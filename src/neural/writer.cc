@@ -51,7 +51,7 @@ std::string GetLc0CacheDirectory() {
 
 }  // namespace
 
-InputPlanes PlanesFromTrainingData(const V5TrainingData& data) {
+InputPlanes PlanesFromTrainingData(const V6TrainingData& data) {
   InputPlanes result;
   for (int i = 0; i < 104; i++) {
     result.emplace_back();
@@ -149,15 +149,18 @@ TrainingDataReader::TrainingDataReader(std::string filename)
 
 TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
 
-bool TrainingDataReader::ReadChunk(V5TrainingData* data) {
-  if (format_v5) {
+TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
+
+bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
+  if (format_v6) {
     int read_size = gzread(fin_, reinterpret_cast<void*>(data), sizeof(*data));
     if (read_size < 0) throw Exception("Corrupt read.");
     return read_size == sizeof(*data);
   } else {
+    size_t v6_extra = 48;
     size_t v5_extra = 16;
     size_t v4_extra = 16;
-    size_t v3_size = sizeof(*data) - v4_extra - v5_extra;
+    size_t v3_size = sizeof(*data) - v4_extra - v5_extra - v6_extra;
     int read_size = gzread(fin_, reinterpret_cast<void*>(data), v3_size);
     if (read_size < 0) throw Exception("Corrupt read.");
     if (read_size != v3_size) return false;
@@ -192,16 +195,44 @@ bool TrainingDataReader::ReadChunk(V5TrainingData* data) {
         data->root_m = 0.0f;
         data->best_m = 0.0f;
         data->plies_left = 0.0f;
-        return true;
+        //return true;
       }
       case 5: {
-        format_v5 = true;
+        //format_v5 = true;
+        // If actually 5, we need to read the additional data first.
+        if (orig_version == 5) {
+          read_size = gzread(
+              fin_,
+              reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
+              v4_extra + v5_extra);
+          if (read_size < 0) throw Exception("Corrupt read.");
+          if (read_size != v5_extra) return false;
+        }
+        data->version = 6;
+        data->result_q = data->dummy;
+        data->result_d = data->dummy == 0 ? 1 : 0;
+        data->played_q = 0;
+        data->played_d = 0;
+        data->played_m = 0;
+        // The folowing may be NaN if not found in cache.
+        data->orig_q = std::numeric_limits<float>::quiet_NaN();
+        data->orig_d = std::numeric_limits<float>::quiet_NaN();
+        data->orig_m = std::numeric_limits<float>::quiet_NaN();
+        data->visits = 0;
+        data->played_idx = 0;
+        data->best_idx = 0;
+        //data->reserved;
+        //return read_size == v4_extra + v5_extra;
+        return true;
+      }
+      case 6: {
+        format_v6 = true;
         read_size = gzread(
             fin_,
             reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
-            v4_extra + v5_extra);
+            v4_extra + v5_extra + v6_extra);
         if (read_size < 0) throw Exception("Corrupt read.");
-        return read_size == v4_extra + v5_extra;
+        return read_size == v4_extra + v5_extra + v6_extra;
       }
     }
   }
@@ -228,7 +259,7 @@ TrainingDataWriter::TrainingDataWriter(std::string filename)
   if (!fout_) throw Exception("Cannot create gzip file " + filename_);
 }
 
-void TrainingDataWriter::WriteChunk(const V5TrainingData& data) {
+void TrainingDataWriter::WriteChunk(const V6TrainingData& data) {
   auto bytes_written =
       gzwrite(fout_, reinterpret_cast<const char*>(&data), sizeof(data));
   if (bytes_written != sizeof(data)) {
