@@ -199,8 +199,6 @@ void Validate(const std::vector<V6TrainingData>& fileContents) {
       // TODO figure out bounds for best_idx and played_idx, if any
       // result.best_idx = best_move.as_nn_index(transform);
       // result.played_idx = played_move.as_nn_index(transform);
-      // TODO fix this
-      // float result = 0.5 * (1.0 - data.result_d + data.result_q);
     } else {
       // v5 result is now dummy
       DataAssert(data.dummy >= -1 && data.dummy <= 1);
@@ -230,7 +228,6 @@ void Validate(const std::vector<V6TrainingData>& fileContents) {
       DataAssert(data.side_to_move_or_enpassant >= 0 &&
                  data.side_to_move_or_enpassant <= 1);
     }
-
     DataAssert(data.rule50_count >= 0 && data.rule50_count <= 100);
     float sum = 0.0f;
     for (int j = 0; j < sizeof(data.probabilities) / sizeof(float); j++) {
