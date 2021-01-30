@@ -866,7 +866,7 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
               continue;
             }
             int steps = history.Last().GetRule50Ply();
-            if ((dtm + steps > 99) && (dtm <= i_result.plies_left)) {
+            if ((dtm + steps > 99) && (dtm <= fileContents[i + 1].plies_left)) {
               // Following DTM could trigger 50 move rule and the current
               // move_count is more than DTM.
               // If DTM is more than the current move_count then we can rescore
