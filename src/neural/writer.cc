@@ -149,8 +149,6 @@ TrainingDataReader::TrainingDataReader(std::string filename)
 
 TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
 
-TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
-
 bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
   if (format_v6) {
     int read_size = gzread(fin_, reinterpret_cast<void*>(data), sizeof(*data));
@@ -195,10 +193,9 @@ bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
         data->root_m = 0.0f;
         data->best_m = 0.0f;
         data->plies_left = 0.0f;
-        //return true;
+        // Deliberate fallthrough.
       }
       case 5: {
-        //format_v5 = true;
         // If actually 5, we need to read the additional data first.
         if (orig_version == 5) {
           read_size = gzread(
@@ -206,23 +203,22 @@ bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
               reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
               v4_extra + v5_extra);
           if (read_size < 0) throw Exception("Corrupt read.");
-          if (read_size != v5_extra) return false;
+          if (read_size != v4_extra + v5_extra) return false;
         }
         data->version = 6;
-        data->result_q = data->dummy;
-        data->result_d = data->dummy == 0 ? 1 : 0;
-        data->played_q = 0;
-        data->played_d = 0;
-        data->played_m = 0;
-        // The folowing may be NaN if not found in cache.
+        data->result_q = static_cast<float>(data->dummy);
+        data->result_d = data->dummy == 0 ? 1.0f : 0.0f;
+        data->played_q = 0.0f;
+        data->played_d = 0.0f;
+        data->played_m = 0.0f;
+        // Mark orig as NaN since scripts further downstream already have to handle that case.
         data->orig_q = std::numeric_limits<float>::quiet_NaN();
         data->orig_d = std::numeric_limits<float>::quiet_NaN();
         data->orig_m = std::numeric_limits<float>::quiet_NaN();
         data->visits = 0;
         data->played_idx = 0;
         data->best_idx = 0;
-        //data->reserved;
-        //return read_size == v4_extra + v5_extra;
+        data->reserved = 0;
         return true;
       }
       case 6: {

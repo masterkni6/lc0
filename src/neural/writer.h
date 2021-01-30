@@ -132,7 +132,6 @@ class TrainingDataReader {
  private:
   std::string filename_;
   gzFile fin_;
-  //TODO v6
   bool format_v6 = false;
 };
 
