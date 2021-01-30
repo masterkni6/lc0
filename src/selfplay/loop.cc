@@ -189,22 +189,9 @@ void Validate(const std::vector<V6TrainingData>& fileContents) {
     DataAssert(data.root_d >= 0.0f && data.root_d <= 1.0f);
     DataAssert(data.best_q >= -1.0f && data.best_q <= 1.0f);
     DataAssert(data.root_q >= -1.0f && data.root_q <= 1.0f);
-    DataAssert(data.orig_q >= -1.0f && data.orig_q <= 1.0f);
-    DataAssert(data.played_q >= -1.0f && data.played_q <= 1.0f);
-    DataAssert(data.result_q >= -1.0f && data.result_q <= 1.0f);
-    DataAssert(data.orig_d >= 0.0f && data.orig_d <= 1.0f);
-    DataAssert(data.played_d >= 0.0f && data.played_d <= 1.0f);
-    DataAssert(data.result_d >= 0.0f && data.result_d <= 1.0f);
     DataAssert(data.root_m >= 0.0f);
     DataAssert(data.best_m >= 0.0f);
-    DataAssert(data.orig_m >= 0.0f);
-    DataAssert(data.played_m >= 0.0f);
     DataAssert(data.plies_left >= 0.0f);
-    DataAssert(data.visits >= 0);
-    // TODO figure out bounds for best_idx and played_idx, if any
-    // result.best_idx = best_move.as_nn_index(transform);
-    // result.played_idx = played_move.as_nn_index(transform);
-
     switch (data.input_format) {
       case pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE:
         DataAssert(data.castling_them_oo >= 0 && data.castling_them_oo <= 1);
@@ -620,6 +607,7 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
                         << std::endl;
                         */
               }
+
               if (score_to_apply == 0) {
                 fileContents[j].result_d = 1.0f;
               } else {
@@ -726,6 +714,7 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
                       << std::endl;
                       */
             }
+
             if (new_score == 0) {
               fileContents[i + 1].result_d = 1.0f;
             } else {
@@ -832,7 +821,7 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
       int offset = 0;
       bool all_draws = true;
       for (auto& chunk : fileContents) {
-        // plies_left can't be 0 for real v6/v5 data, so if it is 0 it must be a v4
+        // plies_left can't be 0 for real v5 data, so if it is 0 it must be a v4
         // conversion, and we should populate it ourselves with a better
         // starting estimate.
         if (chunk.plies_left == 0.0f) {
