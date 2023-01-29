@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018-2019 The LCZero Authors
+  Copyright (C) 2018-2022 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -67,8 +67,8 @@ static size_t getMaxAttentionHeadSize(const LegacyWeights& weights, int N) {
 
   const size_t encoder_heads = weights.pol_encoder_head_count;
 
-  size_t size = N * 64 *
-      std::max(std::max(embedding_op_size, encoder_dff), policy_d_model);
+  size_t size = N * 64 * std::max(std::max(embedding_op_size, encoder_dff),
+                                  policy_d_model);
 
   // size of matmul_qk matrix = encoder_heads_ * Batch * 64 * 64
   const size_t matmul_qk_size = encoder_heads * N * 64 * 64;
@@ -178,6 +178,10 @@ class CudaNetwork : public Network {
     cudaGetDeviceProperties(&deviceProp, gpu_id_);
     showDeviceInfo(deviceProp);
 
+    l2_cache_size_ = deviceProp.l2CacheSize;
+
+    allow_cache_opt_ = options.GetOrDefault<bool>("cache_opt", false);
+
     // Select GPU to run on (for *the current* thread).
     ReportCUDAErrors(cudaSetDevice(gpu_id_));
 
@@ -225,6 +229,7 @@ class CudaNetwork : public Network {
     const int kNumInputPlanes = kInputPlanes;
     const int kNumFilters = (int)weights.input.biases.size();
     numBlocks_ = (int)weights.residual.size();
+    numFilters_ = kNumFilters;
 
     // Warn if the memory required for storing transformed weights is
     // going to exceed 40% of total video memory, force custom_winograd off
@@ -243,8 +248,10 @@ class CudaNetwork : public Network {
     // Disable res block fusing for fp32 for now (not worth it)
     // TODO: make it work for filters not a multiple of 32.
     // Note that when used with SE, the optimization
-    // works only when filter count is <= 384 (pre-Ampere), or less than 512 (Ampere)
-    // It turns dynamically off based on filter count (see ResidualBlock<DataType>::Eval)
+    // works only when filter count is <= 384 (pre-Ampere), or less than 512
+    // (Ampere)
+    // It turns dynamically off based on filter count (see
+    // ResidualBlock<DataType>::Eval)
     if (kNumFilters % 32 == 0 && std::is_same<half, DataType>::value) {
       use_res_block_winograd_fuse_opt_ = true;
     } else {
@@ -277,14 +284,13 @@ class CudaNetwork : public Network {
 
     // Need additional space for transformed input/outputs which are 36/16
     // times size (4x4 block transformed into 6x6).
-    const size_t transformed_tensor_size =
-        (size_t)(max_batch_size_ * kNumFilters * 64 * (36.0 / 16.0) *
-                 sizeof(DataType));
+    const size_t transformed_tensor_size = (size_t)(
+        max_batch_size_ * kNumFilters * 64 * (36.0 / 16.0) * sizeof(DataType));
     scratch_size_ = std::max(scratch_size_, 2 * transformed_tensor_size);
 
     // Attention policy head may need more memory
     const size_t attentionSize =
-        getMaxAttentionHeadSize(weights, max_batch_size_);
+        getMaxAttentionHeadSize(weights, max_batch_size_) * sizeof(DataType);
     scratch_size_ = std::max(scratch_size_, attentionSize);
 
     ReportCUDAErrors(cudaMalloc(&scratch_mem_, scratch_size_));
@@ -312,7 +318,8 @@ class CudaNetwork : public Network {
       if (use_res_block_winograd_fuse_opt_) {
         auto layer = std::make_unique<ResidualBlock<DataType>>(
             getLastLayer(), kNumFilters, has_se, se_k, use_gemm_ex, block == 0,
-            block == (numBlocks_ - 1), mish_net ? MISH : RELU, deviceProp.sharedMemPerBlockOptin);
+            block == (numBlocks_ - 1), mish_net ? MISH : RELU,
+            deviceProp.sharedMemPerBlockOptin);
         layer->LoadWeights0(&weights.residual[block].conv1.weights[0],
                             &weights.residual[block].conv1.biases[0],
                             scratch_mem_);
@@ -531,19 +538,52 @@ class CudaNetwork : public Network {
     float* opVal = io->op_value_mem_gpu_;
     float* opMov = io->op_moves_left_mem_gpu_;
 
+
+    // Figure out if the memory requirment for running the res block would fit
+    // in the L2 cache.
+    bool enableCacheOpt = false;
+    DataType* skip_connection =
+        use_res_block_winograd_fuse_opt_ ? tensor_mem[1] : tensor_mem[2];
+
+#if CUDART_VERSION >= 11000
+    const int pre_transform_tensor_size =
+        batchSize * numFilters_ * 8 * 8 * sizeof(DataType);
+    const int transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
+    const int res_block_mem =
+        transformed_tensor_size * 2 + pre_transform_tensor_size;
+
+    cudaStreamAttrValue stream_attribute = {};
+    stream_attribute.accessPolicyWindow.base_ptr = tensor_mem[2];
+    stream_attribute.accessPolicyWindow.num_bytes = res_block_mem;
+    stream_attribute.accessPolicyWindow.hitRatio = 1.0f;
+    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+    if (allow_cache_opt_ && use_res_block_winograd_fuse_opt_ &&
+        (res_block_mem <= scratch_size_) && (res_block_mem <= l2_cache_size_)) {
+      // we can use a single alloc to hold all the required tensors, and enable
+      // persistent L2 caching on it
+      ReportCUDAErrors(cudaStreamSetAttribute(
+          stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
+
+      enableCacheOpt = true;
+      skip_connection =
+          tensor_mem[2] + 2 * transformed_tensor_size / sizeof(DataType);
+    }
+#endif
+
     int l = 0;
     // Input.
-    network_[l++]->Eval(
-        batchSize,
-        use_res_block_winograd_fuse_opt_ ? tensor_mem[1] : tensor_mem[2],
-        tensor_mem[0], nullptr, scratch_mem, scratch_size_, nullptr, cublas,
-        stream);  // input conv
+    network_[l++]->Eval(batchSize, skip_connection, tensor_mem[0], nullptr,
+                        scratch_mem, scratch_size_, nullptr, cublas,
+                        stream);  // input conv
 
     // Residual block.
     for (int block = 0; block < numBlocks_; block++) {
       if (use_res_block_winograd_fuse_opt_) {
-        network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[1], nullptr,
-                            scratch_mem, scratch_size_, nullptr, cublas,
+        network_[l++]->Eval(batchSize, tensor_mem[2], skip_connection, nullptr,
+                            enableCacheOpt ? nullptr : scratch_mem,
+                            scratch_size_, nullptr, cublas,
                             stream);  // block
       } else {
         network_[l++]->Eval(batchSize, tensor_mem[0], tensor_mem[2], nullptr,
@@ -555,6 +595,16 @@ class CudaNetwork : public Network {
                             cublas, stream);  // conv2
       }
     }
+
+#if CUDART_VERSION >= 11000
+    if (enableCacheOpt) {
+      // reset the cache settings
+      stream_attribute.accessPolicyWindow.num_bytes = 0;
+      cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
+                             &stream_attribute);
+      cudaCtxResetPersistingL2Cache();
+    }
+#endif
 
     // Policy head.
     if (attn_policy_) {
@@ -759,18 +809,21 @@ class CudaNetwork : public Network {
  private:
   const NetworkCapabilities capabilities_;
   int gpu_id_;
+  int l2_cache_size_;
   int max_batch_size_;
   bool wdl_;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
                                           // tower
   bool multi_stream_;                     // run multiple parallel network evals
+  bool allow_cache_opt_;                  // try to fit residual block activations in L2 cache
 
   // Currently only one NN Eval can happen a time (we can fix this if needed
   // by allocating more memory).
   mutable std::mutex lock_;
 
   int numBlocks_;
+  int numFilters_;
   bool has_se_;
   bool conv_policy_;
   bool attn_policy_;
@@ -838,7 +891,7 @@ class CudaNetwork : public Network {
     CERR << "GPU clock frequency: " << deviceProp.clockRate / 1e3f << " MHz";
     CERR << "GPU compute capability: " << deviceProp.major << "."
          << deviceProp.minor;
-
+    CERR << "L2 cache capacity: " << deviceProp.l2CacheSize;
     if (std::is_same<float, DataType>::value && deviceProp.major >= 7) {
       CERR << "WARNING: you will probably get better performance from the "
               "cuda-fp16 backend.";
@@ -878,10 +931,10 @@ std::unique_ptr<Network> MakeCudaNetwork(const std::optional<WeightsFile>& w,
           pblczero::NetworkFormat::NETWORK_CLASSICAL_WITH_HEADFORMAT &&
       weights.format().network_format().network() !=
           pblczero::NetworkFormat::NETWORK_SE_WITH_HEADFORMAT) {
-    throw Exception(
-        "Network format " +
-        std::to_string(weights.format().network_format().network()) +
-        " is not supported by the CUDA backend.");
+    throw Exception("Network format " +
+                    pblczero::NetworkFormat::NetworkStructure_Name(
+                        weights.format().network_format().network()) +
+                    " is not supported by the CUDA backend.");
   }
   if (weights.format().network_format().policy() !=
           pblczero::NetworkFormat::POLICY_CLASSICAL &&
@@ -890,7 +943,8 @@ std::unique_ptr<Network> MakeCudaNetwork(const std::optional<WeightsFile>& w,
       weights.format().network_format().policy() !=
           pblczero::NetworkFormat::POLICY_ATTENTION) {
     throw Exception("Policy format " +
-                    std::to_string(weights.format().network_format().policy()) +
+                    pblczero::NetworkFormat::PolicyFormat_Name(
+                        weights.format().network_format().policy()) +
                     " is not supported by the CUDA backend.");
   }
   if (weights.format().network_format().value() !=
@@ -898,17 +952,18 @@ std::unique_ptr<Network> MakeCudaNetwork(const std::optional<WeightsFile>& w,
       weights.format().network_format().value() !=
           pblczero::NetworkFormat::VALUE_WDL) {
     throw Exception("Value format " +
-                    std::to_string(weights.format().network_format().value()) +
+                    pblczero::NetworkFormat::ValueFormat_Name(
+                        weights.format().network_format().value()) +
                     " is not supported by the CUDA backend.");
   }
   if (weights.format().network_format().moves_left() !=
           pblczero::NetworkFormat::MOVES_LEFT_NONE &&
       weights.format().network_format().moves_left() !=
           pblczero::NetworkFormat::MOVES_LEFT_V1) {
-    throw Exception(
-        "Movest left head format " +
-        std::to_string(weights.format().network_format().moves_left()) +
-        " is not supported by the CUDA backend.");
+    throw Exception("Moves left head format " +
+                    pblczero::NetworkFormat::MovesLeftFormat_Name(
+                        weights.format().network_format().moves_left()) +
+                    " is not supported by the CUDA backend.");
   }
   if (weights.format().network_format().default_activation() !=
           pblczero::NetworkFormat::DEFAULT_ACTIVATION_RELU &&
@@ -916,7 +971,8 @@ std::unique_ptr<Network> MakeCudaNetwork(const std::optional<WeightsFile>& w,
           pblczero::NetworkFormat::DEFAULT_ACTIVATION_MISH) {
     throw Exception(
         "Default activation " +
-        std::to_string(weights.format().network_format().default_activation()) +
+        pblczero::NetworkFormat::DefaultActivation_Name(
+            weights.format().network_format().default_activation()) +
         " is not supported by the CUDA backend.");
   }
   return std::make_unique<CudaNetwork<DataType>>(weights, options);

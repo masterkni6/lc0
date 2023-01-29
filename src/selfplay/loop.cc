@@ -395,8 +395,8 @@ void ChangeInputFormat(int newInputFormat, V6TrainingData* data,
   uint8_t king_side = 1;
   // If frc trained, send the bit mask representing rook position.
   if (Is960CastlingFormat(input_format)) {
-    queen_side <<= castlings.queenside_rook();
-    king_side <<= castlings.kingside_rook();
+    queen_side <<= castlings.our_queenside_rook();
+    king_side <<= castlings.our_kingside_rook();
   }
 
   data->castling_us_ooo = castlings.we_can_000() ? queen_side : 0;
