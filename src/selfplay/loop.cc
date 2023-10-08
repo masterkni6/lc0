@@ -25,8 +25,6 @@
   Program grant you additional permission to convey the resulting work.
 */
 
-#include "NumCpp.hpp"
-
 #include "selfplay/loop.h"
 
 #include <optional>
@@ -900,56 +898,52 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
       def apply_alpha(qs, alpha):
         if not isinstance(qs, np.ndarray):
             qs = np.array(qs)
-        qs = qs * (-1)**np.arange(len(qs))    
+
+        n = len(qs)
+        signs = (-1)**np.arange(n)
+        qs = qs * signs
         # Create an array with alpha^(i-j) at (i, j) if this is at most 1 and 0 otherwise.
-        weights = np.arange(len(qs)) - np.arange(len(qs))[:, None]
-        weights = np.where(weights >= 0, alpha**weights, 0)
+        q_st = np.zeros(n)
+        val = 0
+        for i in range(n):
+            if i == 0:
+                val = qs[-1]
+            else:
+                val = alpha * val + qs[-i-1] * (1- alpha)
+            q_st[-i-1] = val
 
-        qs_adjusted = np.einsum("ij,j->i", weights, qs) / np.sum(weights, axis=1)
-        qs_adjusted = qs_adjusted * (-1)**np.arange(len(qs_adjusted))
+        q_st = q_st * signs
 
-        return qs_adjusted
+        return q_st
       */
-      //TODO finish this 
       float alpha = 1.0f-(1.0f/6.0f);
       std::vector<float> qs;
       std::vector<int> alt_signs;
-      std::vector<int> increment;
       int sign = 1;
       int size = fileContents.size();
+      std::vector<float> qs_st(size, 0.0f);
       for (int i = 0; i < size; ++i) {
         qs.push_back(fileContents[i].root_q);
-        increment.push_back(i+1);
         alt_signs.push_back(sign);
         sign *= -1;
       }
       for (int i = 0; i < size; ++i) {
         qs[i] *= alt_signs[i];
       }
-      auto nd_qs = nc::NdArray(qs).reshape(1,size);
-      auto reg = nc::NdArray(increment);
-      auto inverse = nc::NdArray(increment).reshape(size,1);
-      auto diff = reg-inverse;
-      std::vector<float> diff_array(size*size);
-      int x = 0;
-      float new_value = 0.0f;
-      for(auto& value : diff) {
-        if (value < 0) {
-          new_value = 0.0f;
-        } else {
-          new_value = std::pow(alpha, value);
-        }
-        diff_array[x] = new_value;
-        x++;
-      }
-      auto dn_array = nc::NdArray(diff_array).reshape(size,size);
-      auto sum = nc::sum((dn_array * nd_qs), nc::Axis::COL);
-      auto result = sum / nc::sum(dn_array, nc::Axis::COL);
+      float val = 0.0f;
       for (int i = 0; i < size; ++i) {
-        result[i] *= alt_signs[i];
+        if(i == 0){
+          val = qs.back();
+        } else {
+          val = alpha * val + qs[size+(-i-1)] * (1 - alpha);
+        }
+        qs_st[size+(-i-1)] = val;
+      }
+      for (int i = 0; i < size; ++i) {
+        qs_st[i] *= alt_signs[i];
       }
       int y = 0;
-      for(auto& value : result) {
+      for(auto& value : qs_st) {
         fileContents[y].q_st = value;
         y++;
       }
