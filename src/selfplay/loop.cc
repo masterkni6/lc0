@@ -25,6 +25,8 @@
   Program grant you additional permission to convey the resulting work.
 */
 
+#include "NumCpp.hpp"
+
 #include "selfplay/loop.h"
 
 #include <optional>
@@ -893,6 +895,64 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
           }
         }
       }
+      
+      /*
+      def apply_alpha(qs, alpha):
+        if not isinstance(qs, np.ndarray):
+            qs = np.array(qs)
+        qs = qs * (-1)**np.arange(len(qs))    
+        # Create an array with alpha^(i-j) at (i, j) if this is at most 1 and 0 otherwise.
+        weights = np.arange(len(qs)) - np.arange(len(qs))[:, None]
+        weights = np.where(weights >= 0, alpha**weights, 0)
+
+        qs_adjusted = np.einsum("ij,j->i", weights, qs) / np.sum(weights, axis=1)
+        qs_adjusted = qs_adjusted * (-1)**np.arange(len(qs_adjusted))
+
+        return qs_adjusted
+      */
+      //TODO finish this 
+      float alpha = 1.0f-(1.0f/6.0f);
+      std::vector<float> qs;
+      std::vector<int> alt_signs;
+      std::vector<int> increment;
+      int sign = 1;
+      int size = fileContents.size();
+      for (int i = 0; i < size; ++i) {
+        qs.push_back(fileContents[i].root_q);
+        increment.push_back(i+1);
+        alt_signs.push_back(sign);
+        sign *= -1;
+      }
+      for (int i = 0; i < size; ++i) {
+        qs[i] *= alt_signs[i];
+      }
+      auto nd_qs = nc::NdArray(qs).reshape(1,size);
+      auto reg = nc::NdArray(increment);
+      auto inverse = nc::NdArray(increment).reshape(size,1);
+      auto diff = reg-inverse;
+      std::vector<float> diff_array(size*size);
+      int x = 0;
+      float new_value = 0.0f;
+      for(auto& value : diff) {
+        if (value < 0) {
+          new_value = 0.0f;
+        } else {
+          new_value = std::pow(alpha, value);
+        }
+        diff_array[x] = new_value;
+        x++;
+      }
+      auto dn_array = nc::NdArray(diff_array).reshape(size,size);
+      auto sum = nc::sum((dn_array * nd_qs), nc::Axis::COL);
+      auto result = sum / nc::sum(dn_array, nc::Axis::COL);
+      for (int i = 0; i < size; ++i) {
+        result[i] *= alt_signs[i];
+      }
+      int y = 0;
+      for(auto& value : result) {
+        fileContents[y].q_st = value;
+        y++;
+      }
 
       // Correct move_count using DTZ for 3 piece no-pawn positions only.
       // If Gaviota TBs are enabled no need to use syzygy.
@@ -1204,7 +1264,7 @@ void RescoreLoop::RunLoop() {
   options_.Add<StringOption>(kInputDirId);
   options_.Add<StringOption>(kOutputDirId);
   options_.Add<StringOption>(kPolicySubsDirId);
-  options_.Add<IntOption>(kThreadsId, 1, 20) = 1;
+  options_.Add<IntOption>(kThreadsId, 1, 128) = 1;
   options_.Add<FloatOption>(kTempId, 0.001, 100) = 1;
   // Positive dist offset requires knowing the legal move set, so not supported
   // for now.

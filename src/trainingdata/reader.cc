@@ -205,7 +205,7 @@ bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
         data->played_idx = 0;
         data->best_idx = 0;
         data->policy_kld = 0.0f;
-        data->reserved = 0;
+        data->q_st = 0;
         return true;
       }
       case 6: {
