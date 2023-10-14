@@ -124,7 +124,7 @@ class SelfPlayGame {
   std::mutex mutex_;
 
   // Training data to send.
-  V6TrainingDataArray training_data_;
+  V7TrainingDataArray training_data_;
 
   std::unique_ptr<SyzygyTablebase> syzygy_tb_;
 };

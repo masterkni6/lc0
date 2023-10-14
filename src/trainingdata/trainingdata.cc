@@ -77,7 +77,7 @@ std::tuple<float, float> DriftCorrect(float q, float d) {
 }
 }  // namespace
 
-void V6TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
+void V7TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
                                 bool adjudicated) const {
   if (training_data_.empty()) return;
   // Base estimate off of best_m.  If needed external processing can use a
@@ -111,11 +111,11 @@ void V6TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
   }
 }
 
-void V6TrainingDataArray::Add(const Node* node, const PositionHistory& history,
+void V7TrainingDataArray::Add(const Node* node, const PositionHistory& history,
                               Eval best_eval, Eval played_eval,
                               bool best_is_proven, Move best_move,
                               Move played_move, const NNCacheLock& nneval) {
-  V6TrainingData result;
+  V7TrainingData result;
   const auto& position = history.Last();
 
   // Set version.

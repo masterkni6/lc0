@@ -34,7 +34,7 @@ namespace lczero {
 
 #pragma pack(push, 1)
 
-struct V6TrainingData {
+struct V7TrainingData {
   uint32_t version;
   uint32_t input_format;
   float probabilities[1858];
@@ -82,14 +82,25 @@ struct V6TrainingData {
   // Kullback-Leibler divergence between visits and policy (denominator)
   float policy_kld;
   float q_st;
+  float d_st;
+  uint16_t opp_played_idx;
+  uint16_t next_played_idx;
+  float reserved1;
+  float reserved2;
+  float reserved3;
+  float reserved4;
+  float reserved5;
+  float reserved6;
+  float reserved7;
+  float reserved8;
 } PACKED_STRUCT;
-static_assert(sizeof(V6TrainingData) == 8356, "Wrong struct size");
+static_assert(sizeof(V7TrainingData) == 8396, "Wrong struct size");
 
 #pragma pack(pop)
 
-class V6TrainingDataArray {
+class V7TrainingDataArray {
  public:
-  V6TrainingDataArray(FillEmptyHistory white_fill_empty_history,
+  V7TrainingDataArray(FillEmptyHistory white_fill_empty_history,
                       FillEmptyHistory black_fill_empty_history,
                       pblczero::NetworkFormat::InputFormat input_format)
       : fill_empty_history_{white_fill_empty_history, black_fill_empty_history},
@@ -105,7 +116,7 @@ class V6TrainingDataArray {
              bool adjudicated) const;
 
  private:
-  std::vector<V6TrainingData> training_data_;
+  std::vector<V7TrainingData> training_data_;
   FillEmptyHistory fill_empty_history_[2];
   pblczero::NetworkFormat::InputFormat input_format_;
 };

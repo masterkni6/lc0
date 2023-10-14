@@ -32,7 +32,7 @@
 
 namespace lczero {
 
-struct V6TrainingData;
+struct V7TrainingData;
 
 class TrainingDataWriter {
  public:
@@ -46,7 +46,7 @@ class TrainingDataWriter {
   }
 
   // Writes a chunk.
-  void WriteChunk(const V6TrainingData& data);
+  void WriteChunk(const V7TrainingData& data);
 
   // Flushes file and closes it.
   void Finalize();

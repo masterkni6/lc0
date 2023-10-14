@@ -37,7 +37,7 @@ namespace lczero {
 // transforms are reverted before returning, since it is assumed that the data
 // will be used with DecodeMoveFromInput or PopulateBoard which assume the
 // InputPlanes are not transformed.
-InputPlanes PlanesFromTrainingData(const V6TrainingData& data);
+InputPlanes PlanesFromTrainingData(const V7TrainingData& data);
 
 class TrainingDataReader {
  public:
@@ -47,7 +47,7 @@ class TrainingDataReader {
   ~TrainingDataReader();
 
   // Reads a chunk. Returns true if a chunk was read.
-  bool ReadChunk(V6TrainingData* data);
+  bool ReadChunk(V7TrainingData* data);
 
   // Gets full filename of the file being read.
   std::string GetFileName() const { return filename_; }
@@ -55,7 +55,7 @@ class TrainingDataReader {
  private:
   std::string filename_;
   gzFile fin_;
-  bool format_v6 = false;
+  bool format_v7 = false;
 };
 
 }  // namespace lczero

@@ -130,7 +130,7 @@ void DataAssert(bool check_result) {
   if (!check_result) throw Exception("Range Violation");
 }
 
-void Validate(const std::vector<V6TrainingData>& fileContents) {
+void Validate(const std::vector<V7TrainingData>& fileContents) {
   if (fileContents.empty()) throw Exception("Empty File");
 
   for (int i = 0; i < fileContents.size(); i++) {
@@ -219,7 +219,7 @@ void Validate(const std::vector<V6TrainingData>& fileContents) {
   }
 }
 
-void Validate(const std::vector<V6TrainingData>& fileContents,
+void Validate(const std::vector<V7TrainingData>& fileContents,
               const MoveList& moves) {
   PositionHistory history;
   int rule50ply;
@@ -345,7 +345,7 @@ void gaviota_tb_probe_hard(const Position& pos, unsigned int& info,
   tb_probe_hard(stm, epsq, tb_NOCASTLE, wsq, bsq, wpc, bpc, &info, &dtm);
 }
 
-void ChangeInputFormat(int newInputFormat, V6TrainingData* data,
+void ChangeInputFormat(int newInputFormat, V7TrainingData* data,
                        const PositionHistory& history) {
   data->input_format = newInputFormat;
   auto input_format =
@@ -426,7 +426,7 @@ void ChangeInputFormat(int newInputFormat, V6TrainingData* data,
   data->invariance_info |= invariance_mask;
 }
 
-int ResultForData(const V6TrainingData& data) {
+int ResultForData(const V7TrainingData& data) {
   // Ensure we aren't reprocessing some data that has had custom adjustments to
   // result training target applied.
   DataAssert(data.result_q == -1.0f || data.result_q == 1.0f ||
@@ -471,8 +471,8 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
   {
     try {
       TrainingDataReader reader(file);
-      std::vector<V6TrainingData> fileContents;
-      V6TrainingData data;
+      std::vector<V7TrainingData> fileContents;
+      V7TrainingData data;
       while (reader.ReadChunk(&data)) {
         fileContents.push_back(data);
       }
@@ -918,34 +918,47 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
       */
       float alpha = 1.0f-(1.0f/6.0f);
       std::vector<float> qs;
+      std::vector<float> ds;
+      std::vector<uint16_t> played_idxs;
       std::vector<int> alt_signs;
       int sign = 1;
       int size = fileContents.size();
       std::vector<float> qs_st(size, 0.0f);
+      std::vector<float> ds_st(size, 0.0f);
       for (int i = 0; i < size; ++i) {
         qs.push_back(fileContents[i].root_q);
+        ds.push_back(fileContents[i].root_d);
+        played_idxs.push_back(fileContents[i].played_idx);
         alt_signs.push_back(sign);
         sign *= -1;
       }
+      //signifies end of game
+      played_idxs.push_back(65535);
+      played_idxs.push_back(65535);
       for (int i = 0; i < size; ++i) {
         qs[i] *= alt_signs[i];
       }
       float val = 0.0f;
+      float d_val = 0.0f;
       for (int i = 0; i < size; ++i) {
         if(i == 0){
           val = qs.back();
+          d_val = ds.back();
         } else {
           val = alpha * val + qs[size+(-i-1)] * (1 - alpha);
+          d_val = alpha * d_val + ds[size+(-i-1)] * (1 - alpha);
         }
         qs_st[size+(-i-1)] = val;
+        ds_st[size+(-i-1)] = d_val;
       }
       for (int i = 0; i < size; ++i) {
         qs_st[i] *= alt_signs[i];
       }
-      int y = 0;
-      for(auto& value : qs_st) {
-        fileContents[y].q_st = value;
-        y++;
+      for (int i = 0; i < size; ++i) {
+        fileContents[i].q_st = qs_st[i];
+        fileContents[i].d_st = ds_st[i];
+        fileContents[i].opp_played_idx = played_idxs[i+1];
+        fileContents[i].next_played_idx = played_idxs[i+2];
       }
 
       // Correct move_count using DTZ for 3 piece no-pawn positions only.
@@ -1182,8 +1195,8 @@ void ProcessFiles(const std::vector<std::string>& files,
 void BuildSubs(const std::vector<std::string>& files) {
   for (auto& file : files) {
     TrainingDataReader reader(file);
-    std::vector<V6TrainingData> fileContents;
-    V6TrainingData data;
+    std::vector<V7TrainingData> fileContents;
+    V7TrainingData data;
     while (reader.ReadChunk(&data)) {
       fileContents.push_back(data);
     }
