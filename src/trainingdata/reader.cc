@@ -241,7 +241,7 @@ bool TrainingDataReader::ReadChunk(V7TrainingData* data) {
             reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
             v4_extra + v5_extra + v6_extra + v7_extra);
         if (read_size < 0) throw Exception("Corrupt read.");
-        return read_size == v4_extra + v5_extra + v7_extra;
+        return read_size == v4_extra + v5_extra + v6_extra + v7_extra;
       }
       default:
         throw Exception("Unknown format.");
