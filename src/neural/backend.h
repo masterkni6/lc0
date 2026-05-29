@@ -54,6 +54,12 @@ struct EvalResultPtr {
   float* d = nullptr;
   float* m = nullptr;
   std::span<float> p = {};
+  // Optional second policy distribution from a secondary policy head
+  // (e.g. the optimistic-st head used for tactical-surprise exploration).
+  // Empty span = backend doesn't expose a secondary head; consumers
+  // should fall back to `p` in that case.  Same length as `p` when
+  // populated (one entry per legal move, in the same order as `p`).
+  std::span<float> p_optimistic = {};
 };
 
 struct EvalResult {
@@ -61,9 +67,14 @@ struct EvalResult {
   float d;
   float m;
   std::vector<float> p;
+  // Optional second policy distribution.  Same semantics as
+  // EvalResultPtr::p_optimistic — empty when not produced by the backend.
+  // Same length as `p` when populated.
+  std::vector<float> p_optimistic;
 
   EvalResultPtr AsPtr() {
-    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p};
+    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p,
+                         .p_optimistic = p_optimistic};
   }
 };
 

@@ -73,7 +73,8 @@ template <typename DataType>
 struct InputsOutputs {
   InputsOutputs(unsigned maxBatchSize, bool wdl, bool moves_left,
                 size_t tensor_mem_size = 0, size_t scratch_size = 0,
-                bool cublasDisableTensorCores = false) {
+                bool cublasDisableTensorCores = false,
+                bool optimistic_policy = false) {
     ReportCUDAErrors(cudaHostAlloc(
         &input_masks_mem_, maxBatchSize * kInputPlanes * sizeof(uint64_t),
         cudaHostAllocMapped));
@@ -98,6 +99,24 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaMalloc(
         &op_policy_mem_gpu_,
         maxBatchSize * kNumOutputPolicy * sizeof(op_policy_mem_[0])));
+
+    // Optimistic policy head output buffers — allocated only when the
+    // backend was constructed with the optimistic head enabled.  Same
+    // size + layout as the vanilla policy buffers (per-sample policy
+    // logits over kNumOutputPolicy moves).  Search blends:
+    //   p_effective = (1 - alpha) * op_policy + alpha * op_policy_opt
+    // at root edges when --optimistic-policy-weight > 0.
+    if (optimistic_policy) {
+      ReportCUDAErrors(cudaHostAlloc(
+          &op_policy_opt_mem_,
+          maxBatchSize * kNumOutputPolicy * sizeof(op_policy_opt_mem_[0]),
+          0));
+      ReportCUDAErrors(cudaMalloc(
+          &op_policy_opt_mem_gpu_,
+          maxBatchSize * kNumOutputPolicy * sizeof(op_policy_opt_mem_[0])));
+      ReportCUDAErrors(cudaEventCreateWithFlags(
+          &policy_opt_done_event_, cudaEventDisableTiming));
+    }
     ReportCUDAErrors(cudaHostAlloc(
         &op_value_mem_, maxBatchSize * (wdl ? 3 : 1) * sizeof(op_value_mem_[0]),
         cudaHostAllocMapped));
@@ -165,6 +184,11 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaFree(input_val_mem_gpu_));
     ReportCUDAErrors(cudaFreeHost(op_policy_mem_));
     ReportCUDAErrors(cudaFree(op_policy_mem_gpu_));
+    if (op_policy_opt_mem_ != nullptr) {
+      ReportCUDAErrors(cudaFreeHost(op_policy_opt_mem_));
+      ReportCUDAErrors(cudaFree(op_policy_opt_mem_gpu_));
+      ReportCUDAErrors(cudaEventDestroy(policy_opt_done_event_));
+    }
     ReportCUDAErrors(cudaFreeHost(op_value_mem_));
     ReportCUDAErrors(cudaFree(op_value_mem_gpu_));
     ReportCUDAErrors(cudaEventDestroy(upload_done_event_));
@@ -200,6 +224,10 @@ struct InputsOutputs {
   DataType* op_policy_mem_;
   DataType* op_value_mem_;
   DataType* op_moves_left_mem_ = nullptr;
+  // Optimistic policy head host buffer.  nullptr when optimistic head
+  // not enabled at backend construction; presence-check via this
+  // pointer in the destructor and consumers.
+  DataType* op_policy_opt_mem_ = nullptr;
 
   // Copies in VRAM.
   uint64_t* input_masks_mem_gpu_;
@@ -207,6 +235,7 @@ struct InputsOutputs {
   DataType* op_policy_mem_gpu_;
   DataType* op_value_mem_gpu_;
   DataType* op_moves_left_mem_gpu_ = nullptr;
+  DataType* op_policy_opt_mem_gpu_ = nullptr;
 
   std::unique_ptr<float[]> wdl_cpu_softmax_;
 
@@ -226,6 +255,7 @@ struct InputsOutputs {
   // cuda events to synchronize between streams
   cudaEvent_t upload_done_event_ = nullptr;
   cudaEvent_t policy_done_event_ = nullptr;
+  cudaEvent_t policy_opt_done_event_ = nullptr;
   cudaEvent_t value_done_event_ = nullptr;
   cudaEvent_t moves_left_done_event_ = nullptr;
   cudaEvent_t wdl_download_done_event_ = nullptr;

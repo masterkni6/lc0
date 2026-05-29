@@ -31,8 +31,21 @@ set MKL_PATH=C:\Program Files (x86)\IntelSWTools\compilers_and_libraries\windows
 set DNNL_PATH=C:\dnnl_win_1.1.1_cpu_vcomp
 
 rem 3. In most cases you won't need to change anything further down.
-echo Deleting build directory:
-rd /s build
+if exist build (
+  echo.
+  echo Build directory exists. Delete it for a clean rebuild?
+  echo   Y = delete build\ (weights/models will be copied to weights\ first^)
+  echo   N = keep build\ (incremental build; may fail if .proto changed^)
+  choice /C YN /M "Delete build directory"
+  if errorlevel 2 (
+    echo Keeping existing build directory.
+  ) else (
+    if not exist weights mkdir weights
+    for %%f in (build\*.pb.gz build\*.onnx build\*.pt) do copy "%%f" weights\ >nul 2>&1
+    rd /s /q build
+    echo Deleted build\ - saved any .pb.gz/.onnx/.pt files to weights\
+  )
+)
 
 set CC=cl
 set CXX=cl
@@ -50,7 +63,7 @@ if exist "C:\Program Files\Microsoft Visual Studio\2022" (
 ) else (
   where /q cl
   if errorlevel 1 call "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
-  set backend=vs2017
+  set backend=vs2022
 )
 
 set BLAS=true
@@ -73,6 +86,7 @@ meson setup build --backend %backend% --buildtype release -Ddx=%DX12% -Dcudnn=%C
 -Dopencl_libdirs="%OPENCL_LIB_PATH%" -Dopencl_include="%OPENCL_INCLUDE_PATH%" ^
 -Dopenblas_include="%OPENBLAS_PATH%\include" -Dopenblas_libdirs="%OPENBLAS_PATH%\lib" ^
 -Dcutlass="%CUTLASS%" ^
+-Donnx=false ^
 -Ddefault_library=static
 
 if errorlevel 1 exit /b

@@ -81,6 +81,36 @@ struct BaseWeights {
     Vec dense_b;
     Smolgen smolgen;
     bool has_smolgen;
+
+    // Ray-conditioned RPE (per-layer bias tables, num_heads * 225 each)
+    Vec rpe_base;
+    Vec rpe_clear;
+    Vec rpe_blocked;
+
+    // NLA (NonLinear Attention) second-layer Q/K projection
+    Vec q2_w;
+    Vec q2_b;
+    Vec k2_w;
+    Vec k2_b;
+
+    // GLU Attention (V): gated value projection
+    Vec v_gate_w;
+    Vec v_gate_b;
+    Vec v_up_w;
+    Vec v_up_b;
+
+    // PGB (Post-Gating Bias on V)
+    Vec pgb_v;
+
+    // VGA-E (Element-wise gate on attention output)
+    Vec vga_elem_gate_w;
+    Vec vga_elem_gate_b;
+
+    // Weighted GQA blend matrices (heads, kv_heads), row-major.
+    // Empty when use_weighted_gqa is false; under plain GQA the CUDA
+    // backend synthesizes block-selection weights at load time.
+    Vec gqa_w_k;
+    Vec gqa_w_v;
   };
 
   struct FFN {
@@ -89,6 +119,15 @@ struct BaseWeights {
     Vec dense1_b;
     Vec dense2_w;
     Vec dense2_b;
+
+    // SwiGLU FFN weights
+    Vec gate_proj_w;
+    Vec gate_proj_b;
+    Vec up_proj_w;
+    Vec up_proj_b;
+    Vec down_proj_w;
+    Vec down_proj_b;
+    Vec pgb_ffn;  // Post-Gating Bias on SwiGLU hidden
   };
 
   struct EncoderLayer {
@@ -99,6 +138,9 @@ struct BaseWeights {
     FFN ffn;
     Vec ln2_gammas;
     Vec ln2_betas;
+
+    // ExoFormer: per-layer anchor blending coefficients (2 scalars)
+    Vec exo_lambda;
   };
 
   // Input convnet.
@@ -129,6 +171,57 @@ struct BaseWeights {
   // Encoder stack.
   std::vector<EncoderLayer> encoder;
   int encoder_head_count;
+  // Grouped-Query Attention: number of KV heads (< encoder_head_count
+  // means GQA active).  0 = no GQA / full MHA.
+  int kv_headcount = 0;
+
+  // Encoder final norm (Pre-Norm only)
+  Vec encoder_final_norm_gammas;
+  Vec encoder_final_norm_betas;
+
+  // ExoFormer: anchor projections (model-level, computed once from embedding)
+  Vec exo_q_anc_w;
+  Vec exo_k_anc_w;
+  Vec exo_v_anc_w;
+
+  // Exo-as-smolgen-bias: single projection from pooled initial flow to
+  // (H * gen_sz) anchor code.  Shape: (H*gen_sz, emb_size) stored flat in
+  // PyTorch nn.Linear(emb_size, H*gen_sz) convention (out, in).  Training
+  // applies a 1/sqrt(N_layers) forward-pass scaling; this scaling is baked
+  // into the exported weight so runtime uses it as a plain projection.
+  Vec exo_smol_anchor_w;
+
+  // Rich embedding: per-square MLP input is widened with
+  // per-square extras (piece bits + attack_maps + material_info masks).
+  Vec rich_emb_sq_w1;
+  Vec rich_emb_sq_b1;
+  Vec rich_emb_sq_w2;
+  Vec rich_emb_sq_b2;
+  Vec rich_emb_global_w;
+  Vec rich_emb_global_b;
+
+  // Format flags
+  bool is_prenorm = false;
+  bool use_rms_norm = false;
+  bool use_swiglu_ffn = false;
+  bool use_parallel_ffn = false;
+  bool use_material_info = false;
+  bool use_attack_maps = false;
+  // Soft-cap values. 0.0 disables; non-zero value enables. No separate bool
+  // flag — the value itself is the gate. Old nets that exported the legacy
+  // `use_attn_logit_softcap` boolean are handled at proto-read time.
+  float attn_logit_cap = 0.0f;
+  float smolgen_softcap = 0.0f;
+  float v_softcap = 0.0f;
+  // SwiGLU FFN soft-cap: tanh(out/cap)*cap on silu(gate)*up before
+  // down-projection. Bounds FFN multiplicative output, preventing
+  // mid-late stack gradient explosions. 0.0 disables.
+  float swiglu_softcap = 0.0f;
+
+  // Multi-exit value branch layer. -1 = disabled (default); >=0 = value
+  // heads read encoder flow at this layer instead of the final encoder
+  // output. Policy heads still read final flow.
+  int value_branch_at_layer = -1;
 
   // Residual tower.
   std::vector<Residual> residual;
@@ -216,6 +309,11 @@ struct MultiHeadWeights : public BaseWeights {
     Vec ip2_val_b;
     Vec ip_val_err_w;
     Vec ip_val_err_b;
+
+    // SimPool attentive pooling
+    Vec simpool_query;
+    Vec simpool_key_w;
+    Vec simpool_key_b;
   };
 
  private:

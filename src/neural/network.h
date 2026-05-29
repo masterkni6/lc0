@@ -66,6 +66,20 @@ class NetworkComputation {
   virtual float GetDVal(int sample) const = 0;
   // Returns P value @move_id of @sample.
   virtual float GetPVal(int sample, int move_id) const = 0;
+  // Returns P value @move_id of @sample from the optional secondary
+  // policy head (e.g. optimistic-st).  Backends that don't compute a
+  // secondary head should leave the default, which returns the same
+  // value as GetPVal so callers that blend
+  //   alpha * GetPValOptimistic + (1 - alpha) * GetPVal
+  // get a clean no-op when no second head is available.
+  virtual float GetPValOptimistic(int sample, int move_id) const {
+    return GetPVal(sample, move_id);
+  }
+  // True iff this backend instance was constructed with a secondary
+  // policy head and GetPValOptimistic returns distinct values from
+  // GetPVal.  Search can short-circuit the blend math when this is
+  // false instead of doing N pointless (1-alpha)*p + alpha*p = p ops.
+  virtual bool HasOptimisticPolicy() const { return false; }
   virtual float GetMVal(int sample) const = 0;
   virtual ~NetworkComputation() = default;
 };

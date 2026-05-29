@@ -62,7 +62,14 @@ static size_t getMaxAttentionHeadSize(
     encoder_dff = weights.pol_encoder[0].ffn.dense1_b.size();
 
     assert(encoder_d_model == weights.pol_encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
+    // v_b is absent under GLU-V (split into v_gate_b + v_up_b).  Only
+    // assert width when v_b is actually present.
+    if (weights.pol_encoder[0].mha.v_b.size() > 0) {
+      assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
+    } else {
+      assert(weights.pol_encoder[0].mha.v_gate_w.size() > 0 &&
+             "v_b empty but no GLU-V weights either — net is malformed");
+    }
     assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2_b.size());
   }
 
@@ -95,7 +102,14 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
     encoder_dff = weights.encoder[0].ffn.dense1_b.size();
 
     assert(encoder_d_model == weights.encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.encoder[0].mha.v_b.size());
+    // v_b is absent under GLU-V (split into v_gate_b + v_up_b).  Only
+    // assert width when v_b is actually present.
+    if (weights.encoder[0].mha.v_b.size() > 0) {
+      assert(encoder_d_model == weights.encoder[0].mha.v_b.size());
+    } else {
+      assert(weights.encoder[0].mha.v_gate_w.size() > 0 &&
+             "v_b empty but no GLU-V weights either — net is malformed");
+    }
     assert(embedding_op_size == weights.encoder[0].ffn.dense2_b.size());
   }
 

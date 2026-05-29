@@ -187,6 +187,7 @@ files += [
   'src/search/classic/stoppers/timemgr.cc',
   'src/search/classic/wrapper.cc',
   'src/search/register.cc',
+  'src/selfplay/external_engine.cc',
   'src/selfplay/game.cc',
   'src/selfplay/loop.cc',
   'src/selfplay/multigame.cc',
@@ -459,6 +460,7 @@ if get_option('build_backends')
   nvcc_paths += ['nvcc', '/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc']
   message('Looking for nvcc in: ' + ', '.join(nvcc_paths))
   cu_blas = cc.find_library('cublas', dirs: cudnn_libdirs, required: false)
+  cu_blas_lt = cc.find_library('cublasLt', dirs: cudnn_libdirs, required: false)
   cu_dnn = cc.find_library('cudnn', dirs: cudnn_libdirs, required: false)
   cu_dart = cc.find_library('cudart', dirs: cudnn_libdirs, required: false)
   nvcc = find_program(nvcc_paths,
@@ -473,6 +475,11 @@ if get_option('build_backends')
     nvcc_arguments = ['-c', '@INPUT@', '-o', '@OUTPUT@',
                       '-I', meson.current_source_dir() + '/src']
     nvcc_help = run_command(nvcc, '-h', check : false).stdout()
+    # CUTLASS >= 4.x requires C++17.  nvcc's default on Windows is C++14,
+    # which breaks CUTLASS headers with errors like "auto not allowed here"
+    # in cute/numeric/integral_constant.hpp.  Pass --std=c++17 on every
+    # platform (not just non-Windows as the original branch did).
+    nvcc_arguments += ['--std=c++17']
     if host_machine.system() == 'windows'
       if get_option('b_vscrt') == 'mt'
         nvcc_arguments += ['-Xcompiler', '-MT']
@@ -484,7 +491,7 @@ if get_option('build_backends')
         nvcc_arguments += ['-Xcompiler', '-MD']
       endif
     else
-      nvcc_arguments += ['--std=c++17', '-Xcompiler', '-fPIC']
+      nvcc_arguments += ['-Xcompiler', '-fPIC']
       if get_option('debug')
         nvcc_arguments += ['-g']
       endif
@@ -526,7 +533,15 @@ if get_option('build_backends')
     nvcc_ok = true
 
     max_cuda = 0
-    nvcc_dryrun = run_command(nvcc, '--dryrun', nvcc_extra_args, 'foo.cu', check : false).stderr()
+    # nvcc --dryrun writes the command trace to stderr on Linux but to stdout
+    # on Windows.  Concatenate both so the __CUDA_ARCH__ scan works on every
+    # platform.  Reading only .stderr() silently broke Windows builds: the
+    # scan found nothing, max_cuda stayed at 0, and any gate of the form
+    # `max_cuda >= 800` (e.g. the CUTLASS enable block below) was disabled
+    # without a warning.
+    nvcc_dryrun_res = run_command(nvcc, '--dryrun', nvcc_extra_args, 'foo.cu',
+                                   check : false)
+    nvcc_dryrun = nvcc_dryrun_res.stdout() + nvcc_dryrun_res.stderr()
     foreach x : nvcc_dryrun.split()
       if x.contains('-D__CUDA_ARCH__=')
         arch = x.substring(16).to_int()
@@ -535,10 +550,24 @@ if get_option('build_backends')
         endif
       endif
     endforeach
+    message('nvcc max_cuda arch detected: @0@'.format(max_cuda))
   endif
   if (get_option('cudnn') or get_option('plain_cuda')) and cu_dart.found() and cu_blas.found() and nvcc_ok
     deps += [cu_blas, cu_dart]
-    cuda_files = ['src/neural/backends/cuda/layers.cc']
+    # cuBLAS-Lt is optional (only needed for the experimental FP8 path).
+    # Link it when found; the FP8 code falls back to Hgemm if unavailable.
+    if cu_blas_lt.found()
+      deps += cu_blas_lt
+      add_project_arguments('-DLC0_HAS_CUBLAS_LT=1', language: 'cpp')
+      nvcc_extra_args += '-DLC0_HAS_CUBLAS_LT=1'
+    endif
+    cuda_files = [
+      'src/neural/backends/cuda/layers.cc',
+      'src/neural/backends/cuda/weight_arena.cc',
+    ]
+    if cu_blas_lt.found()
+      cuda_files += 'src/neural/backends/cuda/gemm_tuner.cc'
+    endif
     if get_option('cudnn') and cu_dnn.found()
       deps += cu_dnn
       cuda_files += 'src/neural/backends/cuda/network_cudnn.cc'
@@ -579,6 +608,7 @@ if get_option('build_backends')
       depend_files: 'src/neural/backends/cuda/winograd_helper.inc',
       command : [nvcc, nvcc_extra_args, nvcc_arguments]
     )
+
     has_backends = true
   endif
 
@@ -777,6 +807,13 @@ if get_option('build_backends')
       else
         deps += cc.find_library('cublas', required: true)
         deps += cc.find_library('cudart', required: true)
+        # cuBLAS-Lt for FP8 matmul path (optional — gracefully missing if
+        # older CUDA toolkit is installed).
+        cu_blas_lt_opt = cc.find_library('cublasLt', required: false)
+        if cu_blas_lt_opt.found()
+          deps += cu_blas_lt_opt
+          add_project_arguments('-DLC0_HAS_CUBLAS_LT=1', language: 'cpp')
+        endif
         add_project_arguments('-DUSE_CUBLAS=ON', language : 'cpp')
         if get_option('cc_cuda') != ''
           sycl_nvidia_target = 'nvidia_gpu_sm_' + get_option('cc_cuda')

@@ -85,6 +85,16 @@ message Weights {
     optional Layer dense2_b = 7;
     optional Layer ln2_gammas = 8;
     optional Layer ln2_betas = 9;
+
+    // SmolgenV2: cross-attention compression (replaces dense1/ln1/dense2/ln2).
+    // compress (field 1) and smol_weight_gen are shared with V1.
+    optional Layer v2_queries = 10;       // (H, attn_dim) learned queries
+    optional Layer v2_k_proj = 11;        // (attn_dim, hidden_channels) no bias
+    optional Layer v2_v_proj = 12;        // (value_dim, hidden_channels) no bias
+    optional Layer v2_head_proj_w = 13;   // (gen_sz, value_dim)
+    optional Layer v2_head_proj_b = 14;   // (gen_sz,)
+    optional Layer v2_head_ln_gammas = 15; // (gen_sz,)
+    optional Layer v2_head_ln_betas = 16;  // (gen_sz,)
   }
 
   message MHA {
@@ -103,6 +113,55 @@ message Weights {
     optional Layer rpe_v = 12;
 
     // reserved 13 - 22 for int8 quantization
+
+    // Ray-conditioned RPE: per-layer bias tables (num_heads, 225 each),
+    // expanded to (heads, 64, 64) via RPE_MAP at load time.
+    optional Layer rpe_base = 23;
+    optional Layer rpe_clear = 24;
+    optional Layer rpe_blocked = 25;
+
+    // Residual attention: per-head mixing coefficient (num_heads,).
+    // attn_logits += alpha * prev_layer_attn_logits.
+    optional Layer attn_residual_alpha = 26;
+
+    // NLA (NonLinear Attention): second-layer Q/K projection weights.
+    // Q = Wq2(silu(Wq(x) + bq)) + bq2, same for K.
+    // V uses GLU Attention instead (v_gate/v_up below).
+    optional Layer q2_w = 27;
+    optional Layer q2_b = 28;
+    optional Layer k2_w = 29;
+    optional Layer k2_b = 30;
+    // reserved 31-34 (formerly NLA V and per-head VGA, superseded by GLU V and VGA-E)
+
+    // GLU Attention: gated value projection.
+    // V = SiLU(Wv_gate(x)) * Wv_up(x) instead of V = Wv(x).
+    optional Layer v_gate_w = 35;
+    optional Layer v_gate_b = 36;
+    optional Layer v_up_w = 37;
+    optional Layer v_up_b = 38;
+
+    // PGB (Post-Gating Bias): bias after GLU gating on V.
+    optional Layer pgb_v = 39;
+
+    // VGA-E (Element-wise): per-dimension gate on attention output.
+    // output *= sigmoid(Linear(input)). Replaces per-head VGA.
+    optional Layer vga_elem_gate_w = 40;
+    optional Layer vga_elem_gate_b = 41;
+
+    // Learnable per-head attention temperature (num_heads scalars).
+    // Replaces fixed 1/sqrt(d_k). Q is scaled by temp before Q@K^T.
+    optional Layer attn_temp = 42;
+
+    // Weighted GQA (arXiv:2407.10855): learnable (heads, kv_heads) blend
+    // matrices that mix the kv_heads slices of K/V into per-Q-head K/V.
+    // Each Q head h sees:
+    //   K[h] = Σ_k gqa_w_k[h, k] * K_kv[k] ; same for V via gqa_w_v.
+    // When absent under GQA (kv_headcount < encoder_head_count),
+    // inference synthesizes block-selection weights (w[h, h*KH/H] = 1.0)
+    // which reproduces plain GQA's repeat-expand exactly.  Row-major:
+    // (heads, kv_heads) flat in encoder_head_count*kv_headcount floats.
+    optional Layer gqa_w_k = 43;
+    optional Layer gqa_w_v = 44;
   }
 
   message FFN {
@@ -111,6 +170,25 @@ message Weights {
     optional Layer dense2_w = 3;
     optional Layer dense2_b = 4;
     // reserved 5 - 10 for int8 quantization
+
+    // SwiGLU FFN: gate_proj * silu ⊙ up_proj → down_proj
+    optional Layer gate_proj_w = 11;
+    optional Layer gate_proj_b = 12;
+    optional Layer up_proj_w = 13;
+    optional Layer up_proj_b = 14;
+    optional Layer down_proj_w = 15;
+    optional Layer down_proj_b = 16;
+    optional Layer pgb_ffn = 17;  // Post-Gating Bias on SwiGLU hidden
+  }
+
+  // MUDD: per-layer per-stream aggregator weights.
+  // Each stream (Q/K/V/R) has: RMSNorm gamma, Linear1 weight, Linear2 weight, bias.
+  // Sizes vary per layer: Linear1 is (emb, num_sources), Linear2 is (num_sources, num_sources).
+  message MuddStream {
+    optional Layer rms_gamma = 1;      // (emb_size,)
+    optional Layer linear1_w = 2;      // (num_sources, emb_size) — transposed from PyTorch
+    optional Layer linear2_w = 3;      // (num_sources, num_sources)
+    optional Layer bias = 4;           // (num_sources,) — static bias added before softmax
   }
 
   message EncoderLayer {
@@ -120,6 +198,29 @@ message Weights {
     optional FFN ffn = 4;
     optional Layer ln2_gammas = 5;
     optional Layer ln2_betas = 6;
+
+    // ExoFormer: per-layer anchor blending coefficients (2 scalars).
+    // lambda[0] = anchor weight, lambda[1] = current weight.
+    optional Layer exo_lambda = 7;
+
+    // MUDD four-stream dynamic cross-layer aggregation.
+    optional MuddStream mudd_q = 8;
+    optional MuddStream mudd_k = 9;
+    optional MuddStream mudd_v = 10;
+    optional MuddStream mudd_r = 11;
+
+    // LayerScale (Spike No More, COLM 2025): per-channel learnable scalars
+    // applied to each sublayer's output before residual add. Shape
+    // (emb_size,). Typical init 1/num_layers; values evolve during
+    // training so each channel can have its own effective contribution.
+    //
+    // When present, inference MUST apply the scaling before the residual
+    // add, otherwise the model's output diverges from its trained state.
+    //     x + attn_output * ls_attn    (pre-norm attention residual)
+    //     x + ffn_output  * ls_ffn     (pre-norm FFN residual)
+    // Absence => regular residual add (no scaling).
+    optional Layer ls_attn = 12;
+    optional Layer ls_ffn  = 13;
   }
 
   message PolicyHead {
@@ -143,7 +244,7 @@ message Weights {
   message ValueHead {
     optional Layer ip_val_w = 1;  // "embedding" for attention body value
     optional Layer ip_val_b = 2;
-    optional Layer ip1_val_w = 3;
+    optional Layer ip1_val_w = 3;  // dense1 (flatten→hidden or simpool→hidden)
     optional Layer ip1_val_b = 4;
     optional Layer ip2_val_w = 5;
     optional Layer ip2_val_b = 6;
@@ -151,6 +252,16 @@ message Weights {
     optional Layer ip_val_err_b = 8;
     optional Layer ip_val_cat_w = 9;
     optional Layer ip_val_cat_b = 10;
+
+    // SimPool: attentive pooling replaces flatten+dense.
+    // query(1, val_emb) cross-attends over 64 tokens.
+    optional Layer simpool_query = 12;   // (1, val_emb_size)
+    optional Layer simpool_key_w = 13;   // (val_emb_size, val_emb_size)
+    optional Layer simpool_key_b = 14;   // (val_emb_size,)
+
+    // Optional separate V projection for proper cross-attention (Run B).
+    // Used when value_head_separate_v=true in model config. No bias.
+    optional Layer simpool_value_w = 15;   // (val_emb_size, val_emb_size)
 
     // Legacy value head support.
     optional ConvBlock value = 11;
@@ -248,6 +359,54 @@ message Weights {
 
   optional ValueHeads value_heads = 44;
   optional PolicyHeads policy_heads = 45;
+
+  // Final LayerNorm/RMSNorm after encoder stack (Pre-Norm only).
+  optional Layer encoder_final_norm_gammas = 46;
+  optional Layer encoder_final_norm_betas = 47;
+
+  // Number of KV heads for Grouped Query Attention (GQA).
+  // When set and < headcount, K/V projections are smaller and get expanded
+  // to match Q heads during inference.  Omit or set == headcount for full MHA.
+  optional uint32 kv_headcount = 48;
+
+  // ExoFormer: anchor projections (computed once from embedding, shared across layers).
+  optional Layer exo_q_anc_w = 49;
+  optional Layer exo_k_anc_w = 50;
+  optional Layer exo_v_anc_w = 51;
+
+  // Exo-as-smolgen-bias: single projection from pooled initial flow to
+  // (H * gen_sz) anchor code, added to every layer's smolgen gen_from
+  // before the shared weight_gen decoder.  Training-side 1/sqrt(N_layers)
+  // scaling is baked into this weight at export time — CUDA applies the
+  // projection as-is with no runtime scaling.
+  optional Layer exo_smol_anchor_w = 65;
+
+  // Light embedding: per-square MLP + global summary (replaces ip_emb_preproc).
+  // Per-square: Linear(12, 64) → SiLU → Linear(64, emb_dense_sz)
+  optional Layer light_emb_sq_w1 = 52;
+  optional Layer light_emb_sq_b1 = 53;
+  optional Layer light_emb_sq_w2 = 54;
+  optional Layer light_emb_sq_b2 = 55;
+  // Global summary: Linear(768, global_sz)
+  optional Layer light_emb_global_w = 56;
+  optional Layer light_emb_global_b = 57;
+
+  // Rich embedding: per-square MLP now takes piece bits + per-square extras
+  // (attack_maps 6, material_info per-square masks 2). SiLU between layers
+  // earns its keep because the input is mixed continuous, not strict one-hot.
+  // Input dim to first linear is inferable from weight shape:
+  //   rich_emb_sq_w1.size() / rich_emb_sq_b1.size()  →  per_sq_input_sz
+  // Global path (rich_emb_global_*) mirrors light_emb_global_*: Linear(768, G).
+  optional Layer rich_emb_sq_w1 = 59;
+  optional Layer rich_emb_sq_b1 = 60;
+  optional Layer rich_emb_sq_w2 = 61;
+  optional Layer rich_emb_sq_b2 = 62;
+  optional Layer rich_emb_global_w = 63;
+  optional Layer rich_emb_global_b = 64;
+
+  // Value Residual Learning (ResFormer): blend first layer's V into all layers.
+  // V_n = 0.5 * V_current + 0.5 * V_first. No extra weights needed.
+  optional bool use_value_residual = 58;
 
   // Moves left head
   optional ConvBlock moves_left = 12;
@@ -352,6 +511,7 @@ message NetworkFormat {
   enum DefaultActivation {
     DEFAULT_ACTIVATION_RELU = 0;
     DEFAULT_ACTIVATION_MISH = 1;
+    DEFAULT_ACTIVATION_SILU = 2;
   }
   optional DefaultActivation default_activation = 7;
 
@@ -364,6 +524,101 @@ message NetworkFormat {
     INPUT_EMBEDDING_PE_DENSE = 2;
   }
   optional InputEmbeddingFormat input_embedding = 10;
+
+  // Encoder normalization style.
+  enum EncoderNormStyle {
+    ENCODER_NORM_POSTNORM = 0;   // Default: LN after residual (DeepNorm)
+    ENCODER_NORM_PRENORM = 1;    // LN before MHA/FFN, final LN after stack
+  }
+  optional EncoderNormStyle encoder_norm_style = 11;
+
+  // QK-Norm: normalize Q and K vectors before dot product in attention.
+  optional bool use_qk_norm = 12;
+
+  // RMSNorm: use Root Mean Square normalization instead of LayerNorm.
+  optional bool use_rms_norm = 13;
+
+  // SwiGLU FFN: use gated SwiGLU feed-forward (gate_proj, up_proj, down_proj)
+  // instead of standard two-layer FFN (dense1, dense2).
+  optional bool use_swiglu_ffn = 14;
+
+  // Parallel FFN: PaLM-style parallel attention+FFN.
+  // Both MHA and FFN read from LN1 output, no LN2 needed.
+  // x = x + attn(ln1(x)) + ffn(ln1(x))
+  optional bool use_parallel_ffn = 15;
+
+  // Material info: derived chess features (piece counts, material diffs,
+  // own/opp masks) computed from input planes and concatenated to the
+  // embedding input. 18 extra features per square.
+  optional bool use_material_info = 16;
+
+  // Attack maps: 6 derived tactical features per square computed from piece
+  // planes with ray blocking. Features: own_attacked, opp_attacked,
+  // own_attack_count (norm), opp_attack_count (norm), own_defended,
+  // opp_hanging. 6 extra features per square.
+  optional bool use_attack_maps = 17;
+
+  // Tactical features (v2): 13 planes replace input planes 91-103 (SEE,
+  // control, hanging, pins, discovered checks, passed pawns, legal checks)
+  // plus 15 per-square extras (mobility, king zone, pawn structure, fork,
+  // battery, overloaded, hanging value, in_check, best SEE). Computed CPU-side
+  // by the input encoder using lc0's ChessBoard; the 15-extra tensor is
+  // uploaded to GPU as a side channel alongside the 112 planes.
+  optional bool use_tactical = 18;
+
+  // Attention logit soft-cap (Gemma 2 style): when enabled, applies
+  // tanh(logits/cap)*cap to pre-softmax attention logits. Smoothly bounds
+  // logit magnitude to prevent any single head/position from saturating
+  // softmax, stabilizing deep pre-norm transformers in bf16/fp16 training.
+  // This is an architectural choice — inference MUST mirror it or outputs
+  // will diverge. Applied after all additive biases, before softmax.
+  optional bool use_attn_logit_softcap = 19;
+  // Cap value for the soft-cap. Typical 50.0. Inference loader should
+  // default to 50.0 if the flag is set but this field is absent.
+  optional float attn_logit_cap = 20;
+
+  // Policy-head QK-Norm: RMSNorm (scale=False, no learnable gain) on the
+  // policy-head Q and K projections, matching Python's PolicyHead(
+  // use_qk_norm=True). Independent of the encoder-body `use_qk_norm` flag
+  // because training enables them separately (policy-only is the default
+  // user stabilisation knob — the encoder pays 2×N_layers norms, the
+  // policy head pays only 2). No extra learnable weights are exported;
+  // the backend allocates a unit-gamma buffer at load time.
+  optional bool use_policy_qk_norm = 21;
+
+  // Smolgen output soft-cap: tanh(out/cap)*cap applied to the smolgen
+  // weight-gen output (the per-position attention bias) BEFORE it is added
+  // to QK^T. Bounds the smolgen contribution element-wise so any one
+  // smolgen-driven head/position can't dominate the attention logits.
+  // Non-zero value enables it (no separate bool flag — the value itself
+  // is the gate). Typical training value: 5.0. 0.0 disables.
+  optional float smolgen_softcap = 22;
+
+  // V-projection soft-cap: tanh(V/cap)*cap applied to the V tensor after
+  // GLU-V (silu(gate)*up) and PGB. Bounds V element-wise so the
+  // multiplicative gate can't produce 100-1000× outliers at wide d_model.
+  // Non-zero value enables it. Typical training value: 5.0. 0.0 disables.
+  optional float v_softcap = 23;
+
+  // SwiGLU FFN output soft-cap: tanh(out/cap)*cap applied to the FFN's
+  // silu(gate)*up product before the down-projection adds it to the residual.
+  // Same role as v_softcap but for the FFN sublayer's multiplicative output.
+  // Bounds element-wise so silu*up amplification can't produce backward-
+  // gradient explosions at mid-late stack FFNs (observed at step ~500k on
+  // 768x60 nets). Non-zero value enables it. Typical training value: 10.0.
+  // 0.0 disables.
+  optional float swiglu_softcap = 25;
+
+  // Multi-exit: when set, the value heads read encoder flow at this layer
+  // instead of the final encoder output. Policy heads still read the final
+  // flow. Layers BETWEEN this layer and the final encoder layer therefore
+  // receive only policy gradient — they specialize for policy refinement.
+  // Use case: value plateaus shallow (e.g. L40-50) while policy needs the
+  // full encoder depth.
+  // -1 (or unset) = disabled, all heads read final flow.
+  // Must be < (encoder_layers - 1) to be meaningful (otherwise it's a
+  // no-op since the final layer = encoder_layers - 1).
+  optional int32 value_branch_at_layer = 24;
 }
 
 message Format {

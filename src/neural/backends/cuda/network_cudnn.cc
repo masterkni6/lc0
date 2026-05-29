@@ -63,7 +63,14 @@ static size_t getMaxAttentionHeadSize(
     encoder_dff = weights.pol_encoder[0].ffn.dense1_b.size();
 
     assert(encoder_d_model == weights.pol_encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
+    // v_b is absent under GLU-V (split into v_gate_b + v_up_b).  Only
+    // assert width when v_b is actually present.
+    if (weights.pol_encoder[0].mha.v_b.size() > 0) {
+      assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
+    } else {
+      assert(weights.pol_encoder[0].mha.v_gate_w.size() > 0 &&
+             "v_b empty but no GLU-V weights either — net is malformed");
+    }
     assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2_b.size());
   }
 
@@ -165,8 +172,37 @@ class CudnnNetwork : public Network {
                       file.format().network_format().output(),
                       file.format().network_format().moves_left()} {
     MultiHeadWeights weights(file.weights());
+
+    // Set format flags from NetworkFormat (not available to BaseWeights ctor).
+    {
+      const auto& nf_flags = file.format().network_format();
+      weights.is_prenorm = nf_flags.encoder_norm_style() ==
+          pblczero::NetworkFormat::ENCODER_NORM_PRENORM;
+      weights.use_rms_norm = nf_flags.use_rms_norm();
+      weights.use_swiglu_ffn = nf_flags.use_swiglu_ffn();
+      weights.use_parallel_ffn = nf_flags.use_parallel_ffn();
+      weights.use_material_info = nf_flags.use_material_info();
+      weights.use_attack_maps = nf_flags.use_attack_maps();
+      // Soft-caps. value > 0 = enabled. Legacy `use_attn_logit_softcap`
+      // honored as backward-compat fallback to Gemma 2 default of 50.
+      weights.attn_logit_cap = nf_flags.attn_logit_cap();
+      if (weights.attn_logit_cap == 0.0f &&
+          nf_flags.use_attn_logit_softcap()) {
+        weights.attn_logit_cap = 50.0f;
+      }
+      weights.smolgen_softcap = nf_flags.smolgen_softcap();
+      weights.v_softcap = nf_flags.v_softcap();
+      weights.swiglu_softcap = nf_flags.swiglu_softcap();
+      weights.value_branch_at_layer = nf_flags.has_value_branch_at_layer()
+                                          ? nf_flags.value_branch_at_layer()
+                                          : -1;
+    }
+
     gpu_id_ = options.GetOrDefault<int>("gpu", 0);
     enable_graph_capture_ = options.GetOrDefault<bool>("graph_capture", true);
+    // The cudnn backend lacks the dual-graph infrastructure for parallel FFN:
+    // disable graph capture to prevent a silent deadlock on External wait nodes.
+    if (weights.use_parallel_ffn) enable_graph_capture_ = false;
 
     conv_policy_ = file.format().network_format().policy() ==
                    pblczero::NetworkFormat::POLICY_CONVOLUTION;

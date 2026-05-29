@@ -53,11 +53,28 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip2_mov_w(LayerAdapter(weights.ip2_mov_w()).as_vector()),
       ip2_mov_b(LayerAdapter(weights.ip2_mov_b()).as_vector()),
       smolgen_w(LayerAdapter(weights.smolgen_w()).as_vector()),
-      has_smolgen(weights.has_smolgen_w()) {
+      has_smolgen(weights.has_smolgen_w()),
+      encoder_final_norm_gammas(
+          LayerAdapter(weights.encoder_final_norm_gammas()).as_vector()),
+      encoder_final_norm_betas(
+          LayerAdapter(weights.encoder_final_norm_betas()).as_vector()),
+      exo_q_anc_w(LayerAdapter(weights.exo_q_anc_w()).as_vector()),
+      exo_k_anc_w(LayerAdapter(weights.exo_k_anc_w()).as_vector()),
+      exo_v_anc_w(LayerAdapter(weights.exo_v_anc_w()).as_vector()),
+      exo_smol_anchor_w(
+          LayerAdapter(weights.exo_smol_anchor_w()).as_vector()),
+      rich_emb_sq_w1(LayerAdapter(weights.rich_emb_sq_w1()).as_vector()),
+      rich_emb_sq_b1(LayerAdapter(weights.rich_emb_sq_b1()).as_vector()),
+      rich_emb_sq_w2(LayerAdapter(weights.rich_emb_sq_w2()).as_vector()),
+      rich_emb_sq_b2(LayerAdapter(weights.rich_emb_sq_b2()).as_vector()),
+      rich_emb_global_w(LayerAdapter(weights.rich_emb_global_w()).as_vector()),
+      rich_emb_global_b(LayerAdapter(weights.rich_emb_global_b()).as_vector()) {
   for (const auto& res : weights.residual()) {
     residual.emplace_back(res);
   }
   encoder_head_count = weights.headcount();
+  // GQA: number of KV heads (proto field kv_headcount, 0 = full MHA).
+  kv_headcount = weights.kv_headcount();
   for (const auto& enc : weights.encoder()) {
     encoder.emplace_back(enc);
   }
@@ -142,7 +159,23 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       dense_w(LayerAdapter(mha.dense_w()).as_vector()),
       dense_b(LayerAdapter(mha.dense_b()).as_vector()),
       smolgen(Smolgen(mha.smolgen())),
-      has_smolgen(mha.has_smolgen()) {
+      has_smolgen(mha.has_smolgen()),
+      rpe_base(LayerAdapter(mha.rpe_base()).as_vector()),
+      rpe_clear(LayerAdapter(mha.rpe_clear()).as_vector()),
+      rpe_blocked(LayerAdapter(mha.rpe_blocked()).as_vector()),
+      q2_w(LayerAdapter(mha.q2_w()).as_vector()),
+      q2_b(LayerAdapter(mha.q2_b()).as_vector()),
+      k2_w(LayerAdapter(mha.k2_w()).as_vector()),
+      k2_b(LayerAdapter(mha.k2_b()).as_vector()),
+      v_gate_w(LayerAdapter(mha.v_gate_w()).as_vector()),
+      v_gate_b(LayerAdapter(mha.v_gate_b()).as_vector()),
+      v_up_w(LayerAdapter(mha.v_up_w()).as_vector()),
+      v_up_b(LayerAdapter(mha.v_up_b()).as_vector()),
+      pgb_v(LayerAdapter(mha.pgb_v()).as_vector()),
+      vga_elem_gate_w(LayerAdapter(mha.vga_elem_gate_w()).as_vector()),
+      vga_elem_gate_b(LayerAdapter(mha.vga_elem_gate_b()).as_vector()),
+      gqa_w_k(LayerAdapter(mha.gqa_w_k()).as_vector()),
+      gqa_w_v(LayerAdapter(mha.gqa_w_v()).as_vector()) {
   if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
     throw Exception("RPE weights file not supported.");
   }
@@ -152,7 +185,14 @@ BaseWeights::FFN::FFN(const pblczero::Weights::FFN& ffn)
     : dense1_w(LayerAdapter(ffn.dense1_w()).as_vector()),
       dense1_b(LayerAdapter(ffn.dense1_b()).as_vector()),
       dense2_w(LayerAdapter(ffn.dense2_w()).as_vector()),
-      dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()) {}
+      dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()),
+      gate_proj_w(LayerAdapter(ffn.gate_proj_w()).as_vector()),
+      gate_proj_b(LayerAdapter(ffn.gate_proj_b()).as_vector()),
+      up_proj_w(LayerAdapter(ffn.up_proj_w()).as_vector()),
+      up_proj_b(LayerAdapter(ffn.up_proj_b()).as_vector()),
+      down_proj_w(LayerAdapter(ffn.down_proj_w()).as_vector()),
+      down_proj_b(LayerAdapter(ffn.down_proj_b()).as_vector()),
+      pgb_ffn(LayerAdapter(ffn.pgb_ffn()).as_vector()) {}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
@@ -161,7 +201,8 @@ BaseWeights::EncoderLayer::EncoderLayer(
       ln1_betas(LayerAdapter(encoder.ln1_betas()).as_vector()),
       ffn(FFN(encoder.ffn())),
       ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
-      ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
+      ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()),
+      exo_lambda(LayerAdapter(encoder.exo_lambda()).as_vector()) {}
 
 BaseWeights::Smolgen::Smolgen(const pblczero::Weights::Smolgen& smolgen)
     : compress(LayerAdapter(smolgen.compress()).as_vector()),
@@ -203,7 +244,10 @@ MultiHeadWeights::ValueHead::ValueHead(
       ip2_val_w(LayerAdapter(valuehead.ip2_val_w()).as_vector()),
       ip2_val_b(LayerAdapter(valuehead.ip2_val_b()).as_vector()),
       ip_val_err_w(LayerAdapter(valuehead.ip_val_err_w()).as_vector()),
-      ip_val_err_b(LayerAdapter(valuehead.ip_val_err_b()).as_vector()) {}
+      ip_val_err_b(LayerAdapter(valuehead.ip_val_err_b()).as_vector()),
+      simpool_query(LayerAdapter(valuehead.simpool_query()).as_vector()),
+      simpool_key_w(LayerAdapter(valuehead.simpool_key_w()).as_vector()),
+      simpool_key_b(LayerAdapter(valuehead.simpool_key_b()).as_vector()) {}
 
 LegacyWeights::LegacyWeights(const pblczero::Weights& weights)
     : BaseWeights(weights),

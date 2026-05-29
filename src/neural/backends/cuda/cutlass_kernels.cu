@@ -26,9 +26,16 @@
 */
 
 #include "neural/backends/cuda/cuda_common.h"
+#include "neural/tables/activation_function.h"
 
 // Fused MHA implementation from cutlass example #41
 #include "fused_multi_head_attention/kernel_forward.h"
+
+// CUTLASS GEMM for fused projection + bias + activation
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/epilogue/thread/linear_combination_silu.h"
+
 #include "utils/exception.h"
 
 namespace lczero {
@@ -117,6 +124,78 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
   } else {
     fusedMHACutlass<true>(output, mha_q, mha_k, mha_v, skip, batch_size,
                           num_heads, depth, stream);
+  }
+}
+
+// ── CUTLASS GEMM + Bias + Activation (fused projection) ─────────────────
+// Replaces: cublasXgemm + addBiasBatched with a single fused GEMM.
+// Computes: C = activation(A^T @ B + bias) where bias is broadcast per-row.
+//
+// Layout: A is (K, M) col-major = (M, K) row-major (PyTorch weight format).
+//         B is (K, N) col-major = input tensor.
+//         C is (M, N) col-major = output tensor.
+//         bias is (M,) broadcast to each column of C.
+
+// GEMM with no activation (bias only)
+using GemmBiasNone = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::ColumnMajor,    // A
+    cutlass::half_t, cutlass::layout::ColumnMajor,    // B
+    cutlass::half_t, cutlass::layout::ColumnMajor,    // C
+    float,                                             // accumulator
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::half_t, 8, float, float>>;
+
+// GEMM with SiLU activation (bias + silu)
+using GemmBiasSiLU = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombinationSilu<
+        cutlass::half_t, 8, float, float>>;
+
+void cutlassGemmBias(void* output, const void* weight, const void* input,
+                     const void* bias, int M, int N, int K,
+                     ActivationFunction activation, cudaStream_t stream) {
+  // C(M,N) = act(W^T(M,K) @ X(K,N) + bias(M))
+  // In col-major: W is stored as (K,M), X as (K,N), C as (M,N).
+  // CUTLASS: OP_T on A means A is (K,M) and we compute A^T @ B.
+  // But CUTLASS device::Gemm expects A in the declared layout.
+  // We declare A as ColumnMajor(K,M) and use transposed GEMM.
+
+  auto run_gemm = [&](auto& gemm_op) {
+    using GemmType = std::decay_t<decltype(gemm_op)>;
+    typename GemmType::Arguments args(
+        {M, N, K},
+        {(cutlass::half_t*)weight, K},   // A: (K, M) col-major
+        {(cutlass::half_t*)input, K},     // B: (K, N) col-major
+        {(cutlass::half_t*)bias, 0},      // C: bias broadcast (stride 0)
+        {(cutlass::half_t*)output, M},    // D: output (M, N) col-major
+        {1.0f, 1.0f}                      // alpha, beta (beta=1 adds bias from C)
+    );
+    auto status = gemm_op(args, nullptr, stream);
+    if (status != cutlass::Status::kSuccess) {
+      throw Exception("CUTLASS GEMM failed: " +
+                      std::string(cutlass::cutlassGetStatusString(status)));
+    }
+  };
+
+  if (activation == ACTIVATION_SWISH) {
+    GemmBiasSiLU gemm;
+    run_gemm(gemm);
+  } else {
+    GemmBiasNone gemm;
+    run_gemm(gemm);
   }
 }
 

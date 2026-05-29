@@ -30,6 +30,8 @@
 #include "cuda_common.h"
 #include "neural/tables/activation_function.h"
 
+#include <cstdint>
+
 namespace lczero {
 namespace cudnn_backend {
 
@@ -57,6 +59,18 @@ template <typename T>
 void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
                     int C, int Nstride, ActivationFunction activation,
                     cudaStream_t stream);
+
+// Fused bias-add + tanh soft-cap. Used for V-projection finalization in
+// GLU-V attention paths (PyTorch order: silu(gate)*up → +pgb_v → softcap).
+//   total : total number of elements in input/output (e.g. N*64*d_model)
+//   C     : bias-broadcast period (i.e. d_model). Bias is length-C broadcast
+//           across `total / C` rows. Pass nullptr for bias to skip the add
+//           (cap-only mode, used when PGB is off but v_softcap > 0).
+//   softcap : tanh cap value; <=0 means no cap (kernel still copies, so
+//             prefer addBiasBatched in that case to avoid the write).
+template <typename T>
+void addBiasAndSoftCap(T* output, const T* input, const T* bias, int total,
+                       int C, float softcap, cudaStream_t stream);
 
 // Add bias to convolution's output.
 template <typename T>
@@ -136,12 +150,14 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
 
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2,
-             cudaStream_t stream);
+             cudaStream_t stream, float softcap = 0.0f,
+             float smolgen_cap = 0.0f);
 
 template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
                const T* skip, const T* gammas, const T* betas, float ep,
-               float alpha, ActivationFunction act, cudaStream_t stream);
+               float alpha, ActivationFunction act, cudaStream_t stream,
+               const T* input2 = nullptr, const T* out_add = nullptr);
 
 template <typename T>
 void ComputePromotionLogits(int N, int C, T* output, const T* keys,
@@ -155,6 +171,49 @@ void inputPreprocessForAttentionBody(T* output, const T* input,
                                      bool is_pe_dense_embedding,
                                      cudaStream_t stream);
 
+// Compute 18 material features from (N, 112, 8, 8) NCHW input planes.
+// Output: (N, 64, 18) NHWC. See common_kernels.cu for feature definitions.
+template <typename T>
+void computeMaterialFeatures(int N, T* output, const T* input,
+                             cudaStream_t stream);
+
+// Extended preprocess: [input(NCHW), material(NHWC), encoding] → NHWC output.
+template <typename T>
+void inputPreprocessForAttentionBodyWithMaterial(
+    T* output, const T* input, const T* material, const T* encoding,
+    int N, int input_size, int material_size, int encoding_size,
+    bool is_pe_dense_embedding, cudaStream_t stream);
+
+// Build per-square input for rich embedding MLP: concatenates the 12 piece
+// planes (from NCHW input), the 6 attack-map features (NHWC, optional), and
+// the 2 per-square material_info slots (indices 15/16 of 18-dim NHWC buf,
+// optional) into an NHWC (N, 64, total_sz) output buffer. `attack` / `material`
+// may be null if their respective features are disabled (sizes 0).
+template <typename T>
+void buildRichPerSquareInput(
+    T* output, const T* input_nchw,
+    const T* attack_nhwc, int attack_size,
+    const T* material_nhwc, int material_size,
+    int N, int total_sz, cudaStream_t stream);
+
+// Compute 6 attack-map features from (N, 112, 8, 8) NCHW input planes.
+// Output: (N, 64, 6) NHWC. Features per square (see common_kernels.cu):
+//   [0] own_attacked  [1] opp_attacked  [2] own_attack_count/6
+//   [3] opp_attack_count/6  [4] own_defended  [5] opp_hanging
+template <typename T>
+void computeAttackMaps(int N, T* output, const T* input, cudaStream_t stream);
+
+// Extended preprocess: [input(NCHW), extra1(NHWC), extra2(NHWC), encoding] → NHWC.
+// Used when both material_info and attack_maps are active (extra1=material 18,
+// extra2=attack_maps 6).
+template <typename T>
+void inputPreprocessForAttentionBodyWithTwoExtras(
+    T* output, const T* input,
+    const T* extra1, int extra1_size,
+    const T* extra2, int extra2_size,
+    const T* encoding, int N, int input_size, int encoding_size,
+    bool is_pe_dense_embedding, cudaStream_t stream);
+
 template <typename T>
 void applyInputGating(T* output, const T* input, const T* mult, const T* add,
                       int N, int HW, int C, cudaStream_t stream);
@@ -163,6 +222,178 @@ template <typename T>
 void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
                        int d_model, T* k, T* q, T* b1, T* v, T* b2,
                        cudaStream_t stream);
+
+// GQA variant of genOffsetPointers — each Q head h aliases the shared KV
+// head h_kv = h * kv_heads / heads.  K/V use stride kv_dim, Q/outputs use
+// d_model.  No physical KV expand (plain copy via offset aliasing).
+template <typename T>
+void genOffsetPointers_GQA(T** offsets, int heads, int kv_heads, int max_batch,
+                           int depth, int d_model, int kv_dim, T* k, T* q,
+                           T* b1, T* v, T* b2, cudaStream_t stream);
+
+// Weighted-GQA physical expand: K_out[n,h,s,d] = Σ_k W_k[h,k]*K_in[n,k,s,d]
+// (same for V).  Used when plain GQA's offset-aliasing isn't enough because
+// each Q head needs a learnable blend across the kv_heads.  Input K/V are
+// kv_dim-strided; output K/V are d_model-strided.
+//
+// Optional fused pre-blend ops (pointer == nullptr / softcap == 0 to skip):
+//   b_k        : (kv_dim,) bias added to k_in before the blend sum.
+//   b_v        : (kv_dim,) bias (PGB) added to v_in before softcap+blend.
+//   v_softcap  : applies v_cap * tanh(v_val / v_cap) per kv-slice.
+// Math identity:  Σ_k W[h,k] * (X[k] + b[k])  ==  Σ_k W[h,k]*X[k] + Σ_k W[h,k]*b[k]
+// so fusing bias inside the loop yields the same K_out/V_out as a
+// separate addBias kernel followed by the unfused expand.
+// k_in_stride / v_in_stride (optional, default 0 → use kv_dim):
+//   The per-position column stride of K/V in their input buffers.  Pass
+//   non-zero when K is embedded in a wider container (e.g. the fused
+//   QKV output buffer where K lives at offset d_model with stride
+//   d_model + 3*kv_dim).  The caller passes a K-pointer already offset
+//   to K's first row; this stride is then the WIDER container stride.
+//   V usually remains kv_dim-strided (its own SwiGLU output buffer).
+template <typename T>
+void expandKVWeighted(T* k_out, T* v_out, const T* k_in, const T* v_in,
+                      const T* w_k, const T* w_v, int N, int heads,
+                      int kv_heads, int depth, int d_model, int kv_dim,
+                      cudaStream_t stream,
+                      const T* b_k = nullptr, const T* b_v = nullptr,
+                      float v_softcap = 0.0f,
+                      const T* exo_k_anc = nullptr,
+                      const T* exo_v_anc = nullptr,
+                      int k_in_stride = 0, int v_in_stride = 0);
+
+// addBiasAndAdd: out[i] = in[i] + broadcast_bias[i % width] + add[i].
+// Used to fuse Q2's bias add with the Q exo anchor add — the K/V exo
+// goes into expandKVWeighted, so this kernel completes AddExoAnchors
+// elimination on the GQA + ExoFormer path.
+template <typename T>
+void addBiasAndAdd(T* out, const T* in, const T* bias, const T* add,
+                   int total, int width, cudaStream_t stream);
+
+// addBiasSiluStrided: out[b*stride + c] = silu(in[b*stride + c] + bias[c])
+// for b in [0, batch), c in [0, inner).  Used for Q1's silu+bias step
+// when Q1 lives in the fused QKV output buffer at offset 0 with the
+// wider column stride (= d_model + 3*kv_dim).
+template <typename T>
+void addBiasSiluStrided(T* out, const T* in, const T* bias,
+                        int batch, int inner, int stride,
+                        cudaStream_t stream);
+
+// RMSNorm: x * |gamma| / rms(x).  Same calling convention as LayerNorm
+// but omits mean-centering and beta.  bias/skip may be null.
+template <typename T>
+void RMSNorm(int N, int C, T* output, const T* input, const T* bias,
+             const T* skip, const T* gammas, float ep, float alpha,
+             ActivationFunction act, cudaStream_t stream,
+             const T* input2 = nullptr);
+
+// Fused SiLU(gate) * up elementwise (SwiGLU FFN).
+// swiglu_softcap > 0 applies tanh(out/cap)*cap to the silu*up product before
+// returning. 0 disables (no cap). Used by FFN paths; V projection paths
+// continue to use v_softcap via a separate fusion in their own kernels.
+template <typename T>
+void SwiGLUElementwise(int total, T* output, const T* gate, const T* up,
+                       const T* gate_bias, const T* up_bias,
+                       cudaStream_t stream,
+                       float swiglu_softcap = 0.0f);
+
+// SwiGLU with biases fused into the elementwise kernel. Saves 2 kernel
+// launches per SwiGLU FFN call versus separate addBiasBatched + SwiGLU.
+// `dff` is the per-token feature dim for bias indexing.
+// swiglu_softcap > 0 applies tanh-bound to the output; 0 disables.
+// pgb_bias (optional): broadcasts (dff,) PGB add over the silu*up output
+//   (post-softcap, pre-write).  Folds the FFN's separate
+//   addBiasBatched(ffn_pgb_) launch into this kernel.
+template <typename T>
+void SwiGLUElementwiseWithBias(int total, int dff, T* output, const T* gate,
+                                const T* up, const T* gate_bias,
+                                const T* up_bias, cudaStream_t stream,
+                                float swiglu_softcap = 0.0f,
+                                const T* pgb_bias = nullptr);
+
+// Fused SwiGLU for single-GEMM output [gate; up] of shape (batch, 2*dff).
+// Reads interleaved gate/up per batch element, adds biases, applies silu * up.
+// Output shape: (batch, dff).
+// swiglu_softcap > 0 applies tanh-bound to the output; 0 disables.
+// pgb_bias (optional): see SwiGLUElementwiseWithBias above.
+// column_stride (optional, default = 2*dff): the per-batch stride in
+// the gate_up buffer.  Pass non-zero to read gate/up out of a wider
+// container (e.g. the fused QKV output buffer where gate/up live at
+// some offset with stride d_model+3*kv_dim).  Within each column, gate
+// occupies rows [0..dff), up rows [dff..2*dff).  Pass 0 to use the
+// natural 2*dff packing.
+template <typename T>
+void SwiGLUFusedGateUp(int batch, int dff, T* output, const T* gate_up,
+                       const T* gate_bias, const T* up_bias,
+                       cudaStream_t stream,
+                       float swiglu_softcap = 0.0f,
+                       const T* pgb_bias = nullptr,
+                       int column_stride = 0);
+
+// Concatenate per-square features with broadcast global features.
+// output: (N, 64, sq_size + global_size) from sq: (N*64, sq_size) and
+// global: (N, global_size) broadcast to all 64 squares.
+template <typename T>
+void ConcatSquareAndGlobal(int N, int sq_size, int global_size,
+                           T* output, const T* sq_features,
+                           const T* global_features, cudaStream_t stream);
+
+// Weighted blend: output[i] = alpha * a[i] + beta * b[i].
+// Used for ExoFormer anchor blending.
+template <typename T>
+void WeightedAdd(int total, T* output, float alpha, const T* a,
+                 float beta, const T* b, cudaStream_t stream);
+
+// Fused ExoFormer anchor add: Q += Qa, K += Ka, V += Va in one kernel launch.
+// All three tensors must have the same element count.
+// Saves 2 kernel launch overheads per encoder layer vs 3 separate addVectors.
+template <typename T>
+void AddExoAnchors(int total, T* q, const T* aq, T* k, const T* ak,
+                   T* v, const T* av, cudaStream_t stream);
+
+#ifdef USE_CUTLASS
+// CUTLASS GEMM + Bias + Activation: C = act(W^T @ X + bias).
+// Fuses the projection GEMM with bias addition and optional SiLU activation.
+// Half precision only (tensor cores). Falls back to cuBLAS when not available.
+void cutlassGemmBias(void* output, const void* weight, const void* input,
+                     const void* bias, int M, int N, int K,
+                     ActivationFunction activation, cudaStream_t stream);
+#endif
+
+// Fused attention for 64-token sequences: Q×K^T + bias → softmax → ×V → output.
+// Entire attention matrix lives in shared memory — never touches global.
+// One thread block per (batch, head). SmolGen bias fused if non-null.
+template <typename T>
+void FusedAttention64(int N, int num_heads, int depth, int d_model,
+                      T* output, const T* Q, const T* K, const T* V,
+                      const T* smolgen_bias, cudaStream_t stream);
+
+// Fused VGA-E: output[i] *= sigmoid(gate[i] + bias[i % bias_size]).
+// Replaces addVectors(sigmoid) + ElementwiseMultiply in one pass.
+template <typename T>
+void FusedVGAE(int total, T* output, const T* gate, const T* bias,
+               int bias_size, cudaStream_t stream);
+
+// Fused Residual Add + LayerNorm: ln_output = LN(residual + delta).
+// Also writes residual_output = residual + delta if non-null.
+// Replaces addVectors + NormLayer in one pass.
+template <typename T>
+void FusedResidualAddLN(int tokens, int emb, T* ln_output,
+                        T* residual_output, const T* residual,
+                        const T* delta, const T* gamma, const T* beta,
+                        float eps, cudaStream_t stream);
+
+// Fused 3-way vector add: output = a + b + c. For parallel FFN where we
+// need in_out += attn_out + ffn_out. Saves one kernel launch + one read/write
+// pass over the biggest tensor (in_out) versus two addVectors calls.
+template <typename T>
+void Add3(int total, T* output, const T* a, const T* b, const T* c,
+          cudaStream_t stream);
+
+// Element-wise multiply: output[i] = a[i] * b[i].
+// Used for VGA-E gating where sigmoid is already applied to one operand.
+template <typename T>
+void ElementwiseMultiply(int total, T* output, const T* a, const T* b,
+                         cudaStream_t stream);
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
