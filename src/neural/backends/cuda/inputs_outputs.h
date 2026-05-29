@@ -156,10 +156,29 @@ struct InputsOutputs {
         cudaEventCreateWithFlags(&policy_done_event_, cudaEventDisableTiming));
     ReportCUDAErrors(
         cudaEventCreateWithFlags(&value_done_event_, cudaEventDisableTiming));
-    ReportCUDAErrors(cudaEventCreateWithFlags(&wdl_download_done_event_,
-                                              cudaEventDisableTiming));
-    ReportCUDAErrors(cudaEventCreateWithFlags(&download_done_event_,
-                                              cudaEventDisableTiming));
+    // download_done_event_ and wdl_download_done_event_ are the only
+    // events that finishEval() blocks on with cudaEventSynchronize.  By
+    // default CUDA picks spinning when CUDA contexts ≤ logical CPUs
+    // (which is the typical case — one context per process), so a busy
+    // wait burns 100% CPU on every inference while the GPU is still
+    // running.  In selfplay with N concurrent lc0 processes that's N
+    // cores wasted on polling.  cudaEventBlockingSync flips the event
+    // to OS-blocking — the calling thread sleeps until a GPU interrupt
+    // fires.  Adds ~a few µs of wakeup latency per inference, which is
+    // negligible vs the per-batch GPU time (~ms) and recovers full CPU
+    // budget for actual search work.
+    //
+    // Other events (policy_done_event_, value_done_event_, etc.) are
+    // ONLY used as the trigger for cudaStreamWaitEvent — that's a
+    // GPU-side wait that doesn't poll on CPU, so the blocking flag
+    // doesn't apply to them and we leave those with just
+    // cudaEventDisableTiming.
+    ReportCUDAErrors(cudaEventCreateWithFlags(
+        &wdl_download_done_event_,
+        cudaEventDisableTiming | cudaEventBlockingSync));
+    ReportCUDAErrors(cudaEventCreateWithFlags(
+        &download_done_event_,
+        cudaEventDisableTiming | cudaEventBlockingSync));
     if (moves_left) {
       ReportCUDAErrors(cudaHostAlloc(
           &op_moves_left_mem_, maxBatchSize * sizeof(op_moves_left_mem_[0]),
