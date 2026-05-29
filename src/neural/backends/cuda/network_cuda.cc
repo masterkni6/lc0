@@ -368,6 +368,23 @@ class CudaNetwork : public Network {
 
     gpu_id_ = options.GetOrDefault<int>("gpu", 0);
     enable_graph_capture_ = options.GetOrDefault<bool>("graph_capture", true);
+    // GPU-side optimistic policy blend.  When > 0, a small CUDA kernel
+    // runs after both policy chains and pre-blends vanilla + optimistic
+    // logits in place into op_policy_opt_mem_gpu_ via linear logit
+    // interpolation.  Mathematically equivalent to the geometric blend
+    // CPU search computes per node (because softmax is invariant under
+    // linear blends of logits — see common_kernels.cu derivation).
+    //
+    // Usage: set this to the same value you'd otherwise pass to BOTH
+    // --optimistic-policy-weight AND --optimistic-policy-weight-internal,
+    // and set those search flags to 1.0 instead.  Search then uses the
+    // α=1.0 fast path (SetP from p_optimistic without blending) and the
+    // GPU has already done the blend.  Saves the per-node CPU pow+sum+
+    // renorm chain (~30 ops/edge × ~30 edges/node × N nodes ≈ N·900 ops
+    // per search) at the cost of one cheap O(N_outputs) kernel per
+    // inference.  Default 0 (disabled).  Only honored when the net has
+    // the optimistic head built (has_optimistic_policy_).
+    gpu_blend_alpha_ = options.GetOrDefault<float>("gpu_blend_alpha", 0.0f);
     // Note: parallel FFN (multi-stream FFN) is compatible with graph capture
     // via the dual-graph approach: the main graph uses External event flags
     // to signal/wait on the FFN stream without causing isolation errors.
@@ -1218,6 +1235,27 @@ class CudaNetwork : public Network {
           batchSize, (DataType*)io->op_policy_opt_mem_gpu_, spare1,
           nullptr, scratch_mem, scratch_size_, nullptr, cublas,
           compute_stream);  // optimistic policy map  // OPT POLICY output
+      // GPU-side optimistic policy blend.  Both policy chains have run on
+      // compute_stream and their logits live in op_policy_mem_gpu_ (vanilla)
+      // and op_policy_opt_mem_gpu_ (optimistic).  When `gpu_blend_alpha_`
+      // is set, overwrite the optimistic buffer in place with the linear
+      // blend of the two logits.  After host softmax (wrapper.cc), the
+      // priors search reads via GetPValOptimistic() are mathematically
+      // identical to the per-node geometric blend at this alpha — without
+      // the per-node CPU cost.  See blendPolicyLogits_kernel in
+      // common_kernels.cu for the proof.
+      //
+      // Compute_stream ordering: this kernel reads vanilla (written
+      // earlier on the same stream above) and reads+writes optimistic
+      // (just written above).  No cross-stream sync needed — the same
+      // compute_stream sequences all three operations.
+      if (gpu_blend_alpha_ > 0.0f) {
+        BlendPolicyLogits<DataType>(
+            kNumOutputPolicy * batchSize,
+            (DataType*)io->op_policy_opt_mem_gpu_,
+            (const DataType*)io->op_policy_mem_gpu_, gpu_blend_alpha_,
+            compute_stream);
+      }
       ReportCUDAErrors(
           cudaEventRecord(io->policy_opt_done_event_, compute_stream));
       ReportCUDAErrors(cudaStreamWaitEvent(
@@ -1534,6 +1572,11 @@ class CudaNetwork : public Network {
   int max_batch_size_;
   int min_batch_size_;
   bool enable_graph_capture_;
+  // GPU-side optimistic policy blend coefficient.  When > 0 and the net
+  // has the optimistic head built, runs blendPolicyLogits_kernel on
+  // compute_stream after both policy maps to linearly blend logits.
+  // Default 0 (disabled); see ctor for the option-read.
+  float gpu_blend_alpha_ = 0.0f;
   bool wdl_;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual

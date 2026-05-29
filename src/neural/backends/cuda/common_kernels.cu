@@ -2033,6 +2033,55 @@ template void Add3<float>(int, float*, const float*, const float*,
 template void Add3<half>(int, half*, const half*, const half*, const half*,
                           cudaStream_t);
 
+// ── GPU-side optimistic policy blend ─────────────────────────────────────
+// Linear interpolation of vanilla and optimistic policy LOGITS in place
+// (writes back into the optimistic buffer).  Math:
+//
+//   blended_logit[i] = (1 - α) · vanilla_logit[i] + α · optimistic_logit[i]
+//
+// After the host-side softmax (wrapper.cc SoftmaxPolicy), this is
+// mathematically equivalent to the per-edge geometric blend
+// P_main^(1-α) · P_opt^α that the CPU blend computes per node:
+//
+//   softmax((1-α)·L_v + α·L_o) = softmax(L_v)^(1-α) · softmax(L_o)^α / Z
+//
+// Constants drop out of softmax, so the linear blend in logit space
+// recovers the geometric blend in probability space exactly.  Saves the
+// per-node CPU blend cost in search.cc (~30 pow + sum + renorm per
+// node) by doing one cheap linear blend once per inference on GPU.
+//
+// Triggered by setting backend option `gpu_blend_alpha` to a value in
+// (0, 1).  Search then needs to be configured with --optimistic-policy-
+// weight=1.0 and --optimistic-policy-weight-internal=1.0 so it uses
+// the fast path (SetP from p_optimistic directly without further
+// blending) — the GPU has already done the blend.  At α_root = α_
+// internal the GPU blend is mathematically complete; at split alphas
+// don't enable the GPU blend (fall back to the per-node CPU path).
+template <typename T>
+__global__ void blendPolicyLogits_kernel(T* opt_inout, const T* vanilla,
+                                          float alpha, int total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const float v = (float)vanilla[i];
+  const float o = (float)opt_inout[i];
+  opt_inout[i] = (T)((1.0f - alpha) * v + alpha * o);
+}
+
+template <typename T>
+void BlendPolicyLogits(int total, T* opt_inout, const T* vanilla, float alpha,
+                       cudaStream_t stream) {
+  const int kBlockSize = 256;
+  int blocks = DivUp(total, kBlockSize);
+  blendPolicyLogits_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+      opt_inout, vanilla, alpha, total);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+template void BlendPolicyLogits<float>(int, float*, const float*, float,
+                                        cudaStream_t);
+template void BlendPolicyLogits<half>(int, half*, const half*, float,
+                                       cudaStream_t);
+
 // ── Fused ExoFormer anchor add: Q += Qa, K += Ka, V += Va ────────────────
 // Collapses 3 separate addVectors kernel launches into 1 for the common
 // default-lambda ExoFormer path. Saves ~2 launches per encoder layer.

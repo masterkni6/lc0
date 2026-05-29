@@ -389,6 +389,17 @@ template <typename T>
 void Add3(int total, T* output, const T* a, const T* b, const T* c,
           cudaStream_t stream);
 
+// GPU-side optimistic policy blend.  Linearly interpolates vanilla and
+// optimistic policy LOGITS in place into the optimistic buffer:
+//   opt_inout[i] = (1 - alpha) * vanilla[i] + alpha * opt_inout[i]
+// After host softmax this is mathematically equivalent to the per-edge
+// geometric blend P_main^(1-α) · P_opt^α the CPU search code computes
+// per node — but it runs once per inference on GPU instead of N times
+// per inference on CPU.  See common_kernels.cu for the derivation.
+template <typename T>
+void BlendPolicyLogits(int total, T* opt_inout, const T* vanilla, float alpha,
+                       cudaStream_t stream);
+
 // Element-wise multiply: output[i] = a[i] * b[i].
 // Used for VGA-E gating where sigmoid is already applied to one operand.
 template <typename T>
