@@ -1320,32 +1320,47 @@ Move ChessBoard::ParseMove(std::string_view move_str) const {
     // FRC-style castling: chess960 king-takes-rook UCI ("c8a8" = king at c8
     // castles with rook at a8).  Must explicitly require a ROOK at the
     // destination — previously this only checked our_pieces_.get(to), which
-    // also matches the king's own square in the degenerate "c8c8" case below
-    // and would mis-encode WhiteCastling(c, c) (rook supposedly at c-file).
+    // also matched the king's own square in the degenerate "c8c8" case and
+    // would mis-encode WhiteCastling(c, c) (rook supposedly at c-file).
     return Move::WhiteCastling(from.file(), to.file());
   }
-  // Standard-UCI chess960 castling: some engines (including SF in certain
-  // edge cases under UCI_Chess960=true) emit king-source to king-destination
-  // even in chess960 mode.  For positions where the king's castling
-  // destination file equals its starting file (DFRC king on c-file castles
-  // queenside, ends up on c-file; king on g-file castles kingside, ends up
-  // on g-file), the resulting UCI move is a same-square "c8c8" or "g8g8".
-  // Resolve by looking up the actual rook file from castling rights.
-  if (from == our_king_ && from == to) {
-    if (from.file() == kFileC && castlings_.we_can_000()) {
+  // Standard-UCI chess960 castling: some engines (including SF under
+  // UCI_Chess960=true in certain builds / edge cases) emit standard UCI
+  // for castling — king source to king destination — even when chess960
+  // mode is set.  Chess960 castling always lands the king on file C
+  // (queenside) or file G (kingside).  Disambiguate from a normal king
+  // move by also requiring that the matching castling right is still
+  // available — any king move (castling or otherwise) consumes castling
+  // rights immediately, so if the right is still present we know no
+  // king move has happened on that side yet, and the only legal way for
+  // the king to land on its castling target file via this single UCI
+  // move is the castling itself.
+  //
+  // Covers three sub-cases:
+  //   - Same-square: king already on its castling target file (DFRC king
+  //     on c-file castles queenside → "c8c8"; on g-file → "g8g8").
+  //   - Non-adjacent: king moves 2+ files to the castling target (the
+  //     classic "d8g8" or "e1c1" form).
+  //   - Adjacent (1 file): king at b-file castling queenside to c, or at
+  //     f/h castling kingside to g.  Ambiguous on its own but the
+  //     castling-right check disambiguates.
+  if (from == our_king_ && to.rank() == from.rank()) {
+    if (to.file() == kFileC && castlings_.we_can_000()) {
       return Move::WhiteCastling(from.file(), castlings_.our_queenside_rook);
     }
-    if (from.file() == kFileG && castlings_.we_can_00()) {
+    if (to.file() == kFileG && castlings_.we_can_00()) {
       return Move::WhiteCastling(from.file(), castlings_.our_kingside_rook);
     }
-    complain("same-square king move with no castling rights on matching side");
   }
+  // Legacy standard-chess special cases (king starts on e1 — these are
+  // strictly redundant with the general handler above since e1 is also
+  // covered by it, but kept for clarity and to preserve historical
+  // behaviour for non-FRC positions that don't go through the chess960
+  // code path).
   if (from == our_king_ && from == kSquareE1 && to == kSquareG1) {
-    // Kingside castling.
     return Move::WhiteCastling(from.file(), kFileH);
   }
   if (from == our_king_ && from == kSquareE1 && to == kSquareC1) {
-    // Qeenside castling.
     return Move::WhiteCastling(from.file(), kFileA);
   }
   if (from.file() != to.file() && pawns().get(from) && !their_pieces_.get(to)) {
