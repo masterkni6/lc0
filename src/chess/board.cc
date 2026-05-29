@@ -1316,9 +1316,29 @@ Move ChessBoard::ParseMove(std::string_view move_str) const {
     if (!promotion.CanPromoteInto()) complain("invalid promotion");
     return Move::WhitePromotion(from, to, promotion);
   }
-  if (from == our_king_ && our_pieces_.get(to)) {
-    // FRC-style castling.
+  if (from == our_king_ && our_pieces_.get(to) && rooks().get(to)) {
+    // FRC-style castling: chess960 king-takes-rook UCI ("c8a8" = king at c8
+    // castles with rook at a8).  Must explicitly require a ROOK at the
+    // destination — previously this only checked our_pieces_.get(to), which
+    // also matches the king's own square in the degenerate "c8c8" case below
+    // and would mis-encode WhiteCastling(c, c) (rook supposedly at c-file).
     return Move::WhiteCastling(from.file(), to.file());
+  }
+  // Standard-UCI chess960 castling: some engines (including SF in certain
+  // edge cases under UCI_Chess960=true) emit king-source to king-destination
+  // even in chess960 mode.  For positions where the king's castling
+  // destination file equals its starting file (DFRC king on c-file castles
+  // queenside, ends up on c-file; king on g-file castles kingside, ends up
+  // on g-file), the resulting UCI move is a same-square "c8c8" or "g8g8".
+  // Resolve by looking up the actual rook file from castling rights.
+  if (from == our_king_ && from == to) {
+    if (from.file() == kFileC && castlings_.we_can_000()) {
+      return Move::WhiteCastling(from.file(), castlings_.our_queenside_rook);
+    }
+    if (from.file() == kFileG && castlings_.we_can_00()) {
+      return Move::WhiteCastling(from.file(), castlings_.our_kingside_rook);
+    }
+    complain("same-square king move with no castling rights on matching side");
   }
   if (from == our_king_ && from == kSquareE1 && to == kSquareG1) {
     // Kingside castling.
