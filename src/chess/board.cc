@@ -1328,27 +1328,31 @@ Move ChessBoard::ParseMove(std::string_view move_str) const {
   // UCI_Chess960=true in certain builds / edge cases) emit standard UCI
   // for castling — king source to king destination — even when chess960
   // mode is set.  Chess960 castling always lands the king on file C
-  // (queenside) or file G (kingside).  Disambiguate from a normal king
-  // move by also requiring that the matching castling right is still
-  // available — any king move (castling or otherwise) consumes castling
-  // rights immediately, so if the right is still present we know no
-  // king move has happened on that side yet, and the only legal way for
-  // the king to land on its castling target file via this single UCI
-  // move is the castling itself.
+  // (queenside) or file G (kingside).
   //
-  // Covers three sub-cases:
-  //   - Same-square: king already on its castling target file (DFRC king
-  //     on c-file castles queenside → "c8c8"; on g-file → "g8g8").
-  //   - Non-adjacent: king moves 2+ files to the castling target (the
-  //     classic "d8g8" or "e1c1" form).
-  //   - Adjacent (1 file): king at b-file castling queenside to c, or at
-  //     f/h castling kingside to g.  Ambiguous on its own but the
-  //     castling-right check disambiguates.
+  // Disambiguation from a normal king move: in chess960 mode, SF's
+  // castling output uses king-takes-rook form by default; the standard-
+  // UCI fallback is only used in two reliable cases:
+  //   (a) same-square — king already on the castling target file, so
+  //       the move "looks like" 0-distance (e.g. "c8c8" / "g8g8")
+  //   (b) non-adjacent — king moves 2+ files to the target file
+  //       (e.g. "d8g8" / "e1c1")
+  // A 1-file king move TO the castling target file (e.g. "b1c1",
+  // "f8g8") looks like castling shape-wise but in practice SF emits it
+  // for NORMAL 1-square king moves, NOT castling — even when castling
+  // rights are still available.  So we treat 1-file king moves as
+  // regular moves and fall through.
+  //
+  // The castling-right gate also filters out moves where the right was
+  // cleared earlier (king or rook moved already on that side).
   if (from == our_king_ && to.rank() == from.rank()) {
-    if (to.file() == kFileC && castlings_.we_can_000()) {
+    const int file_dist = std::abs(static_cast<int>(to.file().idx) -
+                                    static_cast<int>(from.file().idx));
+    const bool is_castle_shape = (file_dist == 0 || file_dist >= 2);
+    if (is_castle_shape && to.file() == kFileC && castlings_.we_can_000()) {
       return Move::WhiteCastling(from.file(), castlings_.our_queenside_rook);
     }
-    if (to.file() == kFileG && castlings_.we_can_00()) {
+    if (is_castle_shape && to.file() == kFileG && castlings_.we_can_00()) {
       return Move::WhiteCastling(from.file(), castlings_.our_kingside_rook);
     }
   }
