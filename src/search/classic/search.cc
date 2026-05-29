@@ -452,10 +452,572 @@ inline float ComputeCpuct(const SearchParams& params, uint32_t N,
   const float base = params.GetCpuctBase(is_root_node);
   return init + (k ? k * FastLog((N + base) / base) : 0.0f);
 }
+
+// KataGo-style forced exploration quota (Wu 2019, §5.1).
+// Returns the minimum visit count this edge should accumulate before
+// PUCT may stop visiting it.
+inline float GetForcedExploration(float policy, float total_visits_with_vl,
+                                  float factor) {
+  return std::sqrt(policy * total_visits_with_vl * factor);
+}
+
+// Dispatch forced visits to a single root edge if it's under quota,
+// per PR 2415's adaptation of KataGo's recipe to lc0's batched +
+// multi-threaded MCTS.  Differences from the paper:
+//   - Uses `nstarted` (= N + n_in_flight) rather than `N`.  Accounts
+//     for visits in flight via virtual loss across worker threads.
+//   - Uses parent's GetChildrenVisits + GetNInFlight (parent's total
+//     "started" work) in the formula, not just GetChildrenVisits.
+//   - Caller must guard against IsTerminal() and against
+//     `cur_iters[idx].GetN() == 0` (delay forcing until the edge has
+//     received its first natural PUCT visit) before calling this.
+//
+// Composable with an external advisor: when this edge happens to be
+// the advisor's recommended move, the minimum is max'd with
+// advisor_min_visits.  When advisor isn't applicable or disabled,
+// pass advisor_min_visits = 0.
+//
+// Mutates `cur_limit`, `nstarted`, and the child node's n_in_flight.
+// Returns the number of visits dispatched (which the caller adds to
+// visits_to_perform[idx]).
+template <typename Iter>
+int AddForcedExploration(const SearchParams& params, Node* node,
+                         Iter& iter, int& cur_limit, float policy,
+                         int& nstarted, Move advisor_move,
+                         int advisor_min_visits) {
+  const float factor = params.GetForcedExplorationFactor();
+  int minimum_visits = 0;
+  if (factor > 0.0f) {
+    minimum_visits = static_cast<int>(GetForcedExploration(
+        policy,
+        static_cast<float>(node->GetChildrenVisits() + node->GetNInFlight()),
+        factor));
+  }
+  // Advisor floor: if this edge matches the advisor's recommendation,
+  // ensure at least advisor_min_visits.  Disabled when 0.
+  if (advisor_min_visits > 0 && iter.GetMove() == advisor_move) {
+    minimum_visits = std::max(minimum_visits, advisor_min_visits);
+  }
+  if (nstarted >= minimum_visits) return 0;
+
+  Node* child_node = iter.GetOrSpawnNode(node);
+  const int new_visits = std::min(minimum_visits - nstarted, cur_limit);
+  cur_limit -= new_visits;
+  nstarted += new_visits;
+  child_node->IncrementNInFlight(new_visits);
+  return new_visits;
+}
 }  // namespace
 
 // Ignore the last tuple element when sorting in GetVerboseStats
 static bool operator<(const EdgeAndNode&, const EdgeAndNode&) { return false; }
+
+std::vector<float> Search::GetTrainingTargetVisits() const {
+  // Policy Target Pruning (KataGo Wu 2019 §5.1; lc0 adaptation per PR 2415).
+  //
+  // Cap: PUCT(c*) using FULL utility = Q + M + U  (not just Q + U).  M
+  // is the moves-left contribution from the MLH head; PR 2415 includes
+  // it because lc0's full PUCT score is Q + M + U.  Without M the cap
+  // would be inconsistent with what PUCT actually used to select edges.
+  //
+  // Algorithm:
+  //   1. c* = argmax_N over root edges (most-visited, NOT highest-utility).
+  //   2. best_utility = Q(c*) + M(c*) + U(c*) at c*'s actual N.
+  //   3. For each non-c* child c:
+  //        n_forced(c) = sqrt(P(c) * N_total * factor)
+  //                    + advisor floor if c is advisor's move
+  //        If Q(c) + M(c) + U(c at current N) >= best_utility, keep all
+  //        visits (PUCT would have visited c at least this much anyway).
+  //        Otherwise: N_eq = U_coeff * P(c) / (best_utility - (Q+M)(c)) - 1
+  //        target(c) = max(N_eq, n_raw(c) - n_forced(c))
+  //        target(c) = clamp(target(c), 0, n_raw(c)).
+  //   4. c* keeps all its visits.
+  //
+  // Why c* by N: anchoring to "the move PUCT consensus has selected
+  // most often" is more robust than highest-Q (a low-policy edge with
+  // few visits but transiently high Q would dethrone the real best).
+  std::vector<float> result;
+  if (root_node_ == nullptr) return result;
+  result.reserve(root_node_->GetNumEdges());
+
+  // Fast path: no pruning machinery enabled → just return raw N.
+  // Pruning runs when ANY of the following is true:
+  //   - forced exploration is active (factor > 0): pruning removes the
+  //     forced-visit distortion from the training target
+  //   - advisor is active (advisor_min_visits > 0): pruning removes the
+  //     advisor-forced-visit distortion (same mechanism)
+  //   - UsePolicyTargetPruning is explicitly enabled: pruning runs even
+  //     without those, to clamp PUCT early-exploration noise.  This is
+  //     KataGo's actual implementation behavior — their PTP clamp is
+  //     unconditional, not gated on forced visits being on.
+  const float factor = params_.GetForcedExplorationFactor();
+  const bool ptp_explicit = params_.GetUsePolicyTargetPruning();
+  const bool any_prune =
+      (factor > 0.0f) || (advisor_min_visits_ > 0) || ptp_explicit;
+  if (!any_prune) {
+    for (const auto& edge : root_node_->Edges()) {
+      result.push_back(static_cast<float>(edge.GetN()));
+    }
+    return result;
+  }
+
+  // Pre-compute the Q/M/U scaffolding for the root.
+  const bool is_root = true;
+  const bool is_odd_depth = !is_root;  // root depth is even
+  const float draw_score = GetDrawScore(is_odd_depth);
+  const float cpuct = ComputeCpuct(params_, root_node_->GetN(), is_root);
+  const float n_total_for_uct =
+      std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+  const float U_coeff = cpuct * n_total_for_uct;
+  // FPU uses the 4-arg form which queries GetVisitedPolicy internally —
+  // same as what the PUCT inner loop uses, so c's Q values match what
+  // PUCT saw during search.
+  const float fpu = GetFpu(params_, root_node_, is_root, draw_score);
+  const auto m_evaluator = backend_attributes_.has_mlh
+                               ? MEvaluator(params_, root_node_)
+                               : MEvaluator();
+
+  // Step 1: find c* (child with most playouts).
+  int c_star_idx = -1;
+  uint32_t c_star_n = 0;
+  int idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    const uint32_t n = edge.GetN();
+    if (n > c_star_n) {
+      c_star_n = n;
+      c_star_idx = idx;
+    }
+    ++idx;
+  }
+  // No visits at all → return raw counts.
+  if (c_star_idx < 0) {
+    for (const auto& edge : root_node_->Edges()) {
+      result.push_back(static_cast<float>(edge.GetN()));
+    }
+    return result;
+  }
+
+  // Step 2: compute best_utility = Q(c*) + M(c*) + U(c*) at c*'s N.
+  float best_utility = 0.0f;
+  Move advisor_move = advisor_move_;
+  idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    if (idx == c_star_idx) {
+      const float q_star = edge.GetQ(fpu, draw_score);
+      const float m_star = m_evaluator.GetMUtility(edge, q_star);
+      const float u_star =
+          U_coeff * edge.GetP() / (1.0f + static_cast<float>(c_star_n));
+      best_utility = q_star + m_star + u_star;
+      break;
+    }
+    ++idx;
+  }
+
+  // Step 3 + 4: per-edge pruning.
+  idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    const uint32_t n_raw_u = edge.GetN();
+    const float n_raw = static_cast<float>(n_raw_u);
+
+    if (idx == c_star_idx) {
+      result.push_back(n_raw);  // c* keeps all visits
+      ++idx;
+      continue;
+    }
+    if (n_raw_u == 0) {
+      result.push_back(0.0f);
+      ++idx;
+      continue;
+    }
+
+    const float p = edge.GetP();
+    const float q = edge.GetQ(fpu, draw_score);
+    const float m = m_evaluator.GetMUtility(edge, q);
+    const float u_now =
+        U_coeff * p / (1.0f + n_raw);
+    const float qm = q + m;  // utility for non-best
+
+    // Early-out: c's full PUCT (Q + M + U) already >= best_utility →
+    // PUCT would have naturally visited c at least this many times,
+    // so n_raw <= N_eq and the clamp below wouldn't reduce anything.
+    // Skip the math.
+    if (qm + u_now >= best_utility) {
+      result.push_back(n_raw);
+      ++idx;
+      continue;
+    }
+
+    // N_eq: where PUCT(c at N_eq) = best_utility.
+    //   qm + U_coeff * p / (1 + N_eq) = best_utility
+    //   N_eq = U_coeff * p / (best_utility - qm) - 1
+    const float n_eq = U_coeff * p / (best_utility - qm) - 1.0f;
+
+    // KataGo-style clamp: if actual visits exceeded PUCT-equilibrium,
+    // clamp down to equilibrium.  This is the actual KataGo
+    // implementation (getReducedPlaySelectionWeight: "if childWeight >
+    // childWeightWeRetrospectivelyWanted return childWeightWeRetro...").
+    // The paper's "subtract n_forced" framing is equivalent to this
+    // when forced visits inflated n_raw above equilibrium, but the
+    // implementation is the more general clamp.
+    // Operates whenever any_prune is true — so this fires for any of
+    // the three triggers (forced-exploration, advisor, or explicit
+    // UsePolicyTargetPruning).  When n_raw <= N_eq the early-out above
+    // already short-circuited; in the fallthrough we know n_raw > N_eq
+    // and the clamp meaningfully reduces visits.
+    float target = std::max(0.0f, std::min(n_eq, n_raw));
+    result.push_back(target);
+    ++idx;
+  }
+  return result;
+}
+
+// Gumbel-MuZero improved-policy training target.  Constructed at chunk-
+// write time from final search state.  Formula (from mctx's
+// qtransform_completed_by_mix_value + the gumbel_muzero_policy training
+// target builder):
+//
+//   target[i] = softmax(prior_logit[i] + conf[i] × σ(q)[i])
+//
+// where:
+//   prior_logit[i] = log(P(i))  — using lc0's post-softmax priors directly
+//   σ(q)[i]        = (maxvisit_init + max_N) × value_scale × rescaled_q[i]
+//   rescaled_q[i]  = (q[i] - q_min) / (q_max - q_min + ε)  ∈ [0, 1]
+//   q[i]           = empirical Q for visited edges
+//                  = v-mix imputed value for unvisited edges
+//   conf[i]        = sqrt(N[i]) / sqrt(max_N)  — sqrt-scaled confidence
+//                    that damps σ contribution for low-N (and ZEROs out
+//                    for N=0).  This is OUR deviation from mctx, needed
+//                    because PUCT-driven search doesn't visit all
+//                    candidates like Gumbel-SH would, so v-mix imputation
+//                    for unvisited moves is selection-biased.
+//
+// v-mix formula (mctx _compute_mixed_value):
+//   weighted_q  = sum(prior[i] × q[i] × visited[i]) / sum(prior[i] × visited[i])
+//   mixed_value = (raw_value + sum_visit_counts × weighted_q)
+//                 / (sum_visit_counts + 1)
+//
+// raw_value = root_node_->GetWL() — value-head prediction at root.
+//
+// Composes with forced exploration / advisor (more visited candidates =
+// better v-mix and more reliable σ(q)).  Mutually exclusive with PTP —
+// caller in selfplay/game.cc dispatches to either this or
+// GetTrainingTargetVisits, never both.
+std::vector<float> Search::GetGumbelImprovedPolicyTarget() const {
+  std::vector<float> result;
+  if (root_node_ == nullptr) return result;
+  const int num_edges = root_node_->GetNumEdges();
+  result.reserve(num_edges);
+
+  // Pull params for the σ transform.
+  const float maxvisit_init = params_.GetGumbelMuZeroCVisit();
+  const float value_scale = params_.GetGumbelMuZeroCScale();
+  constexpr float kEps = 1e-8f;
+
+  // Root is even-depth.
+  const bool is_odd_depth = false;
+  const float draw_score = GetDrawScore(is_odd_depth);
+  const float fpu = GetFpu(params_, root_node_, /*is_root=*/true, draw_score);
+
+  // First pass: collect prior logits, raw Q (with fpu for unvisited),
+  // visit counts; track sums and extremes.
+  std::vector<float> logits;
+  std::vector<float> qvals;
+  std::vector<uint32_t> visits;
+  logits.reserve(num_edges);
+  qvals.reserve(num_edges);
+  visits.reserve(num_edges);
+
+  uint32_t total_visits = 0;
+  uint32_t max_visits = 0;
+  float weighted_q_num = 0.0f;
+  float weighted_q_den = 0.0f;
+
+  for (const auto& edge : root_node_->Edges()) {
+    const float p = std::max(edge.GetP(), kEps);
+    const float lp = std::log(p);
+    const uint32_t n = edge.GetN();
+    const float q_visited = edge.GetQ(fpu, draw_score);  // = node Q if N>0
+    logits.push_back(lp);
+    visits.push_back(n);
+    qvals.push_back(q_visited);  // placeholder; overwritten for unvisited
+    total_visits += n;
+    if (n > max_visits) max_visits = n;
+    if (n > 0) {
+      weighted_q_num += p * q_visited;
+      weighted_q_den += p;
+    }
+  }
+
+  // No visits at all → return uniform-by-prior softmax.  Numerically
+  // stable softmax of logits alone.
+  if (total_visits == 0 || num_edges == 0) {
+    float lmax = -std::numeric_limits<float>::infinity();
+    for (float l : logits) lmax = std::max(lmax, l);
+    float sum = 0.0f;
+    for (float l : logits) sum += std::exp(l - lmax);
+    if (sum <= 0.0f) sum = 1.0f;
+    for (float l : logits) result.push_back(std::exp(l - lmax) / sum);
+    return result;
+  }
+
+  // v-mix imputed value for unvisited edges.  raw_value = network's
+  // value-head prediction at root.  GetWL() is the running mean which
+  // converges to that prediction; close enough for our purposes here.
+  //
+  // Sign-convention note: root_node_->GetWL() is stored in root's
+  // PARENT's perspective (see backprop trace at search.cc:2844 + 2948),
+  // i.e. opposite sign vs edge.GetQ() at root.  Negate so raw_value
+  // lives in the same root-to-move convention as qvals[] (which were
+  // populated from edge.GetQ() above).  Without this flip the v-mix
+  // averages two values with opposite sign conventions, which silently
+  // biases the imputed Q for unvisited edges by ~2·raw_value.
+  const float raw_value = -root_node_->GetWL();
+  const float weighted_q =
+      weighted_q_den > kEps ? (weighted_q_num / weighted_q_den) : raw_value;
+  const float mixed_value =
+      (raw_value + static_cast<float>(total_visits) * weighted_q) /
+      (static_cast<float>(total_visits) + 1.0f);
+
+  // Replace unvisited Q with mixed_value; track min/max for rescale.
+  float qmin = std::numeric_limits<float>::infinity();
+  float qmax = -std::numeric_limits<float>::infinity();
+  for (int i = 0; i < num_edges; ++i) {
+    if (visits[i] == 0) qvals[i] = mixed_value;
+    if (qvals[i] < qmin) qmin = qvals[i];
+    if (qvals[i] > qmax) qmax = qvals[i];
+  }
+
+  // Rescale Q to [0, 1].  Guard against qmax == qmin (all equal).
+  const float qrange = std::max(qmax - qmin, kEps);
+  for (int i = 0; i < num_edges; ++i) {
+    qvals[i] = (qvals[i] - qmin) / qrange;
+  }
+
+  // σ transform scale factor (constant per call).
+  const float visit_scale =
+      (maxvisit_init + static_cast<float>(max_visits)) * value_scale;
+
+  // sqrt-scaled confidence per edge.  N=0 → conf=0 → no σ contribution.
+  // Use max_visits as the denominator; if max_visits==0 (unreachable
+  // here since total_visits>0) treat as 1 to avoid divide-by-zero.
+  const float max_visits_sqrt =
+      std::sqrt(static_cast<float>(std::max(max_visits, 1u)));
+
+  // Combine: improved_logits[i] = logit + conf × σ(q).
+  std::vector<float> improved_logits(num_edges);
+  float lmax = -std::numeric_limits<float>::infinity();
+  for (int i = 0; i < num_edges; ++i) {
+    const float conf =
+        std::sqrt(static_cast<float>(visits[i])) / max_visits_sqrt;
+    improved_logits[i] = logits[i] + conf * visit_scale * qvals[i];
+    if (improved_logits[i] > lmax) lmax = improved_logits[i];
+  }
+
+  // Numerically stable softmax → output probability distribution.
+  float sum = 0.0f;
+  for (int i = 0; i < num_edges; ++i) {
+    improved_logits[i] = std::exp(improved_logits[i] - lmax);
+    sum += improved_logits[i];
+  }
+  if (sum <= 0.0f) sum = 1.0f;
+  for (int i = 0; i < num_edges; ++i) {
+    result.push_back(improved_logits[i] / sum);
+  }
+  return result;
+}
+
+std::vector<float> Search::GetGrillImprovedPolicyTarget() const {
+  // Implements the "Learn" variant of Grill et al. (ICML 2020), §4.2:
+  // π̄(a) = λ_N · prior(a) / (α − q(a))
+  // where α is solved via dichotomic search so π̄ sums to 1.
+  //
+  // UCI options (read once via params_.GetGrillC()):
+  //   --use-grill-improved-target  (bool) — gate at game.cc dispatch
+  //   --grill-c                    (float, default 1.0) — c constant
+  std::vector<float> result;
+  if (root_node_ == nullptr) return result;
+  result.reserve(root_node_->GetNumEdges());
+
+  const float kGrillC = params_.GetGrillC();
+
+  // Read root-edge state.  Q-imputation for unvisited edges: use the
+  // root's network value, NEGATED.  Simpler than v-mix; the paper doesn't
+  // specify so we pick the straightforward option and refine later if
+  // results suggest it.
+  //
+  // Sign-convention note (verified against backprop in
+  // DoBackupUpdateSingleNode + line 2844 NN-q flip):
+  //   - node.wl_ is stored in the PARENT-of-node's perspective.
+  //   - edge.GetQ(fpu, draw_score) reads CHILD node's wl_, so it is in
+  //     the SELECTING node's (= root's) to-move perspective — exactly
+  //     what PUCT consumes at line 2765.
+  //   - root_node_->GetWL() is in root's PARENT's perspective, i.e.
+  //     the OPPOSITE sign of edge.GetQ() at root.  We therefore negate
+  //     it before mixing with edge.GetQ() values, so the unvisited
+  //     imputation lives in the same convention as the visited Q's.
+  const bool is_root = true;
+  const bool is_odd_depth = !is_root;
+  const float draw_score = GetDrawScore(is_odd_depth);
+  const float fpu = GetFpu(params_, root_node_, is_root, draw_score);
+  const float raw_value =
+      -static_cast<float>(root_node_->GetWL());  // flip to root-to-move view
+
+  std::vector<float> priors;
+  std::vector<float> qs;
+  uint32_t total_visits = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    priors.push_back(edge.GetP());
+    if (edge.GetN() > 0) {
+      qs.push_back(edge.GetQ(fpu, draw_score));
+    } else {
+      // Unvisited: impute Q with the root's network value.  More
+      // sophisticated approaches (v-mix from visited siblings)
+      // could go here.
+      qs.push_back(raw_value);
+    }
+    total_visits += edge.GetN();
+  }
+
+  if (total_visits == 0) {
+    // No search happened.  Return prior as-is (no information to
+    // shape it Q-wise).
+    for (float p : priors) result.push_back(p);
+    return result;
+  }
+
+  // λ_N = c · √N / (|𝒜| + N) per Grill et al. (ICML 2020), Eq. 4.
+  // |𝒜| is the number of legal root actions (priors.size()).  This shape
+  // peaks around N ≈ |𝒜| and decays as N grows, so π̄ relaxes from the
+  // prior toward the Q-greedy distribution at high visit counts.
+  const float lambda_N =
+      kGrillC * std::sqrt(static_cast<float>(total_visits)) /
+      (static_cast<float>(priors.size()) +
+       static_cast<float>(total_visits));
+
+  // Degenerate case: λ_N = 0 makes π̄ = 0 / (α − q) = 0 for all actions,
+  // which cannot sum to 1.  This happens when grill-c is set to 0 (the
+  // formula collapses to "no Q signal at all").  Defensive guard rather
+  // than silently producing an invalid distribution OR hanging in the
+  // safety-expansion loop below (which doubles a 0 gap and never
+  // terminates).  Fall back to the prior.
+  if (lambda_N <= 0.0f) {
+    for (float p : priors) result.push_back(p);
+    return result;
+  }
+
+  // Solve for α via dichotomic search.  Implementation notes vs the
+  // straightforward "bisect on α directly in float" approach:
+  //
+  //   1. Variable transformation: β = α − q_max.  This eliminates
+  //      catastrophic floating-point cancellation when prior(argmax_q)
+  //      is small.  The original formula has α very close to q_max in
+  //      that regime; subtracting two ~O(0.6) numbers to get a O(1e-30)
+  //      difference destroys all precision in fp32.  Working in β
+  //      directly keeps the magnitude where we need precision.
+  //
+  //   2. Bound on β: from Grill Appendix B.3, β ∈ (0, λ_N].
+  //      f(β) := Σ_a λ_N · prior(a) / (β + Δq(a)) where Δq = q_max − q.
+  //      f is strictly decreasing on (0, ∞), f → ∞ as β → 0,
+  //      f(λ_N) ≤ Σ_a prior(a) = 1.  So β* exists uniquely in (0, λ_N].
+  //
+  //   3. Double precision: the bisection and the final π̄ computation
+  //      use double.  At β ≈ 1e-30, fp32 has no precision left;
+  //      fp64 gives us ~15 digits which is enough for any realistic
+  //      prior distribution.
+  //
+  //   4. Geometric-mean midpoint: arithmetic-mean bisection wastes
+  //      iterations when β* is many orders of magnitude smaller than
+  //      β_high.  Using √(β_low · β_high) instead halves the LOG range
+  //      per iteration — converges in 50 iterations regardless of
+  //      β-scale (from λ_N down to 1e-300).
+  //
+  //   5. Initial β_low: any value where f(β_low) ≥ 1.  We use
+  //      std::numeric_limits<double>::min() (~2.2e-308) as a safe
+  //      lower bound that f(β_low) is definitely ≥ 1 at — the term
+  //      for the argmax_q action alone contributes
+  //      λ_N · prior(a*) / 2.2e-308 which is astronomically large.
+
+  double q_max = -std::numeric_limits<double>::infinity();
+  for (float q : qs) q_max = std::max(q_max, static_cast<double>(q));
+
+  // Precompute Δq(a) = q_max − q(a) in double precision (the difference
+  // CAN suffer cancellation here, but q_max and q are both O(1) in
+  // magnitude so the result is at worst ~ulp(1) ≈ 1e-16 error — fine).
+  std::vector<double> dq;
+  dq.reserve(qs.size());
+  for (float q : qs) dq.push_back(q_max - static_cast<double>(q));
+  const double lambda_d = static_cast<double>(lambda_N);
+
+  // f(β) — the policy sum at α = q_max + β.  Each term is well-
+  // conditioned because both β and Δq(a) are ≥ 0 and we ADD them
+  // (no subtraction).
+  auto f_at = [&](double beta) -> double {
+    double sum = 0;
+    for (size_t i = 0; i < priors.size(); ++i) {
+      sum += lambda_d * static_cast<double>(priors[i]) / (beta + dq[i]);
+    }
+    return sum;
+  };
+
+  // Bisection in β-space using geometric mean.  The geometric mean
+  // halves the log of the search interval each iteration, which is
+  // exactly what we want when β* could be anywhere from λ_N down to
+  // ~prior(a*) · λ_N (potentially 1e-30 or smaller).
+  double beta_low  = std::numeric_limits<double>::min();
+  double beta_high = lambda_d;
+
+  // Sanity: f(β_high) should be ≤ 1.  By construction it is (proven
+  // above) unless priors don't sum to ~1.  Skip the upper-bound
+  // expansion loop entirely — not needed in the β-space formulation.
+
+  for (int iter = 0; iter < 60; ++iter) {
+    // Geometric mean = exp((log_low + log_high) / 2) but √(a·b) is
+    // numerically equivalent and avoids the log/exp round-trip.  Use
+    // std::sqrt to keep it simple; std::sqrt on double is exact to
+    // within 0.5 ulp.
+    const double beta_mid = std::sqrt(beta_low * beta_high);
+    if (beta_mid == beta_low || beta_mid == beta_high) {
+      // Converged to representation limit.  Stop.
+      break;
+    }
+    const double s = f_at(beta_mid);
+    if (std::abs(s - 1.0) < 1e-9) {
+      beta_low = beta_high = beta_mid;
+      break;
+    }
+    if (s > 1.0) {
+      beta_low = beta_mid;
+    } else {
+      beta_high = beta_mid;
+    }
+  }
+  // Use the geometric mean of the final interval as our β estimate.
+  const double beta_final = std::sqrt(beta_low * beta_high);
+
+  // Compute π̄(a) using the same well-conditioned formula.  Sum in
+  // double then renormalize so the fp32 result sums to exactly 1.0
+  // within float precision.
+  double sum = 0;
+  std::vector<double> pi_bars(priors.size());
+  for (size_t i = 0; i < priors.size(); ++i) {
+    pi_bars[i] = lambda_d * static_cast<double>(priors[i]) /
+                 (beta_final + dq[i]);
+    sum += pi_bars[i];
+  }
+  // sum should be very close to 1.  If it's degenerate (zero, NaN, Inf)
+  // we have a bug or pathological input — fall back to prior rather
+  // than emitting a corrupted distribution.  This branch should never
+  // fire under the β-space formulation; keeping it as a tripwire.
+  if (!(sum > 0.0) || !std::isfinite(sum)) {
+    result.assign(priors.begin(), priors.end());
+    return result;
+  }
+  result.reserve(pi_bars.size());
+  for (double pb : pi_bars) {
+    result.push_back(static_cast<float>(pb / sum));
+  }
+  return result;
+}
 
 std::vector<std::string> Search::GetVerboseStats(const Node* node) const {
   assert(node == root_node_ || node->GetParent() == root_node_);
@@ -835,6 +1397,28 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   // Root is at even depth.
   const float draw_score = GetDrawScore(/* is_odd_depth= */ false);
 
+  // KataGo recipe: when forced exploration is active, the played-move
+  // temperature distribution should use PRUNED visit counts (forced
+  // visits subtracted from non-best edges), not raw N.  Without this,
+  // forced visits inflate temperature sampling weight on low-policy
+  // edges — selfplay games then over-sample those edges and look
+  // "random" / decisive-but-shallow.
+  //
+  // KataGo applies this clamp in BOTH places: at training-target time
+  // (we do it in GetTrainingTargetVisits) AND at play-selection time
+  // (here).  Equivalent to KataGo's getReducedPlaySelectionWeight,
+  // which returns min(actual_N, N_eq-from-PUCT-equilibrium).
+  //
+  // When forced exploration is disabled, GetTrainingTargetVisits hits
+  // its fast-path and returns raw N, so this is a clean no-op.
+  const bool any_force = params_.GetForcedExplorationFactor() > 0.0f ||
+                         advisor_min_visits_ > 0;
+  std::vector<float> pruned_visits;
+  if (any_force) pruned_visits = GetTrainingTargetVisits();
+  auto effective_n = [&](int idx, const EdgeAndNode& edge) -> float {
+    return any_force ? pruned_visits[idx] : static_cast<float>(edge.GetN());
+  };
+
   std::vector<float> cumulative_sums;
   float sum = 0.0;
   float max_n = 0.0;
@@ -843,51 +1427,66 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   const float fpu =
       GetFpu(params_, root_node_, /* is_root= */ true, draw_score);
 
+  int idx = 0;
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
         std::find(root_move_filter_.begin(), root_move_filter_.end(),
                   edge.GetMove()) == root_move_filter_.end()) {
+      ++idx;
       continue;
     }
-    if (edge.GetN() + offset > max_n) {
-      max_n = edge.GetN() + offset;
+    const float n_eff = effective_n(idx, edge) + offset;
+    if (n_eff > max_n) {
+      max_n = n_eff;
       max_eval = edge.GetQ(fpu, draw_score);
     }
+    ++idx;
   }
 
   // TODO(crem) Simplify this code when samplers.h is merged.
   const float min_eval =
       max_eval - params_.GetTemperatureWinpctCutoff() / 50.0f;
+  idx = 0;
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
         std::find(root_move_filter_.begin(), root_move_filter_.end(),
                   edge.GetMove()) == root_move_filter_.end()) {
+      ++idx;
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
+    if (edge.GetQ(fpu, draw_score) < min_eval) {
+      ++idx;
+      continue;
+    }
     sum += std::pow(
-        std::max(0.0f,
-                 (max_n <= 0.0f
-                      ? edge.GetP()
-                      : ((static_cast<float>(edge.GetN()) + offset) / max_n))),
+        std::max(0.0f, (max_n <= 0.0f
+                            ? edge.GetP()
+                            : ((effective_n(idx, edge) + offset) / max_n))),
         1 / temperature);
     cumulative_sums.push_back(sum);
+    ++idx;
   }
   assert(sum);
 
   const float toss = Random::Get().GetFloat(cumulative_sums.back());
-  int idx =
+  int select =
       std::lower_bound(cumulative_sums.begin(), cumulative_sums.end(), toss) -
       cumulative_sums.begin();
 
+  idx = 0;
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
         std::find(root_move_filter_.begin(), root_move_filter_.end(),
                   edge.GetMove()) == root_move_filter_.end()) {
+      ++idx;
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
-    if (idx-- == 0) return edge;
+    if (edge.GetQ(fpu, draw_score) < min_eval) {
+      ++idx;
+      continue;
+    }
+    if (select-- == 0) return edge;
+    ++idx;
   }
   assert(false);
   return {};
@@ -1466,6 +2065,25 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                        std::back_inserter(legal_moves),
                        [](const auto& edge) { return edge.GetMove(); });
         picked_node.eval->p.resize(legal_moves.size());
+        // Pre-allocate the optimistic policy span only when the
+        // operator opted in via EITHER --optimistic-policy-weight > 0
+        // (root blend) OR --optimistic-policy-weight-internal > 0
+        // (internal-node blend).  The wrapper/backend skips
+        // populating the span when it's empty, so this is the gate
+        // that turns the extra optimistic-head output on/off without
+        // recompiling.
+        //
+        // Both knobs need to be checked here because the per-node
+        // blend code (see ~line 2912) selects which alpha to use
+        // based on node depth — root nodes use the root weight,
+        // internal nodes use the internal weight.  If we only
+        // allocated when the root weight was set, internal-only
+        // configs (e.g. root=0, internal=1.0 to match KataGo) would
+        // silently no-op despite p_optimistic appearing populated.
+        if (params_.GetOptimisticPolicyWeight() > 0.0f ||
+            params_.GetOptimisticPolicyWeightInternal() > 0.0f) {
+          picked_node.eval->p_optimistic.resize(legal_moves.size());
+        }
         picked_node.is_cache_hit = computation_->AddInput(
                                        EvalPosition{
                                            .pos = history.GetPositions(),
@@ -1719,6 +2337,87 @@ void SearchWorker::PickNodesToExtendTask(
       const float puct_mult =
           cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
       int cache_filled_idx = -1;
+
+      // ─── Forced exploration pre-phase (root only) ──────────────────────
+      // Per KataGo's "Forced Playouts" recipe (Wu 2019 §5.1), adapted for
+      // lc0's batched multi-threaded MCTS per PR 2415.  Runs BEFORE the
+      // natural PUCT loop and dispatches forced visits directly via
+      // AddForcedExploration().  Each forced edge gets its
+      // n_forced(c) = sqrt(P(c) * (children_visits + parent_n_in_flight) * factor)
+      // visits accounted for here; the natural PUCT loop then runs with
+      // whatever cur_limit remains.
+      //
+      // Eligibility rules (KataGo paper + PR 2415):
+      //   - Only at root_node_.
+      //   - Stop iterating at the first edge with GetN() == 0; forcing
+      //     waits until natural PUCT has given the edge its first visit.
+      //   - Skip terminal edges (no exploration value).
+      //
+      // Composes with the advisor mechanism: AddForcedExploration takes
+      // the advisor's move + min_visits and floors the per-edge minimum
+      // at max(policy_n_forced, advisor_min_visits) for the matching edge.
+      if (is_root_node) {
+        const float factor = params_.GetForcedExplorationFactor();
+        const int advisor_min = search_->advisor_min_visits_;
+        if (factor > 0.0f || advisor_min > 0) {
+          while (cache_filled_idx + 1 < max_needed && cur_limit > 0) {
+            const int idx = cache_filled_idx + 1;
+            if (idx == 0) {
+              cur_iters[idx] = node->Edges();
+            } else {
+              cur_iters[idx] = cur_iters[idx - 1];
+              ++cur_iters[idx];
+            }
+            current_nstarted[idx] = cur_iters[idx].GetNStarted();
+            // Initialize visits_to_perform[idx] = 0; the natural PUCT
+            // loop will += to it if it later picks this edge.
+            (*visits_to_perform.back())[idx] = 0;
+            if (vtp_last_filled.back() < idx) vtp_last_filled.back() = idx;
+
+            const bool is_unvisited = (cur_iters[idx].GetN() == 0);
+            const bool is_terminal = cur_iters[idx].IsTerminal();
+            // Honor --searchmoves: if a root_move_filter is set, only
+            // edges in that filter are allowed to receive (any) visits,
+            // forced included.  Without this guard, forced exploration
+            // would dispatch visits to moves the user explicitly
+            // excluded — corrupting analysis under UCI searchmoves.
+            const bool in_filter =
+                root_move_filter.empty() ||
+                std::find(root_move_filter.begin(), root_move_filter.end(),
+                          cur_iters[idx].GetMove()) != root_move_filter.end();
+            if (!is_unvisited && !is_terminal && in_filter) {
+              const int new_forced = AddForcedExploration(
+                  params_, node, cur_iters[idx], cur_limit,
+                  current_pol[idx], current_nstarted[idx],
+                  search_->advisor_move_, advisor_min);
+              if (new_forced > 0) {
+                (*visits_to_perform.back())[idx] += new_forced;
+              }
+            }
+            // CRITICAL: The natural PUCT loop below checks
+            // `if (idx > cache_filled_idx)` to decide whether to compute
+            // `current_score[idx]`.  If we advance cache_filled_idx
+            // without populating current_score[idx], the inner loop
+            // reads uninitialized memory and picks edges at random,
+            // which silently destroys search quality at root.  Compute
+            // it here for every idx we touch, post-AddForcedExploration
+            // (so nstarted reflects the just-allocated forced visits).
+            current_score[idx] =
+                current_pol[idx] * puct_mult /
+                    (1 + current_nstarted[idx]) +
+                current_util[idx];
+            ++cache_filled_idx;
+
+            if (is_unvisited) {
+              // KataGo paper: don't force on edges that haven't
+              // received their first natural PUCT visit yet.  This idx
+              // is cached so the natural PUCT loop sees it; stop here.
+              break;
+            }
+          }
+        }
+      }
+
       while (cur_limit > 0) {
         // Perform UCT for current node.
         float best = std::numeric_limits<float>::lowest();
@@ -1764,6 +2463,15 @@ void SearchWorker::PickNodesToExtendTask(
           }
 
           float score = current_score[idx];
+          // Note: forced-exploration overrides were previously applied
+          // here as `score = max_float` overrides.  That approach was
+          // wrong for lc0's batched + multi-threaded MCTS — it ignored
+          // virtual loss (used N instead of nstarted), didn't include
+          // parent_n_in_flight in the quota formula, and didn't guard
+          // against unvisited / terminal edges.  Forced exploration is
+          // now handled in the pre-phase above (AddForcedExploration);
+          // by the time we reach this PUCT loop, the forced visits have
+          // already been allocated into visits_to_perform[idx].
           if (score > best) {
             second_best = best;
             second_best_edge = best_edge;
@@ -2184,10 +2892,121 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
                    : params_.GetWDLRescaleDiff(),
                sign, false, params_.GetWDLMaxS());
   }
-  for (size_t p_idx = 0; auto& edge : node->Edges()) {
-    edge.edge()->SetP(node_to_process->eval->p[p_idx++]);
+  // Blend in the optimistic-st policy head.  Geometric interpolation:
+  //   P_blended(a) ∝ P_main(a)^(1-alpha) * P_opt(a)^alpha
+  // then renormalized so Σ P_blended = 1.  Equivalent to a weighted
+  // mean in LOG space:
+  //   log P_blended(a) = (1-alpha) log P_main(a) + alpha log P_opt(a)
+  //                      - log(Z)
+  // where Z is the normalization constant.  Matches the intent
+  // described in KataGo's searchparams.h ("interpolate geometrically
+  // between raw policy and optimistic policy" — though their CPU
+  // path passes policyOptimism as an NN input rather than blending
+  // in CPU code; here we implement the equivalent at search time
+  // because the network exposes two separate head outputs).
+  //
+  // Geometric vs linear behavioral difference:
+  //   - alpha = 0 → P_blended = P_main (no change)            [identical]
+  //   - alpha = 1 → P_blended = P_opt   (full replace)        [identical]
+  //   - alpha ∈ (0, 1) → depends on whether the two heads agree:
+  //     * If both heads peak on the same move: geometric is SHARPER
+  //       than linear (peaks reinforce, valleys reinforce).
+  //     * If they disagree: geometric is SMOOTHER (any factor that's
+  //       near zero kills that edge — mass migrates to consensus
+  //       moves where both heads have meaningful probability).
+  //     Per-edge the geometric value is always ≤ the arithmetic mean
+  //     (AM-GM inequality), so renormalization is what determines
+  //     the final shape relative to linear.
+  //
+  // Applied BEFORE Dirichlet noise (which only fires at root anyway).
+  //
+  // Two alphas, by depth — matches KataGo's two-knob design
+  // (rootPolicyOptimism vs policyOptimism in their search params):
+  //   * Root nodes use --optimistic-policy-weight (typically 0.05–0.20,
+  //     low because the root visit budget is large; the prior shapes
+  //     a lot of search and we don't want to over-bias).
+  //   * Non-root nodes use --optimistic-policy-weight-internal
+  //     (typically 0.5–1.0; internal visit budget per edge is sparse,
+  //     so the prior dominates exploration and biasing it harder
+  //     toward tactical moves drives deeper tactical discovery).
+  //
+  // Both default 0.0 (off).  Three guards on the blend per node:
+  //   1. alpha > 0 at this depth class (option enabled),
+  //   2. p_optimistic is non-empty (backend exposes a second head),
+  //   3. sizes match (defensive — should always hold when present).
+  // If any guard fails we fall through to the single-head path.
+  const bool is_root = (node == search_->root_node_);
+  const float kOptAlpha =
+      is_root ? params_.GetOptimisticPolicyWeight()
+              : params_.GetOptimisticPolicyWeightInternal();
+  const bool blend_optimistic =
+      kOptAlpha > 0.0f &&
+      !node_to_process->eval->p_optimistic.empty() &&
+      node_to_process->eval->p_optimistic.size() ==
+          node_to_process->eval->p.size();
+  if (blend_optimistic && kOptAlpha == 1.0f) {
+    // Fast path at alpha = 1.0 → pure optimistic.  Skip the pow/sum/
+    // renorm chain (it mathematically reduces to p_opt) so that this
+    // path is byte-identical to standalone policy_head=optimistic.
+    // Floating-point precision in the pow() pipeline could otherwise
+    // produce values that differ in the last few bits and over many
+    // search steps compound into measurably different PUCT decisions.
+    size_t p_idx = 0;
+    for (auto& edge : node->Edges()) {
+      edge.edge()->SetP(node_to_process->eval->p_optimistic[p_idx]);
+      ++p_idx;
+    }
+  } else if (blend_optimistic) {
+    // Two-pass: compute per-edge p_main^(1-α) * p_opt^α, accumulate
+    // sum, then write renormalized values.  Small floor (1e-30) on
+    // each prior prevents pow(0, x) underflow issues on the
+    // pathological case of a near-zero prior; in practice both
+    // heads are softmax outputs so values are bounded away from
+    // exact zero for legal moves and the floor is never triggered.
+    const float one_minus_a = 1.0f - kOptAlpha;
+    constexpr float kFloor = 1e-30f;
+    const size_t n_edges = node_to_process->eval->p.size();
+    std::vector<float> blended;
+    blended.reserve(n_edges);
+    double sum = 0.0;
+    for (size_t p_idx = 0; p_idx < n_edges; ++p_idx) {
+      const float p_main = node_to_process->eval->p[p_idx];
+      const float p_opt = node_to_process->eval->p_optimistic[p_idx];
+      const float b =
+          std::pow(std::max(p_main, kFloor), one_minus_a) *
+          std::pow(std::max(p_opt, kFloor), kOptAlpha);
+      blended.push_back(b);
+      sum += b;
+    }
+    // Renormalize so the blended distribution sums to 1.  Falling
+    // back to the main prior on a degenerate sum=0 case (impossible
+    // in practice given the kFloor above, but defensive).
+    if (sum > 0.0) {
+      const float renorm = static_cast<float>(1.0 / sum);
+      size_t p_idx = 0;
+      for (auto& edge : node->Edges()) {
+        edge.edge()->SetP(blended[p_idx] * renorm);
+        ++p_idx;
+      }
+    } else {
+      size_t p_idx = 0;
+      for (auto& edge : node->Edges()) {
+        edge.edge()->SetP(node_to_process->eval->p[p_idx]);
+        ++p_idx;
+      }
+    }
+  } else {
+    // Blend disabled (or backend doesn't expose the second head):
+    // use the main policy directly.
+    for (size_t p_idx = 0; auto& edge : node->Edges()) {
+      edge.edge()->SetP(node_to_process->eval->p[p_idx]);
+      ++p_idx;
+    }
   }
-  // Add Dirichlet noise if enabled and at root.
+  // Add Dirichlet noise if enabled and at root.  Noise is applied AFTER
+  // the optimistic blend so it perturbs the blended prior (matches the
+  // "blend first, then noise" framing — the blended prior is what the
+  // network believes, then we add exploration noise on top).
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
     ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),
                         params_.GetNoiseAlpha());

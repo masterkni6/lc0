@@ -28,11 +28,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <vector>
 
 #include "chess/callbacks.h"
 #include "chess/uciloop.h"
@@ -93,6 +95,79 @@ class Search {
   // If called after GetBestMove, another call to GetBestMove will have results
   // from temperature having been applied again.
   void ResetBestMove();
+
+  // Returns the post-processed visit distribution to use as the policy
+  // training target for the root position.  Each entry corresponds (in
+  // order) to one of root_node_->Edges().  When no forced-exploration
+  // mechanism is active (ForcedExplorationFactor == 0 AND advisor
+  // disabled), this is just the raw edge.GetN() values.  When either
+  // is active, KataGo-style policy-target pruning is applied: edges
+  // whose final Q + U falls below the best edge's Q have their visit
+  // counts reduced to what PUCT would have given them naturally, so
+  // the trained policy isn't biased by forced exploration on moves
+  // that turned out to be bad.
+  //
+  // Must be called AFTER search completes (RunBlocking returned).
+  // Reads root_node_'s final visit counts; doesn't mutate anything.
+  std::vector<float> GetTrainingTargetVisits() const;
+
+  // Gumbel-MuZero improved-policy training target (Phase 1.6 subset).
+  // Returns softmax(prior_logits + σ(q)) over root edges instead of a
+  // visit-count distribution.  σ(q) = sqrt-confidence-weighted version
+  // of (maxvisit_init + max_N) × value_scale × rescaled_q.  v-mix
+  // imputation gives unvisited edges an estimated Q; the confidence
+  // weighting (sqrt(N_edge)/sqrt(max_N)) damps the σ contribution for
+  // low-N edges so the target doesn't over-weight unvisited moves.
+  //
+  // Search remains plain PUCT (no Gumbel SH); this is purely a chunk-
+  // write-time transformation.  Mutually exclusive with PTP — caller
+  // (selfplay/game.cc) chooses one based on UCI options.
+  //
+  // Must be called AFTER search completes.  const, doesn't mutate tree.
+  std::vector<float> GetGumbelImprovedPolicyTarget() const;
+
+  // Grill et al. (ICML 2020, "MCTS as Regularized Policy Optimization")
+  // improved-policy training target — "Learn" variant from §4.2.
+  //
+  // Returns π̄(a) = λ_N · prior(a) / (α − q(a)) per root edge, where:
+  //   - λ_N = c / √(total_visits) is the regularization strength,
+  //   - α is solved via dichotomic search so π̄ sums to 1.
+  //
+  // λ_N's inverse-sqrt scaling gives "stay near prior when search hasn't
+  // explored much; commit to Q-greedy when search is well-converged" —
+  // a property the Gumbel σ(q) formulation lacks.  At low N the prior
+  // dominates the numerator; at high N the |α − q| denominator favors
+  // high-Q actions.
+  //
+  // Unvisited edges' q(a) is imputed from root_node_->GetWL() (raw value).
+  // More sophisticated (v-mix style) imputation could be added later if
+  // needed; for now this matches the paper's simpler treatment.
+  //
+  // UCI options:
+  //   --use-grill-improved-target=true  → game.cc dispatches here
+  //   --grill-c=<float>                 → c constant in λ_N (default 1.0)
+  //
+  // Mutually exclusive with --use-gumbel-improved-target and
+  // --use-policy-target-pruning (enforced at SearchParams ctor).
+  //
+  // Must be called AFTER search completes.  const, doesn't mutate tree.
+  std::vector<float> GetGrillImprovedPolicyTarget() const;
+
+  // Forces the given move at the root node to receive at least `min_visits`
+  // before the PUCT selector is allowed to pick freely.  Used by selfplay
+  // to inject an external "advisor" engine's recommendation (e.g. Stockfish)
+  // as a forced-exploration target — the trained policy still comes from
+  // lc0's own MCTS distribution, but lc0's search is guaranteed to spend
+  // some visits evaluating the advisor's preferred move.  Should be called
+  // BEFORE StartThreads() / RunBlocking() so all workers see the value.
+  // A min_visits of 0 (the default) disables the override entirely.
+  // If the advisor move is not in the legal-move list at root, the
+  // override silently no-ops on every iteration (best_edge keeps coming
+  // from PUCT alone).
+  void SetAdvisorMove(Move m, int min_visits) {
+    advisor_move_ = m;
+    advisor_min_visits_ = std::max(0, min_visits);
+  }
 
  private:
   // Computes the best move, maybe with temperature (according to the settings).
@@ -200,6 +275,14 @@ class Search {
 
   std::unique_ptr<UciResponder> uci_responder_;
   ContemptMode contempt_mode_;
+
+  // Advisor-move override (selfplay): SearchWorker checks these in the
+  // PUCT root selection loop.  Set once via SetAdvisorMove() before
+  // search starts; never mutated during search, so unguarded read by
+  // workers is safe.  Default-constructed Move + 0 visits = disabled.
+  Move advisor_move_;
+  int advisor_min_visits_ = 0;
+
   friend class SearchWorker;
 };
 

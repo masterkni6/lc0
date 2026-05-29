@@ -62,6 +62,23 @@ class MuxingComputation : public NetworkComputation {
     return parent_->GetPVal(sample + idx_in_parent_, move_id);
   }
 
+  // Forward the optimistic policy head through the muxer.  Without these
+  // overrides, the base-class defaults (HasOptimisticPolicy() == false,
+  // GetPValOptimistic falls back to GetPVal) kick in and the wrapper above
+  // (NetworkAsBackend) silently skips populating result.p_optimistic.
+  // Search then reads the zero-initialized p_optimistic span and, at
+  // --optimistic-policy-weight=1.0 (α=1.0 fast path), sets every edge.P
+  // to 0 — producing near-random play.  This was the root cause of the
+  // "blend works with --backend=cuda-fp16 but breaks without it" report
+  // in selfplay, where the default backend is "multiplexing".
+  bool HasOptimisticPolicy() const override {
+    return parent_ && parent_->HasOptimisticPolicy();
+  }
+
+  float GetPValOptimistic(int sample, int move_id) const override {
+    return parent_->GetPValOptimistic(sample + idx_in_parent_, move_id);
+  }
+
   void PopulateToParent(std::shared_ptr<NetworkComputation> parent) {
     // Populate our batch into batch of batches.
     parent_ = parent;

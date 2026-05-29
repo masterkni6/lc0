@@ -109,6 +109,32 @@ class DemuxingComputation final : public NetworkComputation {
     return parent->GetPVal(offset, move_id);
   }
 
+  // Forward the optimistic policy head through the demuxer.  Without
+  // these overrides, the base-class defaults silently disable the
+  // blend feature in selfplay (which defaults its backend to
+  // "multiplexing"/"demux" wrappers around the actual cuda backend).
+  // For HasOptimisticPolicy we require ALL child computations to
+  // support it — otherwise the search would receive a partially-
+  // filled p_optimistic span and produce inconsistent priors across
+  // the batch.  parents_ is empty before ComputeBlocking; the
+  // wrapper calls HasOptimisticPolicy after ComputeBlocking returns,
+  // so by then parents_ is populated and stable.
+  bool HasOptimisticPolicy() const override {
+    if (parents_.empty()) return false;
+    for (const auto& work : parents_) {
+      if (!work.computation_ || !work.computation_->HasOptimisticPolicy()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  float GetPValOptimistic(int sample, int move_id) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetPValOptimistic(offset, move_id);
+  }
+
   void NotifyComplete() {
     if (1 == dataready_.fetch_sub(1, std::memory_order_release)) {
       {

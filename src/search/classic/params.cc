@@ -208,6 +208,173 @@ const OptionId BaseSearchParams::kCpuctFactorAtRootId{
      .uci_option = "CPuctFactorAtRoot",
      .help_text = "Multiplier for the cpuct growth formula at root.",
      .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kForcedExplorationFactorId{
+    {.long_flag = "forced-exploration-factor",
+     .uci_option = "ForcedExplorationFactor",
+     .help_text =
+         "KataGo-style forced exploration at root. Each root edge gets "
+         "at least sqrt(P * N_total * factor) visits before PUCT is "
+         "allowed to skip it.  0 disables (default).  Selfplay training "
+         "should set 2.0; competitive play should leave it 0.  Paired "
+         "with policy-target pruning at training-data write time so the "
+         "trained policy isn't biased toward forcibly-explored moves.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kUsePolicyTargetPruningId{
+    {.long_flag = "use-policy-target-pruning",
+     .uci_option = "UsePolicyTargetPruning",
+     .help_text =
+         "KataGo-style Policy Target Pruning at training-data write time.  "
+         "When true, the training-target visit distribution at root is "
+         "clamped so no non-best move's visit count exceeds the PUCT-"
+         "equilibrium count (target = min(n_raw, N_eq)).  This removes "
+         "early-exploration noise + any forced-visit inflation without "
+         "needing forced-exploration-factor > 0 to trigger it.  PTP also "
+         "always runs implicitly when forced-exploration-factor > 0 or an "
+         "advisor is active, so enabling this is only meaningful when both "
+         "of those are off and you still want a sharpened policy target.  "
+         "Selfplay default: false (keep raw-N targets); enable explicitly "
+         "if you want PTP without forced exploration.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kUseGumbelMuZeroId{
+    {.long_flag = "use-gumbel-muzero",
+     .uci_option = "UseGumbelMuZero",
+     .help_text =
+         "Gumbel-MuZero policy improvement (Danihelka et al. ICLR 2022) "
+         "at root.  Replaces PUCT root selection with sequential halving "
+         "over Gumbel-perturbed policy logits.  Training target is the "
+         "softmax of `g + p + σ(q)` (constructed improved-policy) instead "
+         "of the visit-count distribution.  Provably improves the policy "
+         "at any visit budget — designed for low-visit settings (≤32) but "
+         "works at any N.  Mutually exclusive with forced-exploration-"
+         "factor and use-policy-target-pruning: when on, those options "
+         "are ignored.  Default off.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGumbelMuZeroMId{
+    {.long_flag = "gumbel-muzero-m",
+     .uci_option = "GumbelMuZeroM",
+     .help_text =
+         "Sequential-halving action subset size for Gumbel-MuZero.  At "
+         "search start, the top-m root moves by Gumbel-perturbed logits "
+         "(plus the advisor's move if one is active) form the initial "
+         "set.  Each halving round visits this set evenly; the bottom "
+         "half by current Q is culled; the remaining set doubles its per-"
+         "action visit budget for the next round.  Larger m → more "
+         "candidates considered but fewer visits per candidate per round.  "
+         "Chess typically has 25-40 legal root moves; m=16 covers the "
+         "meaningful candidates.  Must be a power of 2 (sequential "
+         "halving requires log2(m) rounds).",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGumbelMuZeroCVisitId{
+    {.long_flag = "gumbel-muzero-c-visit",
+     .uci_option = "GumbelMuZeroCVisit",
+     .help_text =
+         "maxvisit_init constant in the σ(q) Q-transform for Gumbel-MuZero, "
+         "matching mctx's qtransform_completed_by_mix_value default.  "
+         "σ(q) = (maxvisit_init + max_visits_at_node) × value_scale × "
+         "rescale_q(q), where Q is FIRST rescaled to [0,1] per-position "
+         "and max_visits_at_node is the most-visited child's N at the "
+         "moment of evaluation.  mctx default: 50.  Larger values weight "
+         "Q more heavily relative to the policy prior.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGumbelMuZeroCScaleId{
+    {.long_flag = "gumbel-muzero-c-scale",
+     .uci_option = "GumbelMuZeroCScale",
+     .help_text =
+         "value_scale constant in the σ(q) Q-transform for Gumbel-MuZero, "
+         "matching mctx's qtransform_completed_by_mix_value default.  See "
+         "c-visit option for the formula.  mctx default: 0.1 (NOT 1.0 — Q "
+         "is already rescaled to [0,1] before scaling, so a value of 0.1 "
+         "keeps the σ(q) magnitude in a similar range to the gumbel + "
+         "logits component).  Re-tunable for chess if Q distribution "
+         "differs materially from Go's.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kUseGumbelImprovedTargetId{
+    {.long_flag = "use-gumbel-improved-target",
+     .uci_option = "UseGumbelImprovedTarget",
+     .help_text =
+         "Write Gumbel-MuZero's improved-policy distribution "
+         "(softmax(prior_logits + σ(q))) as the training-target policy, "
+         "in place of MCTS visit counts.  Search remains plain PUCT "
+         "(no Gumbel SH); only the chunk-write step changes.  σ(q) uses "
+         "v-mix imputed Q for unvisited edges, then rescales to [0,1] and "
+         "applies (gumbel-muzero-c-visit + max_N) × gumbel-muzero-c-scale "
+         "scaling.  Per-edge sqrt-scaled confidence weighting damps the "
+         "σ contribution for low-N edges (N=0 → no σ contribution → "
+         "edge keeps prior weight in the target).  Composes with "
+         "--forced-exploration-factor and advisor (both still run at "
+         "search time, providing more Q data for σ(q)), but bypasses "
+         "PTP entirely.  Mutually exclusive with "
+         "--use-policy-target-pruning.  Default off.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kUseGrillImprovedTargetId{
+    {.long_flag = "use-grill-improved-target",
+     .uci_option = "UseGrillImprovedTarget",
+     .help_text =
+         "Write Grill et al. (ICML 2020) regularized improved-policy "
+         "distribution π̄(a) = λ_N · prior(a) / (α − q(a)) as the "
+         "training-target policy, in place of visit counts.  λ_N = "
+         "c · √N / (|𝒜| + N) (paper Eq. 4) where N is total root "
+         "visits and |𝒜| is the number of legal moves.  Smaller λ_N "
+         "concentrates π̄ on argmax-Q (sharp); larger λ_N pulls π̄ "
+         "toward the prior (smooth).  λ_N grows with c.  α is solved "
+         "via dichotomic search.  Search remains plain PUCT; only the "
+         "chunk-write step changes.  Unvisited edges' Q is imputed "
+         "with the root's value-head prediction (negated to match "
+         "edge.GetQ()'s sign convention).  Mutually exclusive with "
+         "--use-gumbel-improved-target and "
+         "--use-policy-target-pruning (all define the policy target).  "
+         "Default off.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGrillCId{
+    {.long_flag = "grill-c",
+     .uci_option = "GrillC",
+     .help_text =
+         "c constant in λ_N = c · √N / (|𝒜| + N) for Grill improved "
+         "target.  HIGHER c gives LARGER λ_N which makes π̄ SMOOTHER "
+         "(closer to prior); LOWER c gives smaller λ_N which makes "
+         "π̄ SHARPER (concentrated on argmax-Q).  Paper doesn't give "
+         "a chess-calibrated value; tune empirically.  At N=250, "
+         "|𝒜|≈30: c=0.5 → λ_N≈0.028 (very aggressive Q-amplification, "
+         "argmax often inverts vs raw visits); c=1.0 → λ_N≈0.056 "
+         "(paper default; still significantly sharpens); c=2.0 → "
+         "λ_N≈0.113 (mild reshaping); c=4.0 → λ_N≈0.226 (target "
+         "stays close to raw visit distribution).  Empirically c<1 "
+         "produces highly Q-amplified targets where low-prior, "
+         "low-visit moves can dominate due to noisy Q estimates — "
+         "start at c=1 and consider higher if training is unstable.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kOptimisticPolicyWeightId{
+    {.long_flag = "optimistic-policy-weight",
+     .uci_option = "OptimisticPolicyWeight",
+     .help_text =
+         "Mix the trained policy_optimistic_st head into the ROOT "
+         "prior: P_blended = (1 - alpha) * P_main + alpha * P_opt, "
+         "applied at root edges BEFORE Dirichlet noise.  Biases "
+         "search toward tactical-surprise moves the optimistic head "
+         "was trained to favor.  KataGo's analog: rootPolicyOptimism, "
+         "recommended 0.2.  Requires both (a) net has "
+         "policy_optimistic_st head, AND (b) backend exposes "
+         "EvalResult::p_optimistic.  Silently degrades to no-op if "
+         "either is missing.  Default 0.0 (feature off).  See also "
+         "--optimistic-policy-weight-internal for non-root nodes.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kOptimisticPolicyWeightInternalId{
+    {.long_flag = "optimistic-policy-weight-internal",
+     .uci_option = "OptimisticPolicyWeightInternal",
+     .help_text =
+         "Same blend as --optimistic-policy-weight but applied at "
+         "NON-root (internal) tree nodes.  KataGo's analog: "
+         "policyOptimism (their config recommends 1.0 — i.e. fully "
+         "replace the main policy with the optimistic head at every "
+         "internal node).  Internal-node alpha can be much higher "
+         "than root alpha because internal nodes have low visit "
+         "counts per edge, so the prior dominates exploration and "
+         "biasing it toward tactical moves drives deeper tactical "
+         "discovery without disrupting the larger root visit budget. "
+         "Recommended starting point: 0.5–1.0.  Default 0.0 (off, "
+         "matches behavior before this option was added).  Same "
+         "backend prerequisites as the root variant.",
+     .visibility = OptionId::kProOnly}};
 // Remove this option after 0.25 has been made mandatory in training and the
 // training server stops sending it.
 const OptionId BaseSearchParams::kRootHasOwnCpuctParamsId{
@@ -550,6 +717,21 @@ void BaseSearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kCpuctBaseAtRootId, 1.0f, 1000000000.0f) = 38739.0f;
   options->Add<FloatOption>(kCpuctFactorId, 0.0f, 1000.0f) = 3.894f;
   options->Add<FloatOption>(kCpuctFactorAtRootId, 0.0f, 1000.0f) = 3.894f;
+  options->Add<FloatOption>(kForcedExplorationFactorId, 0.0f, 100.0f) = 0.0f;
+  options->Add<BoolOption>(kUsePolicyTargetPruningId) = false;
+  options->Add<BoolOption>(kUseGumbelMuZeroId) = false;
+  options->Add<IntOption>(kGumbelMuZeroMId, 2, 256) = 16;
+  options->Add<FloatOption>(kGumbelMuZeroCVisitId, 0.0f, 10000.0f) = 50.0f;
+  // mctx default is 0.1, NOT 1.0 — Q is rescaled to [0,1] before the
+  // σ transform, so a 0.1 scale keeps the σ(q) magnitude comparable
+  // to the gumbel + logits component.
+  options->Add<FloatOption>(kGumbelMuZeroCScaleId, 0.0f, 1000.0f) = 0.1f;
+  options->Add<BoolOption>(kUseGumbelImprovedTargetId) = false;
+  options->Add<BoolOption>(kUseGrillImprovedTargetId) = false;
+  options->Add<FloatOption>(kGrillCId, 0.0f, 100.0f) = 1.0f;
+  options->Add<FloatOption>(kOptimisticPolicyWeightId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kOptimisticPolicyWeightInternalId, 0.0f, 1.0f) =
+      0.0f;
   options->Add<BoolOption>(kRootHasOwnCpuctParamsId) = false;
   options->Add<BoolOption>(kTwoFoldDrawsId) = true;
   options->Add<FloatOption>(kTemperatureId, 0.0f, 100.0f) = 0.0f;
@@ -653,6 +835,21 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kCpuctFactorAtRoot(options.Get<float>(
           options.Get<bool>(kRootHasOwnCpuctParamsId) ? kCpuctFactorAtRootId
                                                       : kCpuctFactorId)),
+      kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
+      kUsePolicyTargetPruning(options.Get<bool>(kUsePolicyTargetPruningId)),
+      kUseGumbelMuZero(options.Get<bool>(kUseGumbelMuZeroId)),
+      kGumbelMuZeroM(options.Get<int>(kGumbelMuZeroMId)),
+      kGumbelMuZeroCVisit(options.Get<float>(kGumbelMuZeroCVisitId)),
+      kGumbelMuZeroCScale(options.Get<float>(kGumbelMuZeroCScaleId)),
+      kUseGumbelImprovedTarget(
+          options.Get<bool>(kUseGumbelImprovedTargetId)),
+      kUseGrillImprovedTarget(
+          options.Get<bool>(kUseGrillImprovedTargetId)),
+      kGrillC(options.Get<float>(kGrillCId)),
+      kOptimisticPolicyWeight(
+          options.Get<float>(kOptimisticPolicyWeightId)),
+      kOptimisticPolicyWeightInternal(
+          options.Get<float>(kOptimisticPolicyWeightInternalId)),
       kTwoFoldDraws(options.Get<bool>(kTwoFoldDrawsId)),
       kNoiseEpsilon(options.Get<float>(kNoiseEpsilonId)),
       kNoiseAlpha(options.Get<float>(kNoiseAlphaId)),
@@ -725,7 +922,40 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kMaxCollisionVisitsScalingPower(
           options.Get<float>(kMaxCollisionVisitsScalingPowerId)),
       kSearchSpinBackoff(options_.Get<bool>(kSearchSpinBackoffId)),
-      kGarbageCollectionDelay(options_.Get<float>(kGarbageCollectionDelayId)) {}
+      kGarbageCollectionDelay(options_.Get<float>(kGarbageCollectionDelayId)) {
+  // Mutual exclusivity: PTP and the Gumbel-improved-policy target both
+  // define what gets written to the chunk's policy-target field.  Two
+  // recipes can't fight over that field — refuse the config rather than
+  // silently picking one.
+  if (kUseGumbelImprovedTarget && kUsePolicyTargetPruning) {
+    throw Exception(
+        "Conflicting policy-target options: "
+        "--use-gumbel-improved-target=true and "
+        "--use-policy-target-pruning=true cannot be used together.  Both "
+        "define the policy training target.  Disable one.  Recommended: "
+        "drop --use-policy-target-pruning when using improved-target — "
+        "PTP's role (preventing forced-visit distortion in the visit-"
+        "count target) is moot under improved-target, which doesn't use "
+        "visit counts as the target.");
+  }
+  // Grill is also mutually exclusive with the other two policy-target
+  // mechanisms.  Each defines the target distribution differently;
+  // stacking them is ill-defined.
+  if (kUseGrillImprovedTarget && kUseGumbelImprovedTarget) {
+    throw Exception(
+        "Conflicting policy-target options: "
+        "--use-grill-improved-target=true and "
+        "--use-gumbel-improved-target=true cannot be used together.  Both "
+        "define the policy training target.  Disable one.");
+  }
+  if (kUseGrillImprovedTarget && kUsePolicyTargetPruning) {
+    throw Exception(
+        "Conflicting policy-target options: "
+        "--use-grill-improved-target=true and "
+        "--use-policy-target-pruning=true cannot be used together.  Both "
+        "define the policy training target.  Disable one.");
+  }
+}
 
 SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),

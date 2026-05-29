@@ -27,6 +27,11 @@
 
 #include "neural/wrapper.h"
 
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <sstream>
+
 #include <algorithm>
 #include <numeric>
 
@@ -109,9 +114,11 @@ class NetworkAsBackendComputation : public BackendComputation {
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
     int transform;
+    InputPlanes input =
+        EncodePositionForNN(backend_->input_format_, pos.pos, 8,
+                            backend_->fill_empty_history_, &transform);
     const size_t idx = entries_.emplace_back(Entry{
-        .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
-                                     backend_->fill_empty_history_, &transform),
+        .input = std::move(input),
         .legal_moves = MoveList(pos.legal_moves.begin(), pos.legal_moves.end()),
         .result = result,
         .transform = 0});
@@ -120,29 +127,98 @@ class NetworkAsBackendComputation : public BackendComputation {
   }
 
   void ComputeBlocking() override {
-    for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
+    for (auto& entry : entries_) {
+      computation_->AddInput(std::move(entry.input));
+    }
     computation_->ComputeBlocking();
     LCTRACE_FUNCTION_SCOPE;
+    const bool optimistic_available =
+        computation_->HasOptimisticPolicy();
     for (size_t i = 0; i < entries_.size(); ++i) {
       const EvalResultPtr& result = entries_[i].result;
       if (result.q) *result.q = computation_->GetQVal(i);
       if (result.d) *result.d = computation_->GetDVal(i);
       if (result.m) *result.m = computation_->GetMVal(i);
-      if (!result.p.empty()) SoftmaxPolicy(result.p, computation_.get(), i);
+      if (!result.p.empty()) {
+        SoftmaxPolicy(result.p, computation_.get(), i,
+                      /*optimistic=*/false);
+      }
+      // Populate the optimistic policy distribution only when BOTH
+      // (a) the backend actually computed it (HasOptimisticPolicy)
+      // AND (b) the caller pre-allocated a same-length span to receive
+      // it.  Search allocates p_optimistic when EITHER --optimistic-
+      // policy-weight > 0 (root blend) OR --optimistic-policy-weight-
+      // internal > 0 (internal-node blend) is set, so leaving the
+      // span empty is a cheap way to skip both the read and the
+      // softmax cost on runs that aren't blending.
+      if (optimistic_available && !result.p_optimistic.empty()) {
+        SoftmaxPolicy(result.p_optimistic, computation_.get(), i,
+                      /*optimistic=*/true);
+        // Debug: dump first N positions' post-softmax priors for both
+        // heads.  This is the last point before search reads them, so
+        // shows exactly what SetP will receive.
+        static std::atomic<int> dbg_softmax_remaining{[]() {
+          const char* e = std::getenv("LC0_DEBUG_OPT_SOFTMAX");
+          return e ? std::atoi(e) : 0;
+        }()};
+        if (dbg_softmax_remaining.load(std::memory_order_relaxed) > 0) {
+          const int slot =
+              dbg_softmax_remaining.fetch_sub(1, std::memory_order_relaxed);
+          if (slot > 0) {
+            std::ostringstream oss;
+            oss << "[DBG OPT SOFTMAX] slot=" << slot
+                << " entry=" << i
+                << " n_legal=" << result.p.size();
+            float p_min = 1e30f, p_max = -1e30f, p_sum = 0.0f;
+            float pp_min = 1e30f, pp_max = -1e30f, pp_sum = 0.0f;
+            int p_nan = 0, pp_nan = 0;
+            for (size_t k = 0; k < result.p.size(); ++k) {
+              float v = result.p[k];
+              float vp = result.p_optimistic[k];
+              if (std::isnan(v)) ++p_nan;
+              else { p_min = std::min(p_min, v); p_max = std::max(p_max, v); p_sum += v; }
+              if (std::isnan(vp)) ++pp_nan;
+              else { pp_min = std::min(pp_min, vp); pp_max = std::max(pp_max, vp); pp_sum += vp; }
+            }
+            oss << "\n  main_p (after softmax): min=" << p_min
+                << " max=" << p_max << " sum=" << p_sum
+                << " nan=" << p_nan;
+            oss << "\n  opt_p  (after softmax): min=" << pp_min
+                << " max=" << pp_max << " sum=" << pp_sum
+                << " nan=" << pp_nan;
+            const size_t kHead = std::min<size_t>(8, result.p.size());
+            oss << "\n  main_p[0.." << (kHead - 1) << "]:";
+            for (size_t k = 0; k < kHead; ++k) oss << " " << result.p[k];
+            oss << "\n  opt_p [0.." << (kHead - 1) << "]:";
+            for (size_t k = 0; k < kHead; ++k) oss << " " << result.p_optimistic[k];
+            CERR << oss.str();
+          }
+        }
+      }
     }
   }
 
   void SoftmaxPolicy(std::span<float> dst,
-                     const NetworkComputation* computation, int idx) {
+                     const NetworkComputation* computation, int idx,
+                     bool optimistic) {
     LCTRACE_FUNCTION_SCOPE;
     const std::vector<Move>& moves = entries_[idx].legal_moves;
     const int transform = entries_[idx].transform;
     // Copy the values to the destination array and compute the maximum.
+    // Same softmax temperature is applied to vanilla and optimistic
+    // heads — both produce logits in the same scale (they share the
+    // ip_pol_w/ip_pol_b output projection in the PyTorch model;
+    // policy_optimistic_st is a separate AttentionPolicyHead body but
+    // reuses the same post-policy embedding).
     const float max_p = std::accumulate(
         moves.begin(), moves.end(), -std::numeric_limits<float>::infinity(),
         [&, counter = 0](float max_p, const Move& move) mutable {
-          return std::max(max_p, dst[counter++] = computation->GetPVal(
-                                     idx, MoveToNNIndex(move, transform)));
+          const int move_idx = MoveToNNIndex(move, transform);
+          const float p_val = optimistic
+                                  ? computation->GetPValOptimistic(idx,
+                                                                    move_idx)
+                                  : computation->GetPVal(idx, move_idx);
+          return std::max(max_p, dst[counter++] = p_val);
         });
     // Compute the softmax and compute the total.
     const float temperature = backend_->softmax_policy_temperature_;

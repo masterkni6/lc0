@@ -48,6 +48,11 @@ struct CachedValue {
   float m;
   uint8_t num_moves;
   std::unique_ptr<float[]> p;
+  // Optimistic policy head (same shape as p).  Only populated when the
+  // caller's EvalResultPtr passed a non-empty p_optimistic span; left
+  // null otherwise so we don't bloat cache entries for runs without
+  // the blend enabled.
+  std::unique_ptr<float[]> p_optimistic;
 };
 
 void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
@@ -55,6 +60,16 @@ void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
   if (ptr.q) *ptr.q = cv.q;
   if (ptr.m) *ptr.m = cv.m;
   std::copy(cv.p.get(), cv.p.get() + ptr.p.size(), ptr.p.begin());
+  // Copy optimistic policy too, when both sides are present.  If the
+  // cached value has it but the caller didn't allocate space, skip
+  // (no-op).  If the caller allocated but the cached value is missing
+  // it, this is a cache-version mismatch — copy what we have for q/d/m
+  // and let search's blend fall back via its !empty() guard.
+  if (cv.p_optimistic && !ptr.p_optimistic.empty()) {
+    std::copy(cv.p_optimistic.get(),
+              cv.p_optimistic.get() + ptr.p_optimistic.size(),
+              ptr.p_optimistic.begin());
+  }
 }
 
 class MemCache : public CachingBackend {
@@ -119,9 +134,18 @@ class MemCacheComputation : public BackendComputation {
       // still cached in this case, but in subsequent queries we only return it
       // if legal moves are not passed again. Otherwise check the size to guard
       // against hash collisions.
+      //
+      // Additional check: when the caller asked for p_optimistic (non-empty
+      // span in the EvalResultPtr) but the cached value doesn't have it
+      // (entry inserted before the blend was enabled), treat as a cache
+      // miss and recompute.  Otherwise the search's p_optimistic span would
+      // stay at zeros and the blend would silently fall through to vanilla.
+      const bool caller_wants_opt = !result.p_optimistic.empty();
+      const bool cached_has_opt = lock.holds_value() && lock->p_optimistic;
       if (lock.holds_value() &&
           (pos.legal_moves.empty() ||
-           (lock->p && lock->num_moves == pos.legal_moves.size()))) {
+           (lock->p && lock->num_moves == pos.legal_moves.size())) &&
+          (!caller_wants_opt || cached_has_opt)) {
         CachedValueToEvalResult(**lock, result);
         return AddInputResult::FETCHED_IMMEDIATELY;
       }
@@ -132,11 +156,23 @@ class MemCacheComputation : public BackendComputation {
     value->p.reset(pos.legal_moves.empty() ? nullptr
                                            : new float[pos.legal_moves.size()]);
     value->num_moves = pos.legal_moves.size();
+    // Allocate optimistic policy storage only when the caller asked
+    // for it (signalled by passing a non-empty p_optimistic span).
+    // Keeps cache size unchanged for runs that don't use the blend.
+    const bool want_opt = !result.p_optimistic.empty() &&
+                          !pos.legal_moves.empty();
+    if (want_opt) {
+      value->p_optimistic.reset(new float[pos.legal_moves.size()]);
+    }
     return wrapped_computation_->AddInput(
-        pos, EvalResultPtr{&value->q, &value->d, &value->m,
-                           value->p ? std::span<float>{value->p.get(),
-                                                       pos.legal_moves.size()}
-                                    : std::span<float>{}});
+        pos, EvalResultPtr{
+                 &value->q, &value->d, &value->m,
+                 value->p ? std::span<float>{value->p.get(),
+                                             pos.legal_moves.size()}
+                          : std::span<float>{},
+                 want_opt ? std::span<float>{value->p_optimistic.get(),
+                                             pos.legal_moves.size()}
+                          : std::span<float>{}});
   }
 
   virtual void ComputeBlocking() override {
@@ -180,6 +216,14 @@ std::optional<EvalResult> MemCache::GetCachedEvaluation(
     result.p.reserve(pos.legal_moves.size());
     std::copy(lock->p.get(), lock->p.get() + pos.legal_moves.size(),
               std::back_inserter(result.p));
+  }
+  // Copy optimistic policy through when cached.  Caller decides whether
+  // to use it (by setting --optimistic-policy-weight* > 0 in search).
+  if (lock->p_optimistic) {
+    result.p_optimistic.reserve(pos.legal_moves.size());
+    std::copy(lock->p_optimistic.get(),
+              lock->p_optimistic.get() + pos.legal_moves.size(),
+              std::back_inserter(result.p_optimistic));
   }
   return result;
 }
