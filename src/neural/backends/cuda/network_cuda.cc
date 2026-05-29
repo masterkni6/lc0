@@ -1235,35 +1235,56 @@ class CudaNetwork : public Network {
           batchSize, (DataType*)io->op_policy_opt_mem_gpu_, spare1,
           nullptr, scratch_mem, scratch_size_, nullptr, cublas,
           compute_stream);  // optimistic policy map  // OPT POLICY output
-      // GPU-side optimistic policy blend.  Both policy chains have run on
-      // compute_stream and their logits live in op_policy_mem_gpu_ (vanilla)
-      // and op_policy_opt_mem_gpu_ (optimistic).  When `gpu_blend_alpha_`
-      // is set, overwrite the optimistic buffer in place with the linear
-      // blend of the two logits.  After host softmax (wrapper.cc), the
-      // priors search reads via GetPValOptimistic() are mathematically
-      // identical to the per-node geometric blend at this alpha — without
-      // the per-node CPU cost.  See blendPolicyLogits_kernel in
-      // common_kernels.cu for the proof.
+      // GPU-side optimistic policy blend.  Two paths depending on
+      // gpu_blend_alpha_:
       //
-      // Compute_stream ordering: this kernel reads vanilla (written
-      // earlier on the same stream above) and reads+writes optimistic
-      // (just written above).  No cross-stream sync needed — the same
-      // compute_stream sequences all three operations.
+      //   gpu_blend_alpha_ == 0  → current default behaviour
+      //     - Do nothing here.  Vanilla logits stay in op_policy_mem_gpu_;
+      //       optimistic logits stay in op_policy_opt_mem_gpu_.  Both
+      //       get memcpy'd to host.  Wrapper softmaxes both.  Search
+      //       does the host-side blend per node.
+      //
+      //   gpu_blend_alpha_ > 0  → GPU-only blend (Speedup A)
+      //     - Blend kernel writes (1-α)·vanilla + α·optimistic INTO the
+      //       vanilla buffer op_policy_mem_gpu_.  The optimistic buffer
+      //       is no longer needed on host so we skip its memcpy entirely.
+      //     - InputsOutputs allocated with optimistic_policy_host=false,
+      //       so op_policy_opt_mem_ == nullptr.  HasOptimisticPolicy()
+      //       returns false.  Wrapper softmaxes only the vanilla slot
+      //       (now blended).  Memcache stores only p.  Search uses the
+      //       vanilla SetP path.  Eliminates the second host softmax,
+      //       the p_optimistic propagation cost, and the optimistic
+      //       memcpy bandwidth.
+      //     - User must run with --optimistic-policy-weight=0 and
+      //       --optimistic-policy-weight-internal=0 — the blend has
+      //       already been done on GPU; setting search alphas > 0 would
+      //       try to re-blend zero-initialised p_optimistic spans and
+      //       produce catastrophic priors.
+      //
+      // Compute_stream ordering: the blend kernel reads both vanilla
+      // (written earlier on the same stream) and optimistic (just
+      // written above) and writes vanilla — all three operations are
+      // sequenced by compute_stream.  Safe to read+write in place.
       if (gpu_blend_alpha_ > 0.0f) {
         BlendPolicyLogits<DataType>(
             kNumOutputPolicy * batchSize,
-            (DataType*)io->op_policy_opt_mem_gpu_,
-            (const DataType*)io->op_policy_mem_gpu_, gpu_blend_alpha_,
+            (DataType*)io->op_policy_mem_gpu_,        // output = vanilla
+            (const DataType*)io->op_policy_mem_gpu_,  // input vanilla
+            (const DataType*)io->op_policy_opt_mem_gpu_, gpu_blend_alpha_,
             compute_stream);
       }
-      ReportCUDAErrors(
-          cudaEventRecord(io->policy_opt_done_event_, compute_stream));
-      ReportCUDAErrors(cudaStreamWaitEvent(
-          download_stream, io->policy_opt_done_event_, 0));
-      ReportCUDAErrors(cudaMemcpyAsync(
-          io->op_policy_opt_mem_, io->op_policy_opt_mem_gpu_,
-          sizeof(io->op_policy_opt_mem_[0]) * kNumOutputPolicy * batchSize,
-          cudaMemcpyDeviceToHost, download_stream));
+      if (io->op_policy_opt_mem_ != nullptr) {
+        // Host buffer was allocated → CPU pipeline expects the
+        // optimistic logits.  Record the event and copy them.
+        ReportCUDAErrors(
+            cudaEventRecord(io->policy_opt_done_event_, compute_stream));
+        ReportCUDAErrors(cudaStreamWaitEvent(
+            download_stream, io->policy_opt_done_event_, 0));
+        ReportCUDAErrors(cudaMemcpyAsync(
+            io->op_policy_opt_mem_, io->op_policy_opt_mem_gpu_,
+            sizeof(io->op_policy_opt_mem_[0]) * kNumOutputPolicy * batchSize,
+            cudaMemcpyDeviceToHost, download_stream));
+      }
 
       // Debug: dump first N policy values from BOTH heads on first
       // inference, when LC0_DEBUG_OPT_HEAD=1 is set in env.  Prints
@@ -1540,10 +1561,19 @@ class CudaNetwork : public Network {
   std::unique_ptr<InputsOutputs<DataType>> GetInputsOutputs() {
     std::lock_guard<std::mutex> lock(inputs_outputs_lock_);
     if (free_inputs_outputs_.empty()) {
+      // When gpu_blend_alpha_ > 0, the GPU pre-blends vanilla and
+      // optimistic logits into op_policy_mem_gpu_ and we skip the
+      // host-side optimistic memcpy entirely.  Passing
+      // optimistic_policy_host=false to InputsOutputs leaves
+      // op_policy_opt_mem_ (host) as nullptr → HasOptimisticPolicy()
+      // returns false → wrapper does only one softmax, memcache
+      // skips p_optimistic, and search uses the vanilla SetP path.
+      const bool need_opt_host = has_optimistic_policy_ &&
+                                  gpu_blend_alpha_ == 0.0f;
       return std::make_unique<InputsOutputs<DataType>>(
           max_batch_size_, wdl_, moves_left_, tensor_mem_size_, scratch_size_,
           !has_tensor_cores_ && std::is_same<half, DataType>::value,
-          has_optimistic_policy_);
+          has_optimistic_policy_, need_opt_host);
     } else {
       std::unique_ptr<InputsOutputs<DataType>> resource =
           std::move(free_inputs_outputs_.front());

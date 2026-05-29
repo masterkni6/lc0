@@ -71,10 +71,24 @@ struct CudaGraphExec {
 
 template <typename DataType>
 struct InputsOutputs {
+  // optimistic_policy        — allocate the GPU-side buffer the optimistic
+  //                            policy chain writes its logits into
+  // optimistic_policy_host    — also allocate the host-side buffer and
+  //                            done-event that wrapper.cc / search read.
+  //                            Set to false when the backend will pre-
+  //                            blend on GPU and write the result into
+  //                            op_policy_mem_ instead, hiding the
+  //                            second head from the CPU pipeline.
+  //                            HasOptimisticPolicy() returns false in
+  //                            that case (host pointer stays null), so
+  //                            the wrapper skips the second softmax,
+  //                            memcache skips p_optimistic propagation,
+  //                            and search uses the vanilla SetP path.
   InputsOutputs(unsigned maxBatchSize, bool wdl, bool moves_left,
                 size_t tensor_mem_size = 0, size_t scratch_size = 0,
                 bool cublasDisableTensorCores = false,
-                bool optimistic_policy = false) {
+                bool optimistic_policy = false,
+                bool optimistic_policy_host = true) {
     ReportCUDAErrors(cudaHostAlloc(
         &input_masks_mem_, maxBatchSize * kInputPlanes * sizeof(uint64_t),
         cudaHostAllocMapped));
@@ -107,15 +121,25 @@ struct InputsOutputs {
     //   p_effective = (1 - alpha) * op_policy + alpha * op_policy_opt
     // at root edges when --optimistic-policy-weight > 0.
     if (optimistic_policy) {
-      ReportCUDAErrors(cudaHostAlloc(
-          &op_policy_opt_mem_,
-          maxBatchSize * kNumOutputPolicy * sizeof(op_policy_opt_mem_[0]),
-          0));
+      // GPU buffer is always needed when the optimistic chain runs —
+      // it's the destination of the optimistic policy map and the
+      // input to the GPU blend kernel (if active).
       ReportCUDAErrors(cudaMalloc(
           &op_policy_opt_mem_gpu_,
           maxBatchSize * kNumOutputPolicy * sizeof(op_policy_opt_mem_[0])));
-      ReportCUDAErrors(cudaEventCreateWithFlags(
-          &policy_opt_done_event_, cudaEventDisableTiming));
+      // Host buffer + done-event only when the CPU pipeline needs to
+      // read the optimistic logits.  When the backend does GPU-side
+      // pre-blending (gpu_blend_alpha > 0), the blended output is
+      // written into op_policy_mem_gpu_ instead and there is no
+      // separate optimistic memcpy → no host buffer, no event.
+      if (optimistic_policy_host) {
+        ReportCUDAErrors(cudaHostAlloc(
+            &op_policy_opt_mem_,
+            maxBatchSize * kNumOutputPolicy * sizeof(op_policy_opt_mem_[0]),
+            0));
+        ReportCUDAErrors(cudaEventCreateWithFlags(
+            &policy_opt_done_event_, cudaEventDisableTiming));
+      }
     }
     ReportCUDAErrors(cudaHostAlloc(
         &op_value_mem_, maxBatchSize * (wdl ? 3 : 1) * sizeof(op_value_mem_[0]),
@@ -184,10 +208,18 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaFree(input_val_mem_gpu_));
     ReportCUDAErrors(cudaFreeHost(op_policy_mem_));
     ReportCUDAErrors(cudaFree(op_policy_mem_gpu_));
+    // op_policy_opt_mem_ host buffer + done-event are allocated only
+    // when optimistic_policy_host=true (CPU-side blend path).  The
+    // GPU buffer is allocated whenever the optimistic head exists in
+    // the net, even in the GPU-blend-only path, because the optimistic
+    // policy map needs somewhere to write before the blend kernel
+    // reads it.  Free each piece based on what was actually allocated.
     if (op_policy_opt_mem_ != nullptr) {
       ReportCUDAErrors(cudaFreeHost(op_policy_opt_mem_));
-      ReportCUDAErrors(cudaFree(op_policy_opt_mem_gpu_));
       ReportCUDAErrors(cudaEventDestroy(policy_opt_done_event_));
+    }
+    if (op_policy_opt_mem_gpu_ != nullptr) {
+      ReportCUDAErrors(cudaFree(op_policy_opt_mem_gpu_));
     }
     ReportCUDAErrors(cudaFreeHost(op_value_mem_));
     ReportCUDAErrors(cudaFree(op_value_mem_gpu_));

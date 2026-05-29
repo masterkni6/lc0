@@ -151,6 +151,22 @@ class NetworkAsBackendComputation : public BackendComputation {
       // internal > 0 (internal-node blend) is set, so leaving the
       // span empty is a cheap way to skip both the read and the
       // softmax cost on runs that aren't blending.
+      // Defensive fallback: if the caller pre-allocated p_optimistic
+      // (search has --optimistic-policy-weight > 0) but the backend
+      // doesn't expose an optimistic head — either because the net
+      // doesn't have one, or because GPU-side blend is active and the
+      // backend has folded the blend into the vanilla buffer (Speedup
+      // A: backend-opts gpu_blend_alpha > 0) — copy the vanilla priors
+      // into the optimistic slot.  Search's blend at any α between
+      // identical priors reduces to those priors (P_v^(1-α)·P_v^α
+      // renormalised = P_v).  Without this fallback the optimistic
+      // span stays zero-initialised and the blend at α>0 produces
+      // catastrophic all-zero edge priors.
+      if (!optimistic_available && !result.p_optimistic.empty() &&
+          !result.p.empty()) {
+        std::copy(result.p.begin(), result.p.end(),
+                  result.p_optimistic.begin());
+      }
       if (optimistic_available && !result.p_optimistic.empty()) {
         SoftmaxPolicy(result.p_optimistic, computation_.get(), i,
                       /*optimistic=*/true);

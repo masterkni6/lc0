@@ -2058,29 +2058,32 @@ template void Add3<half>(int, half*, const half*, const half*, const half*,
 // internal the GPU blend is mathematically complete; at split alphas
 // don't enable the GPU blend (fall back to the per-node CPU path).
 template <typename T>
-__global__ void blendPolicyLogits_kernel(T* opt_inout, const T* vanilla,
-                                          float alpha, int total) {
+__global__ void blendPolicyLogits_kernel(T* output, const T* vanilla,
+                                          const T* optimistic, float alpha,
+                                          int total) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const float v = (float)vanilla[i];
-  const float o = (float)opt_inout[i];
-  opt_inout[i] = (T)((1.0f - alpha) * v + alpha * o);
+  const float o = (float)optimistic[i];
+  output[i] = (T)((1.0f - alpha) * v + alpha * o);
 }
 
 template <typename T>
-void BlendPolicyLogits(int total, T* opt_inout, const T* vanilla, float alpha,
-                       cudaStream_t stream) {
+void BlendPolicyLogits(int total, T* output, const T* vanilla,
+                       const T* optimistic, float alpha, cudaStream_t stream) {
+  // `output` may alias either `vanilla` or `optimistic` — each thread
+  // does the two reads before the single write, so in-place is safe.
   const int kBlockSize = 256;
   int blocks = DivUp(total, kBlockSize);
   blendPolicyLogits_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
-      opt_inout, vanilla, alpha, total);
+      output, vanilla, optimistic, alpha, total);
   ReportCUDAErrors(cudaGetLastError());
 }
 
-template void BlendPolicyLogits<float>(int, float*, const float*, float,
-                                        cudaStream_t);
-template void BlendPolicyLogits<half>(int, half*, const half*, float,
-                                       cudaStream_t);
+template void BlendPolicyLogits<float>(int, float*, const float*,
+                                        const float*, float, cudaStream_t);
+template void BlendPolicyLogits<half>(int, half*, const half*, const half*,
+                                       float, cudaStream_t);
 
 // ── Fused ExoFormer anchor add: Q += Qa, K += Ka, V += Va ────────────────
 // Collapses 3 separate addVectors kernel launches into 1 for the common
