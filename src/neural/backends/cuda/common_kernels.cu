@@ -2085,6 +2085,48 @@ template void BlendPolicyLogits<float>(int, float*, const float*,
 template void BlendPolicyLogits<half>(int, half*, const half*, const half*,
                                        float, cudaStream_t);
 
+// Dual-output variant: writes two pre-blended buffers in a single read
+// pass over vanilla and optimistic.  Used to support split-alpha (root
+// vs internal) on GPU — the search-time fast path then picks which
+// pre-blended buffer to use per depth without any per-node blend math.
+//
+// out_v[i] = (1 - alpha_root)     · vanilla[i] + alpha_root     · optimistic[i]
+// out_o[i] = (1 - alpha_internal) · vanilla[i] + alpha_internal · optimistic[i]
+//
+// Each thread reads vanilla[i] and optimistic[i] ONCE, computes both
+// blends, writes both outputs.  Safe with full aliasing — `out_v` may
+// alias `vanilla`, `out_o` may alias `optimistic`, both writes happen
+// AFTER both reads in the same thread.
+template <typename T>
+__global__ void blendPolicyLogitsDual_kernel(
+    T* out_v, T* out_o, const T* vanilla, const T* optimistic,
+    float alpha_root, float alpha_internal, int total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const float v = (float)vanilla[i];
+  const float o = (float)optimistic[i];
+  out_v[i] = (T)((1.0f - alpha_root) * v + alpha_root * o);
+  out_o[i] = (T)((1.0f - alpha_internal) * v + alpha_internal * o);
+}
+
+template <typename T>
+void BlendPolicyLogitsDual(int total, T* out_v, T* out_o, const T* vanilla,
+                            const T* optimistic, float alpha_root,
+                            float alpha_internal, cudaStream_t stream) {
+  const int kBlockSize = 256;
+  int blocks = DivUp(total, kBlockSize);
+  blendPolicyLogitsDual_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+      out_v, out_o, vanilla, optimistic, alpha_root, alpha_internal, total);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+template void BlendPolicyLogitsDual<float>(int, float*, float*, const float*,
+                                            const float*, float, float,
+                                            cudaStream_t);
+template void BlendPolicyLogitsDual<half>(int, half*, half*, const half*,
+                                           const half*, float, float,
+                                           cudaStream_t);
+
 // ── Fused ExoFormer anchor add: Q += Qa, K += Ka, V += Va ────────────────
 // Collapses 3 separate addVectors kernel launches into 1 for the common
 // default-lambda ExoFormer path. Saves ~2 launches per encoder layer.

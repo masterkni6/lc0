@@ -401,6 +401,16 @@ template <typename T>
 void BlendPolicyLogits(int total, T* output, const T* vanilla,
                        const T* optimistic, float alpha, cudaStream_t stream);
 
+// Dual-output variant: writes vanilla buffer with blend at alpha_root
+// AND optimistic buffer with blend at alpha_internal in one read pass.
+// Used for split-alpha mode where root and internal nodes want different
+// blends — both pre-computed on GPU so search uses fast-path SetP at
+// every node, picking the pre-blended buffer that matches its depth.
+template <typename T>
+void BlendPolicyLogitsDual(int total, T* out_v, T* out_o, const T* vanilla,
+                            const T* optimistic, float alpha_root,
+                            float alpha_internal, cudaStream_t stream);
+
 // Element-wise multiply: output[i] = a[i] * b[i].
 // Used for VGA-E gating where sigmoid is already applied to one operand.
 template <typename T>

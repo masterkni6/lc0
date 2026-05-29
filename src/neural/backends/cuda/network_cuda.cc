@@ -368,23 +368,35 @@ class CudaNetwork : public Network {
 
     gpu_id_ = options.GetOrDefault<int>("gpu", 0);
     enable_graph_capture_ = options.GetOrDefault<bool>("graph_capture", true);
-    // GPU-side optimistic policy blend.  When > 0, a small CUDA kernel
-    // runs after both policy chains and pre-blends vanilla + optimistic
-    // logits in place into op_policy_opt_mem_gpu_ via linear logit
-    // interpolation.  Mathematically equivalent to the geometric blend
-    // CPU search computes per node (because softmax is invariant under
-    // linear blends of logits — see common_kernels.cu derivation).
+    // GPU-side optimistic policy blend.  Two backend options:
+    //   gpu_blend_alpha       — internal-node alpha (also default for root)
+    //   gpu_blend_alpha_root  — optional override for root nodes
     //
-    // Usage: set this to the same value you'd otherwise pass to BOTH
-    // --optimistic-policy-weight AND --optimistic-policy-weight-internal,
-    // and set those search flags to 1.0 instead.  Search then uses the
-    // α=1.0 fast path (SetP from p_optimistic without blending) and the
-    // GPU has already done the blend.  Saves the per-node CPU pow+sum+
-    // renorm chain (~30 ops/edge × ~30 edges/node × N nodes ≈ N·900 ops
-    // per search) at the cost of one cheap O(N_outputs) kernel per
-    // inference.  Default 0 (disabled).  Only honored when the net has
-    // the optimistic head built (has_optimistic_policy_).
+    // Uniform mode (gpu_blend_alpha > 0, gpu_blend_alpha_root unset or
+    // == gpu_blend_alpha):
+    //   - GPU blends both buffers to the same alpha → only the vanilla
+    //     buffer is needed on host (Speedup A: hides optimistic head
+    //     from CPU pipeline, single softmax in wrapper).
+    //   - User sets --optimistic-policy-weight=0 and
+    //     --optimistic-policy-weight-internal=0.
+    //
+    // Split mode (gpu_blend_alpha > 0 AND gpu_blend_alpha_root > 0
+    // AND they differ):
+    //   - Dual-output kernel produces vanilla buffer at α_root and
+    //     optimistic buffer at α_internal in one read pass.
+    //   - Both buffers memcpy'd to host so search can pick which to
+    //     use per depth.  Wrapper softmaxes both (~5% CPU overhead vs
+    //     uniform mode, but still no per-node host blend math).
+    //   - User sets --optimistic-policy-weight=0 (root uses
+    //     pre-blended vanilla buffer directly via SetP from p) and
+    //     --optimistic-policy-weight-internal=1.0 (internal fast
+    //     path: SetP from p_optimistic).
+    //
+    // Both default 0 (disabled).  Only honored when the net has the
+    // optimistic head built (has_optimistic_policy_).
     gpu_blend_alpha_ = options.GetOrDefault<float>("gpu_blend_alpha", 0.0f);
+    gpu_blend_alpha_root_ =
+        options.GetOrDefault<float>("gpu_blend_alpha_root", 0.0f);
     // Note: parallel FFN (multi-stream FFN) is compatible with graph capture
     // via the dual-graph approach: the main graph uses External event flags
     // to signal/wait on the FFN stream without causing isolation errors.
@@ -1265,7 +1277,27 @@ class CudaNetwork : public Network {
       // (written earlier on the same stream) and optimistic (just
       // written above) and writes vanilla — all three operations are
       // sequenced by compute_stream.  Safe to read+write in place.
-      if (gpu_blend_alpha_ > 0.0f) {
+      // Dispatch blend kernel.  Three cases:
+      //   (a) gpu_blend_alpha_ == 0: no GPU blend, host does it per-node
+      //   (b) gpu_blend_alpha_ > 0, gpu_blend_alpha_root_ == 0 (or
+      //       equal to gpu_blend_alpha_): uniform mode.  Blend writes
+      //       into vanilla buffer; optimistic host buffer not needed.
+      //   (c) gpu_blend_alpha_ > 0 AND gpu_blend_alpha_root_ > 0 AND
+      //       they differ: split mode.  Dual-output kernel writes
+      //       vanilla=blended-at-root and optimistic=blended-at-internal
+      //       in one read pass.
+      const bool gpu_blend_split =
+          gpu_blend_alpha_ > 0.0f && gpu_blend_alpha_root_ > 0.0f &&
+          gpu_blend_alpha_ != gpu_blend_alpha_root_;
+      if (gpu_blend_split) {
+        BlendPolicyLogitsDual<DataType>(
+            kNumOutputPolicy * batchSize,
+            (DataType*)io->op_policy_mem_gpu_,        // out_v = vanilla
+            (DataType*)io->op_policy_opt_mem_gpu_,    // out_o = optimistic
+            (const DataType*)io->op_policy_mem_gpu_,  // input vanilla
+            (const DataType*)io->op_policy_opt_mem_gpu_,  // input optimistic
+            gpu_blend_alpha_root_, gpu_blend_alpha_, compute_stream);
+      } else if (gpu_blend_alpha_ > 0.0f) {
         BlendPolicyLogits<DataType>(
             kNumOutputPolicy * batchSize,
             (DataType*)io->op_policy_mem_gpu_,        // output = vanilla
@@ -1561,15 +1593,24 @@ class CudaNetwork : public Network {
   std::unique_ptr<InputsOutputs<DataType>> GetInputsOutputs() {
     std::lock_guard<std::mutex> lock(inputs_outputs_lock_);
     if (free_inputs_outputs_.empty()) {
-      // When gpu_blend_alpha_ > 0, the GPU pre-blends vanilla and
-      // optimistic logits into op_policy_mem_gpu_ and we skip the
-      // host-side optimistic memcpy entirely.  Passing
-      // optimistic_policy_host=false to InputsOutputs leaves
-      // op_policy_opt_mem_ (host) as nullptr → HasOptimisticPolicy()
-      // returns false → wrapper does only one softmax, memcache
-      // skips p_optimistic, and search uses the vanilla SetP path.
-      const bool need_opt_host = has_optimistic_policy_ &&
-                                  gpu_blend_alpha_ == 0.0f;
+      // We need the host-side optimistic buffer when EITHER:
+      //   (a) GPU blend is OFF — search reads p_optimistic on host
+      //       and does the per-node blend math itself.
+      //   (b) GPU blend is in SPLIT mode — gpu_blend_alpha_root_ > 0
+      //       in addition to gpu_blend_alpha_, so two pre-blended
+      //       buffers are produced and both need to reach the host.
+      // In the uniform GPU blend case (gpu_blend_alpha_ > 0 alone),
+      // the blended priors are written into the vanilla buffer and
+      // the optimistic host buffer isn't needed → leaving it null
+      // makes HasOptimisticPolicy() return false, eliminating the
+      // second host softmax, memcache p_optimistic propagation, and
+      // search's blend branch.
+      const bool split_mode =
+          gpu_blend_alpha_ > 0.0f && gpu_blend_alpha_root_ > 0.0f &&
+          gpu_blend_alpha_ != gpu_blend_alpha_root_;
+      const bool need_opt_host =
+          has_optimistic_policy_ &&
+          (gpu_blend_alpha_ == 0.0f || split_mode);
       return std::make_unique<InputsOutputs<DataType>>(
           max_batch_size_, wdl_, moves_left_, tensor_mem_size_, scratch_size_,
           !has_tensor_cores_ && std::is_same<half, DataType>::value,
@@ -1602,11 +1643,14 @@ class CudaNetwork : public Network {
   int max_batch_size_;
   int min_batch_size_;
   bool enable_graph_capture_;
-  // GPU-side optimistic policy blend coefficient.  When > 0 and the net
-  // has the optimistic head built, runs blendPolicyLogits_kernel on
-  // compute_stream after both policy maps to linearly blend logits.
-  // Default 0 (disabled); see ctor for the option-read.
+  // GPU-side optimistic policy blend coefficients.  When gpu_blend_
+  // alpha_ > 0 and the net has the optimistic head built, runs the
+  // blend kernel after both policy maps to linearly blend logits.
+  // When gpu_blend_alpha_root_ is also > 0 and differs, runs the
+  // dual-output kernel for split-alpha (root vs internal).  Both
+  // default 0 (disabled).  See ctor for the option reads.
   float gpu_blend_alpha_ = 0.0f;
+  float gpu_blend_alpha_root_ = 0.0f;
   bool wdl_;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
