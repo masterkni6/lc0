@@ -28,6 +28,7 @@
 #include "selfplay/tournament.h"
 
 #include <fstream>
+#include <sstream>
 
 #include "chess/pgn.h"
 #include "neural/memcache.h"
@@ -98,6 +99,64 @@ const OptionId kSyzygyTablebaseId{
     "separator (\";\" for Windows, \":\" for Linux).",
     's'};
 
+// ─── External UCI opponent flags ───
+const OptionId kOpponentPathId{
+    "opponent-path", "OpponentPath",
+    "Path to an external UCI engine (e.g. /usr/games/stockfish). When set, "
+    "the engine plays the side(s) selected by --opponent-side; training "
+    "data is only written for lc0's moves."};
+const OptionId kOpponentArgsId{
+    "opponent-args", "OpponentArgs",
+    "Whitespace-separated command-line arguments passed to the opponent "
+    "binary on spawn."};
+const OptionId kOpponentUciOptionsId{
+    "opponent-options", "OpponentOptions",
+    "Semicolon-separated UCI setoption pairs sent to the opponent at "
+    "startup, e.g. 'Threads=1;Hash=64;Skill Level=15;UCI_LimitStrength=true;"
+    "UCI_Elo=2400'. Order is preserved."};
+const OptionId kOpponentGoCommandId{
+    "opponent-go", "OpponentGo",
+    "Argument string appended after 'go' on every move, e.g. 'movetime 50', "
+    "'depth 12', 'nodes 100000'.",
+};
+
+// ─── External UCI advisor flags ───
+// The advisor is queried at every lc0-side move; its recommended move
+// receives forced MCTS visits at root before PUCT selection resumes
+// normal behavior.  Trained policy still comes from lc0's MCTS visit
+// distribution — advisor only biases which positions get explored.
+const OptionId kAdvisorPathId{
+    "advisor-path", "AdvisorPath",
+    "Path to an external UCI engine to use as an MCTS advisor (e.g. "
+    "Stockfish).  When set, lc0 consults this engine at every lc0-side "
+    "move and forces --advisor-min-visits visits on the advisor's move "
+    "at root.  Empty disables advisor mode."};
+const OptionId kAdvisorArgsId{
+    "advisor-args", "AdvisorArgs",
+    "Whitespace-separated command-line arguments passed to the advisor "
+    "binary on spawn."};
+const OptionId kAdvisorUciOptionsId{
+    "advisor-options", "AdvisorOptions",
+    "Semicolon-separated UCI setoption pairs sent to the advisor at "
+    "startup, e.g. 'Threads=2;Hash=256'. Order is preserved."};
+const OptionId kAdvisorGoCommandId{
+    "advisor-go", "AdvisorGo",
+    "Argument string appended after 'go' on every advisor query, e.g. "
+    "'movetime 100', 'nodes 100000'.  Lower = faster selfplay throughput; "
+    "higher = stronger advisor recommendations."};
+const OptionId kAdvisorMinVisitsId{
+    "advisor-min-visits", "AdvisorMinVisits",
+    "Number of root MCTS visits to force on the advisor's move at every "
+    "lc0-side turn.  0 disables advisor injection (the advisor is "
+    "consulted but its move is ignored, which makes no sense — set this "
+    "to a positive value to actually use advisor mode).  Typical: 20-50 "
+    "out of --visits=800.  Must be < --visits."};
+const OptionId kOpponentSideId{
+    "opponent-side", "OpponentSide",
+    "Which colour(s) the opponent plays: white, black, alternate, or none. "
+    "'alternate' switches sides every game so lc0 sees both colours. "
+    "'none' disables the opponent (pure selfplay)."};
+
 }  // namespace
 
 void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
@@ -136,6 +195,21 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<ChoiceOption>(kOpeningsModeId, openings_modes) = "sequential";
 
   options->Add<StringOption>(kSyzygyTablebaseId);
+
+  // External opponent. Default empty -> pure lc0 selfplay.
+  options->Add<StringOption>(kOpponentPathId) = "";
+  options->Add<StringOption>(kOpponentArgsId) = "";
+  options->Add<StringOption>(kOpponentUciOptionsId) = "";
+  options->Add<StringOption>(kOpponentGoCommandId) = "movetime 100";
+  options->Add<StringOption>(kAdvisorPathId) = "";
+  options->Add<StringOption>(kAdvisorArgsId) = "";
+  options->Add<StringOption>(kAdvisorUciOptionsId) = "";
+  options->Add<StringOption>(kAdvisorGoCommandId) = "movetime 100";
+  options->Add<IntOption>(kAdvisorMinVisitsId, 0, 100000) = 0;
+  std::vector<std::string> opponent_sides = {"none", "white", "black",
+                                              "alternate"};
+  options->Add<ChoiceOption>(kOpponentSideId, opponent_sides) = "none";
+
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -367,6 +441,137 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
         discard_pile_.pop_back();
       }
     };
+
+    // ─── External UCI opponent (Stockfish etc.) plumbing ───
+    // We read all opponent settings from player1/white's option dict —
+    // there's only one external opponent in a tournament. The opponent
+    // replaces one or both lc0 sides per --opponent-side.
+    const std::string opponent_path =
+        player_options_[0][0].Get<std::string>(kOpponentPathId);
+    if (!opponent_path.empty()) {
+      const std::string opponent_side =
+          player_options_[0][0].Get<std::string>(kOpponentSideId);
+      // Which actual color (0=white, 1=black) does the opponent play in
+      // this game?  -1 means neither (pure lc0 selfplay).
+      int opponent_color = -1;
+      if (opponent_side == "white") {
+        opponent_color = 0;
+      } else if (opponent_side == "black") {
+        opponent_color = 1;
+      } else if (opponent_side == "alternate") {
+        // SF should sit in the player2 slot consistently, with colors
+        // flipping per game via lc0's standard player1_black flag.
+        // The naive `(game_number % 2 == 0) ? 1 : 0` assumed P1 starts
+        // white, but tournament.cc:247 randomizes first_game_black_
+        // at startup — so on roughly half the processes, the assumption
+        // is INVERTED and SF ends up landing in the player1 slot, with
+        // lc0 in player2.  P1 stats then track SF instead of lc0,
+        // which is why the per-process tournamentstatus output was
+        // bimodal (some processes showing "P1 dominates" = lc0 wins,
+        // others showing "P2 dominates" = also lc0 wins but lc0 is
+        // labeled P2 there).
+        //
+        // Correct: SF's color is the OPPOSITE of player1's color, so
+        // SF always lands in the player2 slot regardless of the
+        // first_game_black_ RNG.
+        opponent_color = player1_black ? 0 : 1;
+      }
+      // The opponent is the "other" player slot — if pl_idx is player2,
+      // and player2 is playing color `color`, and that color matches
+      // opponent_color, then THIS side gets the external engine.  This
+      // is independent of player1/player2 distinction; we just check
+      // "does this slot's color == opponent_color?".
+      if (color == opponent_color) {
+        opt.external_engine_path = opponent_path;
+
+        // args: whitespace-split the string.  Quoted args not supported
+        // yet — Stockfish doesn't need them.  If you ever do, switch to
+        // a real shell-style splitter.
+        const std::string args_str =
+            player_options_[0][0].Get<std::string>(kOpponentArgsId);
+        std::istringstream args_iss(args_str);
+        std::string tok;
+        while (args_iss >> tok) opt.external_engine_args.push_back(tok);
+
+        // UCI options: semicolon-separated Name=Value pairs.
+        const std::string uci_str =
+            player_options_[0][0].Get<std::string>(kOpponentUciOptionsId);
+        std::istringstream uci_iss(uci_str);
+        std::string entry;
+        while (std::getline(uci_iss, entry, ';')) {
+          // Trim leading/trailing spaces.
+          size_t b = 0;
+          while (b < entry.size() && entry[b] == ' ') ++b;
+          size_t e = entry.size();
+          while (e > b && entry[e - 1] == ' ') --e;
+          entry = entry.substr(b, e - b);
+          if (entry.empty()) continue;
+          auto eq = entry.find('=');
+          if (eq == std::string::npos) {
+            throw Exception(
+                "Bad opponent UCI option (missing '='): '" + entry + "'");
+          }
+          opt.external_engine_uci_options.emplace_back(
+              entry.substr(0, eq), entry.substr(eq + 1));
+        }
+
+        opt.external_engine_go_command =
+            player_options_[0][0].Get<std::string>(kOpponentGoCommandId);
+      }
+    }
+  }
+
+  // ─── Advisor engine plumbing ───
+  // Advisor configuration is read PER PLAYER from each player's options
+  // subdict.  OptionsDict's fallback semantics mean:
+  //   --advisor-path=foo               → both player1 and player2 see it
+  //   --player1.advisor-path=foo       → only player1
+  //   --player2.advisor-path=foo       → only player2
+  //   --player1.advisor-path=foo --player2.advisor-path=bar  → different
+  //
+  // The game loop in game.cc skips advisor injection automatically on
+  // sides where an external opponent is playing (no MCTS happens there),
+  // so configuring an advisor on a side that ends up being SF is a no-op.
+  for (int pl_idx : {0, 1}) {
+    const int color = color_idx[pl_idx];
+    const auto& dict = player_options_[pl_idx][color];
+
+    const std::string advisor_path = dict.Get<std::string>(kAdvisorPathId);
+    const int advisor_min_visits = dict.Get<int>(kAdvisorMinVisitsId);
+    if (advisor_path.empty() || advisor_min_visits <= 0) continue;
+
+    PlayerOptions& opt = options[color];
+    opt.advisor_engine_path = advisor_path;
+    opt.advisor_min_visits = advisor_min_visits;
+    opt.advisor_engine_go_command =
+        dict.Get<std::string>(kAdvisorGoCommandId);
+
+    // args: whitespace-split
+    {
+      std::istringstream iss(dict.Get<std::string>(kAdvisorArgsId));
+      std::string tok;
+      while (iss >> tok) opt.advisor_engine_args.push_back(tok);
+    }
+    // UCI options: semicolon-separated Name=Value pairs
+    {
+      std::istringstream iss(dict.Get<std::string>(kAdvisorUciOptionsId));
+      std::string entry;
+      while (std::getline(iss, entry, ';')) {
+        size_t b = 0;
+        while (b < entry.size() && entry[b] == ' ') ++b;
+        size_t e = entry.size();
+        while (e > b && entry[e - 1] == ' ') --e;
+        entry = entry.substr(b, e - b);
+        if (entry.empty()) continue;
+        auto eq = entry.find('=');
+        if (eq == std::string::npos) {
+          throw Exception("Bad advisor UCI option (missing '='): '" +
+                          entry + "'");
+        }
+        opt.advisor_engine_uci_options.emplace_back(
+            entry.substr(0, eq), entry.substr(eq + 1));
+      }
+    }
   }
 
   // Iterator to store the game in. Have to keep it so that later we can

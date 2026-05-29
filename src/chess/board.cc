@@ -759,6 +759,143 @@ bool ChessBoard::IsUnderAttack(Square square) const {
   return false;
 }
 
+// ── Tactical helpers: public API for features outside board.cc ──
+// These expose slider/piece attack patterns (magic bitboards for R/B, static
+// tables for N/K/P) and per-color attacker bitboards. Mirror the internal
+// IsUnderAttack logic but return bitboards rather than booleans.
+
+BitBoard ChessBoard::RookAttacksFrom(Square square, BitBoard occupancy) {
+  return GetRookAttacks(square, occupancy);
+}
+BitBoard ChessBoard::BishopAttacksFrom(Square square, BitBoard occupancy) {
+  return GetBishopAttacks(square, occupancy);
+}
+BitBoard ChessBoard::KnightAttacksFrom(Square square) {
+  return kKnightAttacks[square.as_idx()];
+}
+BitBoard ChessBoard::KingAttacksFrom(Square square) {
+  // No pre-computed king-attack table, synthesize from an offset set.
+  const int rank = square.rank().idx;
+  const int file = square.file().idx;
+  uint64_t bb = 0;
+  for (int dr = -1; dr <= 1; ++dr) {
+    for (int df = -1; df <= 1; ++df) {
+      if (dr == 0 && df == 0) continue;
+      int r = rank + dr, f = file + df;
+      if (r >= 0 && r < 8 && f >= 0 && f < 8) {
+        bb |= (1ULL << (r * 8 + f));
+      }
+    }
+  }
+  return BitBoard(bb);
+}
+BitBoard ChessBoard::PawnAttacksFrom(Square square, bool is_ours) {
+  // kPawnAttacks[sq] is the "attackers of sq from pawns of OPPOSITE color"
+  // when used like kPawnAttacks[sq].intersects(their_pieces_ & pawns_). That
+  // is, if pawns are attacking-forward-toward-us, kPawnAttacks gives their
+  // origin squares.  For explicit forward-attack semantics:
+  //   - own pawn forward: +rank direction  (our pawn at r attacks (r+1, c±1))
+  //   - opp pawn forward: -rank direction  (their pawn at r attacks (r-1, c±1))
+  const int rank = square.rank().idx;
+  const int file = square.file().idx;
+  const int dr = is_ours ? 1 : -1;
+  const int new_rank = rank + dr;
+  uint64_t bb = 0;
+  if (new_rank >= 0 && new_rank < 8) {
+    if (file - 1 >= 0) bb |= (1ULL << (new_rank * 8 + (file - 1)));
+    if (file + 1 < 8)  bb |= (1ULL << (new_rank * 8 + (file + 1)));
+  }
+  return BitBoard(bb);
+}
+
+BitBoard ChessBoard::GetOurAttackers(Square square) const {
+  // Mirror of IsUnderAttack's checks, but for OUR pieces attacking `square`,
+  // and returning the full attacker bitboard rather than short-circuiting.
+  const BitBoard occ = our_pieces_ | their_pieces_;
+  BitBoard attackers(0);
+  // King.
+  {
+    const int krank = our_king_.rank().idx;
+    const int kfile = our_king_.file().idx;
+    const int rank  = square.rank().idx;
+    const int file  = square.file().idx;
+    if (std::abs(krank - rank) <= 1 && std::abs(kfile - file) <= 1 &&
+        our_king_ != square) {
+      attackers = attackers | BitBoard::FromSquare(our_king_);
+    }
+  }
+  // Rook / queen (orthogonal).
+  attackers = attackers |
+              (GetRookAttacks(square, occ) & our_pieces_ & rooks_);
+  // Bishop / queen (diagonal).
+  attackers = attackers |
+              (GetBishopAttacks(square, occ) & our_pieces_ & bishops_);
+  // Pawns — our pawns attack `square` if they're one rank BEHIND square's
+  // rank and on file ± 1. Equivalently, `square` is attacked by our pawns
+  // whose squares are reached by "backward-left/right" from `square`.
+  // kPawnAttacks[sq] gives squares attacked BY A PAWN AT sq in the
+  // black-perspective sense. Since the board is flipped for side-to-move,
+  // "our" pawns move +rank; the squares attacking `square` are at rank-1
+  // file±1.
+  {
+    const int rank = square.rank().idx;
+    const int file = square.file().idx;
+    if (rank - 1 >= 0) {
+      uint64_t bb = 0;
+      if (file - 1 >= 0) bb |= (1ULL << ((rank - 1) * 8 + (file - 1)));
+      if (file + 1 < 8)  bb |= (1ULL << ((rank - 1) * 8 + (file + 1)));
+      attackers = attackers | (BitBoard(bb) & our_pieces_ & pawns_ & kPawnMask);
+    }
+  }
+  // Knights.
+  attackers = attackers |
+              (kKnightAttacks[square.as_idx()] & our_pieces_ - rooks_ -
+               bishops_ - (pawns_ & kPawnMask) -
+               BitBoard::FromSquare(our_king_));
+  return attackers;
+}
+
+BitBoard ChessBoard::GetTheirAttackers(Square square) const {
+  // Symmetric to GetOurAttackers but from the opponent's perspective.
+  const BitBoard occ = our_pieces_ | their_pieces_;
+  BitBoard attackers(0);
+  // Their king.
+  {
+    const int krank = their_king_.rank().idx;
+    const int kfile = their_king_.file().idx;
+    const int rank  = square.rank().idx;
+    const int file  = square.file().idx;
+    if (std::abs(krank - rank) <= 1 && std::abs(kfile - file) <= 1 &&
+        their_king_ != square) {
+      attackers = attackers | BitBoard::FromSquare(their_king_);
+    }
+  }
+  // Their rook / queen.
+  attackers = attackers |
+              (GetRookAttacks(square, occ) & their_pieces_ & rooks_);
+  // Their bishop / queen.
+  attackers = attackers |
+              (GetBishopAttacks(square, occ) & their_pieces_ & bishops_);
+  // Their pawns attack squares one rank AHEAD of themselves (toward rank 0).
+  // So `square` is attacked by their pawn at rank+1, file±1.
+  {
+    const int rank = square.rank().idx;
+    const int file = square.file().idx;
+    if (rank + 1 < 8) {
+      uint64_t bb = 0;
+      if (file - 1 >= 0) bb |= (1ULL << ((rank + 1) * 8 + (file - 1)));
+      if (file + 1 < 8)  bb |= (1ULL << ((rank + 1) * 8 + (file + 1)));
+      attackers = attackers | (BitBoard(bb) & their_pieces_ & pawns_ & kPawnMask);
+    }
+  }
+  // Their knights.
+  attackers = attackers |
+              (kKnightAttacks[square.as_idx()] & their_pieces_ - rooks_ -
+               bishops_ - (pawns_ & kPawnMask) -
+               BitBoard::FromSquare(their_king_));
+  return attackers;
+}
+
 KingAttackInfo ChessBoard::GenerateKingAttackInfo() const {
   KingAttackInfo king_attack_info;
 

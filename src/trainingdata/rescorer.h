@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "syzygy/syzygy.h"
-#include "trainingdata/trainingdata_v6.h"
 #include "trainingdata/trainingdata_v7.h"
 
 namespace lczero {
@@ -51,9 +50,7 @@ std::vector<T> RescoreTrainingData(std::vector<T> fileContents,
                                    float dtzBoost = 0.0f,
                                    int newInputFormat = -1);
 
-// Explicit instantiation declarations.
-extern template std::vector<V6TrainingData> RescoreTrainingData(
-    std::vector<V6TrainingData>, SyzygyTablebase*, float, float, float, int);
+// Explicit instantiation declaration.
 extern template std::vector<V7TrainingData> RescoreTrainingData(
     std::vector<V7TrainingData>, SyzygyTablebase*, float, float, float, int);
 

@@ -33,6 +33,7 @@
 #include "neural/backend.h"
 #include "search/classic/search.h"
 #include "search/classic/stoppers/stoppers.h"
+#include "selfplay/external_engine.h"
 #include "trainingdata/trainingdata.h"
 #include "utils/optionsparser.h"
 
@@ -60,6 +61,42 @@ struct PlayerOptions {
   const OptionsDict* uci_options;
   // Limits to use for every move.
   SelfPlayLimits search_limits;
+
+  // External UCI opponent.  When `external_engine_path` is non-empty,
+  // this side's moves are obtained from the named subprocess instead of
+  // from lc0's MCTS.  Training data is NOT written for these moves (so a
+  // game with an opponent on one side yields ~half as many training
+  // positions as a pure-selfplay game).  The game result is still
+  // recorded onto the lc0-side positions at game end via the existing
+  // WriteTrainingData() path.
+  std::string external_engine_path;
+  std::vector<std::string> external_engine_args;
+  std::vector<std::pair<std::string, std::string>> external_engine_uci_options;
+  // Argument string appended after "go " — e.g. "movetime 100", "depth 12".
+  std::string external_engine_go_command = "movetime 100";
+
+  // External advisor engine (independent of opponent above).  When set,
+  // lc0 consults this engine for a recommended move at each lc0-side
+  // turn, then forces lc0's MCTS to spend `advisor_min_visits` visits
+  // on that move at the root.  The trained policy still comes from
+  // lc0's own MCTS visit distribution — the advisor only biases which
+  // positions get explored, not what value/policy targets get written.
+  //
+  // Skipped automatically when this side is being played by an external
+  // opponent (no MCTS happens, no advisor to inject).
+  //
+  // Cost is one extra UCI subprocess call per lc0 move; with
+  // `advisor_engine_go_command = "movetime 100"` that's ~100ms per
+  // move per game.  Tune lower for higher selfplay throughput.
+  std::string advisor_engine_path;
+  std::vector<std::string> advisor_engine_args;
+  std::vector<std::pair<std::string, std::string>> advisor_engine_uci_options;
+  std::string advisor_engine_go_command = "movetime 100";
+  // Number of root-MCTS visits to force on the advisor's move.  Out of
+  // a typical `--visits=800` budget, 20-50 forced visits gives the
+  // advisor's choice meaningful exploration weight without dominating
+  // the search.  0 disables advisor mode for this side.
+  int advisor_min_visits = 0;
 };
 
 // Plays a single game vs itself.
@@ -121,9 +158,21 @@ class SelfPlayGame {
   std::mutex mutex_;
 
   // Training data to send.
-  V6TrainingDataArray training_data_;
+  V7TrainingDataArray training_data_;
 
   std::unique_ptr<SyzygyTablebase> syzygy_tb_;
+
+  // External UCI engines per side, lazily instantiated when first needed.
+  // Empty index = lc0 plays that side (MCTS).
+  std::unique_ptr<ExternalEngine> external_engines_[2];
+
+  // Advisor engines per side, lazily instantiated when first needed.
+  // Only used when lc0 is playing this side (i.e. external_engines_[idx]
+  // is null) AND advisor_engine_path is set in PlayerOptions.  The
+  // advisor's move biases lc0's MCTS root visit distribution but does
+  // not directly select the played move; lc0's own MCTS makes the
+  // final choice.
+  std::unique_ptr<ExternalEngine> advisor_engines_[2];
 };
 
 }  // namespace lczero

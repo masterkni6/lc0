@@ -37,6 +37,7 @@
 #include "neural/decoder.h"
 #include "syzygy/syzygy.h"
 #include "trainingdata/reader.h"
+#include "trainingdata/trainingdata_v7.h"
 #include "utils/filesystem.h"
 #include "utils/optionsparser.h"
 
@@ -345,7 +346,7 @@ void gaviota_tb_probe_hard(const Position& pos, unsigned int& info,
   tb_probe_hard(stm, epsq, tb_NOCASTLE, wsq, bsq, wpc, bpc, &info, &dtm);
 }
 
-void ChangeInputFormat(int newInputFormat, V6TrainingData* data,
+void ChangeInputFormat(int newInputFormat, V7TrainingData* data,
                        const PositionHistory& history) {
   data->input_format = newInputFormat;
   auto input_format =
@@ -430,7 +431,7 @@ void ChangeInputFormat(int newInputFormat, V6TrainingData* data,
   data->invariance_info |= invariance_mask;
 }
 
-int ResultForData(const V6TrainingData& data) {
+int ResultForData(const V7TrainingData& data) {
   // Ensure we aren't reprocessing some data that has had custom adjustments to
   // result training target applied.
   DataAssert(data.result_q == -1.0f || data.result_q == 1.0f ||
@@ -478,11 +479,11 @@ bool IsAllDraws(const FileData<FrameType>& data) {
   return true;
 }
 
-std::vector<V6TrainingData> ReadFile(const std::string& file) {
-  std::vector<V6TrainingData> fileContents;
+std::vector<V7TrainingData> ReadFile(const std::string& file) {
+  std::vector<V7TrainingData> fileContents;
 
   TrainingDataReader reader(file);
-  V6TrainingData chunk;
+  V7TrainingData chunk;
   while (reader.ReadChunk(&chunk)) {
     fileContents.push_back(chunk);
   }
@@ -1129,6 +1130,87 @@ void WriteNnueOutput(const FileData<FrameType>& data, const std::string& nnue_pl
   }
 }
 
+// Side-table of V7-only fields computed during the rescorer's write
+// pass.  Indexed by chunk position within the file.  Used because the
+// in-memory chunk format is V6 (no slots for these); we compute the
+// values once per file and feed them into the V6→V7 promotion.
+struct V7Extras {
+  float q_st;
+  float d_st;
+  uint16_t opp_played_idx;
+  uint16_t next_played_idx;
+};
+
+// Compute the V7 extra fields for every chunk in a file.
+//
+//   q_st / d_st  — short-term EMAs of root_q / root_d, run BACKWARDS
+//                  through the game with alpha = 1 - 1/6 ≈ 0.833.
+//                  Signs alternate because Q is from side-to-move's
+//                  perspective: undo that during the EMA and re-apply
+//                  at the end so the stored value is also from
+//                  side-to-move's perspective.
+//   opp_played_idx — played_idx of the NEXT position (the opponent's
+//                  reply).  65535 (uint16 sentinel) past end of game.
+//   next_played_idx — played_idx of the position TWO plies ahead
+//                  (our own next move).  Same sentinel past end.
+//
+// Mirrors rescore_tb's selfplay/loop.cc EMA computation so chunks
+// produced by this rescorer are wire-compatible with anything trained
+// on rescore_tb output.
+template <typename FrameType>
+std::vector<V7Extras> ComputeV7Extras(
+    const std::vector<FrameType>& fileContents) {
+  const float alpha = 1.0f - 1.0f / 6.0f;
+  const int n = static_cast<int>(fileContents.size());
+  std::vector<V7Extras> extras(n);
+  if (n == 0) return extras;
+
+  // ── q_st / d_st backwards EMA ──
+  // Sign vector to undo side-to-move perspective for the EMA, then
+  // re-apply.  alt_signs[i] = (-1)^i.
+  std::vector<float> qs(n), ds(n);
+  std::vector<int> alt_signs(n);
+  int sign = 1;
+  for (int i = 0; i < n; ++i) {
+    qs[i] = fileContents[i].root_q * sign;
+    ds[i] = fileContents[i].root_d;  // D is symmetric, no sign flip
+    alt_signs[i] = sign;
+    sign *= -1;
+  }
+  std::vector<float> qs_st(n, 0.0f), ds_st(n, 0.0f);
+  float q_val = 0.0f, d_val = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    if (i == 0) {
+      q_val = qs.back();
+      d_val = ds.back();
+    } else {
+      q_val = alpha * q_val + qs[n - 1 - i] * (1.0f - alpha);
+      d_val = alpha * d_val + ds[n - 1 - i] * (1.0f - alpha);
+    }
+    qs_st[n - 1 - i] = q_val;
+    ds_st[n - 1 - i] = d_val;
+  }
+  for (int i = 0; i < n; ++i) {
+    extras[i].q_st = qs_st[i] * alt_signs[i];  // re-apply sign
+    extras[i].d_st = ds_st[i];                 // D doesn't flip
+  }
+
+  // ── opp_played_idx / next_played_idx ──
+  // Past-end-of-game gets the uint16 sentinel 65535 (the same value
+  // selfplay's AddPlaceholder uses for "no valid move available").
+  constexpr uint16_t kPastEndSentinel = 65535;
+  for (int i = 0; i < n; ++i) {
+    extras[i].opp_played_idx  = (i + 1 < n)
+        ? static_cast<uint16_t>(fileContents[i + 1].played_idx)
+        : kPastEndSentinel;
+    extras[i].next_played_idx = (i + 2 < n)
+        ? static_cast<uint16_t>(fileContents[i + 2].played_idx)
+        : kPastEndSentinel;
+  }
+
+  return extras;
+}
+
 template <typename FrameType>
 void WriteOutputs(const FileData<FrameType>& data, const std::string& file,
                   const std::string& outputDir) {
@@ -1136,11 +1218,27 @@ void WriteOutputs(const FileData<FrameType>& data, const std::string& file,
   if (!outputDir.empty()) {
     std::string fileName = file.substr(file.find_last_of("/\\") + 1);
     TrainingDataWriter writer(outputDir + "/" + fileName);
-    for (const auto& chunk : data.fileContents) {
-      // Don't save chunks that just provide move history.
-      if ((chunk.invariance_info & 64) == 0) {
-        writer.WriteChunk(chunk);
-      }
+
+    // Pre-compute the V7 extras (q_st EMA, d_st EMA, opp/next played
+    // idx).  We include placeholders in the EMA (they have valid
+    // root_q/root_d) so the EMA correctly reflects the full game
+    // trajectory, but we skip them in the write loop below.
+    const std::vector<V7Extras> extras = ComputeV7Extras(data.fileContents);
+
+    for (size_t i = 0; i < data.fileContents.size(); ++i) {
+      // Don't save chunks that just provide move history (external-
+      // opponent placeholder positions written by AddPlaceholder).
+      if ((data.fileContents[i].invariance_info & 64) != 0) continue;
+
+      // Input is always V7 now (the reader auto-upgrades older formats
+      // on read).  Overwrite the V7 fields with our authoritative
+      // per-file EMA + lookahead before writing.
+      V7TrainingData out = data.fileContents[i];
+      out.q_st            = extras[i].q_st;
+      out.d_st            = extras[i].d_st;
+      out.opp_played_idx  = extras[i].opp_played_idx;
+      out.next_played_idx = extras[i].next_played_idx;
+      writer.WriteChunk(out);
     }
   }
 }
@@ -1186,7 +1284,7 @@ void ProcessFile(const std::string& file, SyzygyTablebase* tablebase,
                  std::string nnue_plain_file, ProcessFileFlags flags) {
   try {
     // Read file data
-    std::vector<V6TrainingData> fileContents = ReadFile(file);
+    std::vector<V7TrainingData> fileContents = ReadFile(file);
 
     FileData data =
         ProcessFileInternal(std::move(fileContents), tablebase, distTemp,
@@ -1229,12 +1327,12 @@ void ProcessFiles(const std::vector<std::string>& files,
 void BuildSubs(const std::vector<std::string>& files) {
   for (auto& file : files) {
     TrainingDataReader reader(file);
-    std::vector<V6TrainingData> fileContents;
-    V6TrainingData data;
+    std::vector<V7TrainingData> fileContents;
+    V7TrainingData data;
     while (reader.ReadChunk(&data)) {
       fileContents.push_back(data);
     }
-    Validate(std::span<const V6TrainingData>(fileContents));
+    Validate(std::span<const V7TrainingData>(fileContents));
     MoveList moves;
     for (size_t i = 1; i < fileContents.size(); i++) {
       moves.push_back(
@@ -1245,7 +1343,7 @@ void BuildSubs(const std::vector<std::string>& files) {
       // position before.
       moves.back().Flip();
     }
-    Validate(std::span<const V6TrainingData>(fileContents), moves);
+    Validate(std::span<const V7TrainingData>(fileContents), moves);
 
     // Subs are 'valid'.
     PositionHistory history;
@@ -1302,7 +1400,7 @@ void RunRescorer() {
   options.Add<StringOption>(kInputDirId);
   options.Add<StringOption>(kOutputDirId);
   options.Add<StringOption>(kPolicySubsDirId);
-  options.Add<IntOption>(kThreadsId, 1, 20) = 1;
+  options.Add<IntOption>(kThreadsId, 1, 256) = 1;
   options.Add<FloatOption>(kTempId, 0.001, 100) = 1;
   // Positive dist offset requires knowing the legal move set, so not supported
   // for now.
@@ -1484,9 +1582,7 @@ bool RescorerPolicySubstitutionSetup(std::string policySubsDir) {
   return !policy_subs.empty();
 }
 
-// Explicit template instantiations.
-template std::vector<V6TrainingData> RescoreTrainingData(
-    std::vector<V6TrainingData>, SyzygyTablebase*, float, float, float, int);
+// Explicit template instantiation.
 template std::vector<V7TrainingData> RescoreTrainingData(
     std::vector<V7TrainingData>, SyzygyTablebase*, float, float, float, int);
 

@@ -32,7 +32,7 @@
 
 namespace lczero {
 
-struct V6TrainingData;
+struct V7TrainingData;
 
 class TrainingDataWriter {
  public:
@@ -45,8 +45,10 @@ class TrainingDataWriter {
     if (fout_) Finalize();
   }
 
-  // Writes a chunk.
-  void WriteChunk(const V6TrainingData& data);
+  // Writes a chunk (8396 bytes, V7 format).  Selfplay and the rescorer
+  // both produce V7 chunks; on-disk older formats are upgraded to V7
+  // by TrainingDataReader on read.
+  void WriteChunk(const V7TrainingData& data);
 
   // Flushes file and closes it.
   void Finalize();

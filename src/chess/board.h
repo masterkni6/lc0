@@ -91,6 +91,31 @@ class ChessBoard {
   bool ApplyMove(Move move);
   // Checks if the square is under attack from "theirs" (black).
   bool IsUnderAttack(Square square) const;
+
+  // ── Tactical feature helpers ──
+  // Public access to magic-bitboard slider attack computation. Both take the
+  // blocker occupancy bitboard; returns the set of squares attacked.
+  static BitBoard RookAttacksFrom(Square square, BitBoard occupancy);
+  static BitBoard BishopAttacksFrom(Square square, BitBoard occupancy);
+  static BitBoard KnightAttacksFrom(Square square);
+  static BitBoard KingAttacksFrom(Square square);
+  // Pawn attack squares (diagonal forward). `is_ours` selects forward direction:
+  // true → attacks forward toward rank 8 (own-pawn perspective);
+  // false → attacks toward rank 1 (opponent-pawn perspective).
+  static BitBoard PawnAttacksFrom(Square square, bool is_ours);
+
+  // Bitboard of "our" pieces that attack `square`. Useful for tactical
+  // features like control / hanging / defended / overloaded.
+  BitBoard GetOurAttackers(Square square) const;
+  // Bitboard of "their" pieces that attack `square`.
+  BitBoard GetTheirAttackers(Square square) const;
+  // Counts, convenience wrappers.
+  int CountOurAttackers(Square square) const {
+    return GetOurAttackers(square).count();
+  }
+  int CountTheirAttackers(Square square) const {
+    return GetTheirAttackers(square).count();
+  }
   // Generates the king attack info used for legal move detection.
   KingAttackInfo GenerateKingAttackInfo() const;
   // Checks if "our" (white) king is under check.
@@ -210,6 +235,15 @@ class ChessBoard {
 
   BitBoard ours() const { return our_pieces_; }
   BitBoard theirs() const { return their_pieces_; }
+  // Individual king squares — convenience for external feature code.
+  Square OurKing() const { return our_king_; }
+  Square TheirKing() const { return their_king_; }
+
+  // Clear en-passant markers (the "fake pawns" on ranks 1/8 in pawns_).
+  // Used to match Python's tactical-feature pipeline, which reconstructs
+  // boards from piece planes + castling only (no EP field) — training
+  // features never saw EP, so inference features should match.
+  void ClearEnPassant() { pawns_ &= kPawnMask; }
   BitBoard pawns() const { return pawns_ & kPawnMask; }
   BitBoard en_passant() const { return pawns_ - kPawnMask; }
   BitBoard bishops() const { return bishops_ - rooks_; }

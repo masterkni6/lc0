@@ -29,7 +29,7 @@
 
 namespace lczero {
 
-InputPlanes PlanesFromTrainingData(const V6TrainingData& data) {
+InputPlanes PlanesFromTrainingData(const V7TrainingData& data) {
   InputPlanes result;
   for (int i = 0; i < 104; i++) {
     result.emplace_back();
@@ -117,10 +117,6 @@ InputPlanes PlanesFromTrainingData(const V6TrainingData& data) {
   return result;
 }
 
-InputPlanes PlanesFromTrainingData(const V7TrainingData& data) {
-  return PlanesFromTrainingData(static_cast<const V6TrainingData&>(data));
-}
-
 TrainingDataReader::TrainingDataReader(std::string filename)
     : filename_(filename) {
   fin_ = gzopen(filename_.c_str(), "rb");
@@ -131,16 +127,29 @@ TrainingDataReader::TrainingDataReader(std::string filename)
 
 TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
 
-bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
-  if (format_v6) {
+bool TrainingDataReader::ReadChunk(V7TrainingData* data) {
+  if (format_v7) {
     int read_size = gzread(fin_, reinterpret_cast<void*>(data), sizeof(*data));
     if (read_size < 0) throw Exception("Corrupt read.");
     return read_size == sizeof(*data);
   } else {
+    // V7 is the canonical record format.  Older on-disk formats are
+    // upgraded in-place: we read the V3-equivalent prefix first, then
+    // read the per-version "extra" suffix into the slot it would occupy
+    // in V7.  Sizes (bytes added per version):
+    //   v4_extra = 16  (root_m, best_m, plies_left, ... approx.)
+    //   v5_extra = 16  (result_q, result_d, played_q, played_d)
+    //   v6_extra = 48  (played_m, orig_q, orig_d, orig_m, visits,
+    //                   played_idx, best_idx, policy_kld, q_st)
+    //   v7_extra = 40  (d_st, opp_played_idx, next_played_idx,
+    //                   reserved[8])
+    // v3_size therefore = sizeof(V7TrainingData) - all extras
+    //                   = 8396 - 16 - 16 - 48 - 40 = 8276.
+    int v7_extra = 40;
     int v6_extra = 48;
     int v5_extra = 16;
     int v4_extra = 16;
-    int v3_size = sizeof(*data) - v4_extra - v5_extra - v6_extra;
+    int v3_size = sizeof(*data) - v4_extra - v5_extra - v6_extra - v7_extra;
     int read_size = gzread(fin_, reinterpret_cast<void*>(data), v3_size);
     if (read_size < 0) throw Exception("Corrupt read.");
     if (read_size != v3_size) return false;
@@ -210,16 +219,38 @@ bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
         data->best_idx = 0;
         data->policy_kld = 0.0f;
         data->q_st = 0.0f;
-        return true;
+        [[fallthrough]];
       }
       case 6: {
-        format_v6 = true;
+        // If actually 6, we need to read the V6 extras first.  If we
+        // got here by fallthrough from case 5 (i.e. orig_version was
+        // 3/4/5), those extras have already been zero-filled above.
+        if (orig_version == 6) {
+          read_size = gzread(
+              fin_,
+              reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
+              v4_extra + v5_extra + v6_extra);
+          if (read_size < 0) throw Exception("Corrupt read.");
+          if (read_size != v4_extra + v5_extra + v6_extra) return false;
+        }
+        // Upgrade V6 → V7: bump version header, zero V7 extras.  The
+        // rescorer will fill d_st / opp_played_idx / next_played_idx
+        // via its EMA+lookahead pass.
+        data->version = 7;
+        data->d_st = 0.0f;
+        data->opp_played_idx = 0;
+        data->next_played_idx = 0;
+        for (float& r : data->reserved) r = 0.0f;
+        return true;
+      }
+      case 7: {
+        format_v7 = true;
         read_size = gzread(
             fin_,
             reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
-            v4_extra + v5_extra + v6_extra);
+            v4_extra + v5_extra + v6_extra + v7_extra);
         if (read_size < 0) throw Exception("Corrupt read.");
-        return read_size == v4_extra + v5_extra + v6_extra;
+        return read_size == v4_extra + v5_extra + v6_extra + v7_extra;
       }
       default:
         throw Exception("Unknown format.");

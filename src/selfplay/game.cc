@@ -29,6 +29,7 @@
 
 #include <algorithm>
 
+#include "chess/position.h"
 #include "search/classic/stoppers/common.h"
 #include "search/classic/stoppers/factory.h"
 #include "utils/random.h"
@@ -153,11 +154,235 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       adjudicated_ = true;
       break;
     }
-    // Initialize search.
     const int idx = blacks_move ? 1 : 0;
+
+    // ─── External UCI opponent path ───
+    // If this side is played by an external engine, get a move from it,
+    // apply to the tree, and skip MCTS + training data entirely.  Game
+    // result (recorded at game end) still gets written back to all the
+    // lc0-side training positions via WriteTrainingData().
+    if (!options_[idx].external_engine_path.empty()) {
+      // FRC mode is driven by lc0's --chess960=true flag (stored in
+      // chess960_).  SF doesn't auto-detect FRC from the FEN —
+      // engines are told explicitly via the UCI_Chess960 option, so
+      // we mirror that convention: the user passes --chess960=true
+      // for FRC/DFRC games, and we propagate UCI_Chess960=true to
+      // the external engine + emit FRC castling encoding.
+      //
+      // For standard chess (no --chess960 flag), we don't set
+      // UCI_Chess960 on SF (so it plays at full strength), and we
+      // emit castling in standard "e1g1" form (which SF accepts in
+      // any mode).
+      //
+      // If chess960_ doesn't reflect --chess960=true at runtime
+      // (option-context plumbing issue), DFRC games will desync —
+      // SF will reject FRC castling moves.  We'll see this in the
+      // adjudication diagnostics and can debug from there.
+      const bool is_frc_position = chess960_;
+
+      if (!external_engines_[idx]) {
+        try {
+          external_engines_[idx] = std::make_unique<ExternalEngine>(
+              options_[idx].external_engine_path,
+              options_[idx].external_engine_args,
+              options_[idx].external_engine_uci_options,
+              options_[idx].external_engine_go_command,
+              /*chess960=*/is_frc_position);
+        } catch (const Exception& e) {
+          CERR << "External engine spawn failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — adjudicating as loss for opponent.";
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+      }
+
+      // Build "position fen <X> moves <m1> <m2> ..." for Stockfish.  Use
+      // the original starting FEN + accumulated move list rather than
+      // the current FEN.  This lets the engine see the full game history
+      // for repetition / 50-move-rule purposes, which matters when the
+      // engine is configured with contempt or 3-fold-aware evaluation.
+      //
+      // Emit moves using FRC detection from the starting FEN (NOT the
+      // chess960_ flag, which doesn't always reflect --chess960=true
+      // due to lc0's option-context plumbing).  For FRC starting
+      // positions we send king-takes-rook castling ("b1a1") so the
+      // 960-mode engine recognizes it; for standard chess we send
+      // standard "e1g1" so a non-960-mode engine recognizes it.
+      // Encoding and the engine's UCI_Chess960 setting must agree —
+      // both are now driven by is_frc_position above.
+      const std::vector<Move> played_moves = GetMoves();
+      std::vector<std::string> moves_uci;
+      moves_uci.reserve(played_moves.size());
+      for (const Move& m : played_moves) {
+        moves_uci.push_back(m.ToString(/*is_chess960=*/is_frc_position));
+      }
+
+      std::string uci_move;
+      try {
+        uci_move = external_engines_[idx]->GetMove(orig_fen_, moves_uci);
+      } catch (const Exception& e) {
+        // Engine crashed / timed out.  Tear it down (so the next game's
+        // Spawn() gets a fresh process) and adjudicate the current game
+        // as a loss for the external-engine side so we don't write
+        // garbage training data with no result.
+        external_engines_[idx].reset();
+        CERR << "External engine error on side " << (blacks_move ? "B" : "W")
+             << ": " << e.what() << " — adjudicating as loss for opponent.";
+        game_result_ = blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+        adjudicated_ = true;
+        break;
+      }
+
+      // Parse the UCI move into lc0's internal representation.  We parse
+      // against the current side-to-move's board (which is internally
+      // mirrored for black-to-move positions); ChessBoard::ParseMove
+      // handles the un-mirroring of UCI coordinates automatically.
+      Move move;
+      try {
+        move = tree_[idx]
+                   ->GetPositionHistory()
+                   .Last()
+                   .GetBoard()
+                   .ParseMove(uci_move);
+      } catch (const Exception& e) {
+        // Dump everything we know about the desync. We want:
+        //   - the move SF returned
+        //   - lc0's current view of the position (FEN)
+        //   - lc0's view of the original starting FEN
+        //   - the full move list we sent to SF
+        // Together these let us reproduce SF's view by hand and
+        // identify which move caused the divergence.
+        std::string current_fen = PositionToFen(
+            tree_[idx]->GetPositionHistory().Last());
+        std::string moves_str;
+        for (const auto& m : moves_uci) {
+          moves_str += " ";
+          moves_str += m;
+        }
+        CERR << "External engine returned unparseable move '" << uci_move
+             << "': " << e.what() << " — adjudicating as loss for opponent.";
+        CERR << "  side-to-move: " << (blacks_move ? "black" : "white");
+        CERR << "  lc0-view FEN: " << current_fen;
+        CERR << "  orig FEN sent to engine: " << orig_fen_;
+        CERR << "  moves sent to engine:" << moves_str;
+        external_engines_[idx].reset();
+        game_result_ = blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+        adjudicated_ = true;
+        break;
+      }
+      // Intentionally do NOT increment move_count_ for external engine
+      // moves. The tournament's `npm` stat is total lc0 MCTS nodes /
+      // total moves — incrementing here would halve npm because external
+      // moves contribute 0 nodes. Keeping move_count_ as a count of
+      // lc0-side moves only makes npm = average visits per lc0 move,
+      // which is what users actually want to see vs --visits=N.
+
+      // Write a placeholder training chunk for this opponent move BEFORE
+      // applying it.  The rescorer recovers the per-move list by diffing
+      // consecutive chunks' position planes; without a placeholder for
+      // each opponent move, consecutive lc0-side chunks would be 2 ply
+      // apart and DecodeMoveFromInput would fail.  The chunk is marked
+      // with `invariance_info & 64`; the rescorer drops it on output, so
+      // PyTorch training only ever sees lc0-side positions.
+      //
+      // AddPlaceholder (like Add) expects the move in real-world UCI
+      // coords — it does its own per-side flip internally.  Our `move`
+      // is in storage form (from ParseMove), so convert by flipping for
+      // a black-to-move position.
+      if (training) {
+        Move real_move = move;
+        if (tree_[idx]->IsBlackToMove()) real_move.Flip();
+        training_data_.AddPlaceholder(tree_[idx]->GetPositionHistory(),
+                                       real_move);
+      }
+
+      // Apply move to both trees.
+      //
+      // Subtle: the MCTS path (below) does `if (IsBlackToMove) move.Flip()`
+      // before MakeMove because Search::GetBestMove() returns the move in
+      // real-world UCI coords (it calls Edge::GetMove(is_black) which
+      // flips for black).  MakeMove walks `current_head_->Edges()` and
+      // compares against Edge::move_ which is stored in white-perspective
+      // form — hence the flip is needed to convert real-world → storage.
+      //
+      // ChessBoard::ParseMove already returns moves in storage form (it
+      // un-flips the ranks internally before constructing Move::White),
+      // so we MUST NOT flip again here.  Doing so would feed MakeMove a
+      // move it can't find in the edge list, silently mis-applying to
+      // an arbitrary CreateSingleChildNode fallback.
+      tree_[0]->MakeMove(move);
+      if (tree_[0] != tree_[1]) tree_[1]->MakeMove(move);
+      blacks_move = !blacks_move;
+      continue;
+    }
+
+    // Initialize search.
     if (!options_[idx].uci_options->Get<bool>(kReuseTreeId)) {
       tree_[idx]->TrimTreeAtHead();
     }
+
+    // ─── Optional: consult advisor engine (e.g. Stockfish) ───
+    // If an advisor engine is configured for this side AND lc0 is the
+    // one playing this side (we're not in the external-opponent branch
+    // above), query it for its preferred move.  We'll then tell MCTS to
+    // force some visits onto that move at the root.  Failure is non-
+    // fatal — if the advisor crashes or returns garbage, we tear it
+    // down and proceed with normal MCTS (no adjudication; advisor is
+    // best-effort, never authoritative).
+    Move advisor_move;
+    bool has_advisor_move = false;
+    if (!options_[idx].advisor_engine_path.empty() &&
+        options_[idx].advisor_min_visits > 0) {
+      const bool is_frc_position = chess960_;
+      if (!advisor_engines_[idx]) {
+        try {
+          advisor_engines_[idx] = std::make_unique<ExternalEngine>(
+              options_[idx].advisor_engine_path,
+              options_[idx].advisor_engine_args,
+              options_[idx].advisor_engine_uci_options,
+              options_[idx].advisor_engine_go_command,
+              /*chess960=*/is_frc_position);
+        } catch (const Exception& e) {
+          CERR << "Advisor engine spawn failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — continuing without advisor for the rest of this game.";
+          // Leave advisor_engines_[idx] null; we'll skip the query path
+          // on every subsequent move of this game without retrying.
+        }
+      }
+      if (advisor_engines_[idx]) {
+        try {
+          const std::vector<Move> played_moves = GetMoves();
+          std::vector<std::string> moves_uci;
+          moves_uci.reserve(played_moves.size());
+          for (const Move& m : played_moves) {
+            moves_uci.push_back(m.ToString(is_frc_position));
+          }
+          std::string uci_move =
+              advisor_engines_[idx]->GetMove(orig_fen_, moves_uci);
+          advisor_move = tree_[idx]
+                             ->GetPositionHistory()
+                             .Last()
+                             .GetBoard()
+                             .ParseMove(uci_move);
+          has_advisor_move = true;
+        } catch (const Exception& e) {
+          // Engine crashed / timed out / parse failure on the move.
+          // Tear it down so the next move's branch above tries to
+          // respawn — and proceed with this move's MCTS *without*
+          // advisor injection.  No adjudication: advisor failure isn't
+          // a game-correctness issue.
+          CERR << "Advisor engine query failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — skipping advisor for this move.";
+          advisor_engines_[idx].reset();
+        }
+      }
+    }
+
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (abort_) break;
@@ -174,6 +399,15 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
           /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
           std::move(stoppers), /* infinite */ false, /* ponder */ false,
           *options_[idx].uci_options, syzygy_tb);
+
+      // Inject advisor move into search BEFORE starting workers.  The
+      // override is a single Move + int set in Search; SearchWorker
+      // reads them in its PUCT loop.  Must be set before RunBlocking
+      // so all worker threads see the same value.
+      if (has_advisor_move) {
+        search_->SetAdvisorMove(advisor_move,
+                                options_[idx].advisor_min_visits);
+      }
     }
 
     // Do search.
@@ -289,11 +523,31 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       std::optional<EvalResult> nneval =
           options_[idx].backend->GetCachedEvaluation(EvalPosition{
               tree_[idx]->GetPositionHistory().GetPositions(), legal_moves});
+      // Policy training target dispatch.  Three mutually-exclusive paths
+      // (all enforced as conflicting at SearchParams ctor):
+      //   1. UseGrillImprovedTarget=true  → Grill et al. (ICML 2020)
+      //      regularized target π̄(a) = λ_N · prior / (α − q).
+      //   2. UseGumbelImprovedTarget=true → softmax(prior + σ(q)) target
+      //      (Gumbel-MuZero improved-policy, Phase 1.6).
+      //   3. Default → GetTrainingTargetVisits (raw-N or PTP-clamped
+      //      visit-count distribution, depending on
+      //      forced-exploration-factor / advisor / UsePolicyTargetPruning).
+      // All three keep PUCT search unchanged; only the chunk-write step
+      // differs.  Mutual exclusivity is checked at param-construction
+      // time so reaching this branch with multiple set would be a bug.
+      const auto& sp = search_->GetParams();
+      const std::vector<float> processed_visits =
+          sp.GetUseGrillImprovedTarget()
+              ? search_->GetGrillImprovedPolicyTarget()
+              : sp.GetUseGumbelImprovedTarget()
+                    ? search_->GetGumbelImprovedPolicyTarget()
+                    : search_->GetTrainingTargetVisits();
       training_data_.Add(tree_[idx]->GetCurrentHead(),
                          tree_[idx]->GetPositionHistory(), best_eval,
                          played_eval, best_is_proof, best_move, move,
                          legal_moves, nneval,
-                         search_->GetParams().GetPolicySoftmaxTemp());
+                         search_->GetParams().GetPolicySoftmaxTemp(),
+                         &processed_visits);
     }
     // Must reset the search before mutating the tree.
     search_.reset();

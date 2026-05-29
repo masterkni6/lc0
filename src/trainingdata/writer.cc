@@ -28,6 +28,7 @@
 #include "trainingdata/writer.h"
 
 #include "trainingdata/trainingdata.h"
+#include "trainingdata/trainingdata_v7.h"
 #include "utils/exception.h"
 #include "utils/filesystem.h"
 #include "utils/random.h"
@@ -66,10 +67,15 @@ TrainingDataWriter::TrainingDataWriter(std::string filename)
   if (!fout_) throw Exception("Cannot create gzip file " + filename_);
 }
 
-void TrainingDataWriter::WriteChunk(const V6TrainingData& data) {
+void TrainingDataWriter::WriteChunk(const V7TrainingData& data) {
+  // V7 is 8396 bytes.  The Python trainer's V7_STRUCT_STRING asserts
+  // the same value; if you change this struct, the trainer's
+  // chunkparser.py V7_STRUCT_STRING must change in lockstep.
+  static_assert(sizeof(V7TrainingData) == 8396,
+                "V7TrainingData layout drift; reader & trainer expect 8396.");
   auto bytes_written =
       gzwrite(fout_, reinterpret_cast<const char*>(&data), sizeof(data));
-  if (bytes_written != sizeof(data)) {
+  if (bytes_written != static_cast<int>(sizeof(data))) {
     throw Exception("Unable to write into " + filename_);
   }
 }

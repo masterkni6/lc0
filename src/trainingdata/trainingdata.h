@@ -29,32 +29,52 @@
 
 #include "neural/backend.h"
 #include "search/classic/node.h"
+#include "trainingdata/trainingdata_v7.h"
 #include "trainingdata/writer.h"
-#include "trainingdata/trainingdata_v6.h"
 
 namespace lczero {
 
-class V6TrainingDataArray {
+class V7TrainingDataArray {
  public:
-  V6TrainingDataArray(FillEmptyHistory white_fill_empty_history,
+  V7TrainingDataArray(FillEmptyHistory white_fill_empty_history,
                       FillEmptyHistory black_fill_empty_history,
                       pblczero::NetworkFormat::InputFormat input_format)
       : fill_empty_history_{white_fill_empty_history, black_fill_empty_history},
         input_format_(input_format) {}
 
   // Add a chunk.
+  //
+  // `processed_visits` (optional): when non-null, an array of per-edge
+  // visit counts aligned with `node->Edges()` iteration order, as
+  // returned by `Search::GetTrainingTargetVisits()`.  Used instead of
+  // raw `edge.GetN()` for the policy training target — implements
+  // KataGo-style policy-target pruning when forced exploration is
+  // active.  When null (default), raw edge visit counts are used.
   void Add(const classic::Node* node, const PositionHistory& history,
            classic::Eval best_eval, classic::Eval played_eval,
            bool best_is_proven, Move best_move, Move played_move,
            std::span<Move> legal_moves,
-           const std::optional<EvalResult>& nneval, float policy_softmax_temp);
+           const std::optional<EvalResult>& nneval, float policy_softmax_temp,
+           const std::vector<float>* processed_visits = nullptr);
+
+  // Add a placeholder chunk for a position whose move was selected by an
+  // external (non-lc0) source — e.g. an external UCI opponent during
+  // selfplay.  Placeholders are needed so the rescorer can recover the
+  // full move list by diffing consecutive position planes (its only way
+  // to infer moves between chunks). Without them, consecutive lc0-side
+  // chunks would be 2 ply apart and DecodeMoveFromInput would fail.
+  //
+  // The chunk is marked with invariance_info bit 6 (`& 64`); the existing
+  // rescorer (a) skips strict legality checks for these, (b) DROPS them
+  // from its output stream. So PyTorch training never sees them.
+  void AddPlaceholder(const PositionHistory& history, Move played_move);
 
   // Writes training data to a file.
   void Write(TrainingDataWriter* writer, GameResult result,
              bool adjudicated) const;
 
  private:
-  std::vector<V6TrainingData> training_data_;
+  std::vector<V7TrainingData> training_data_;
   FillEmptyHistory fill_empty_history_[2];
   pblczero::NetworkFormat::InputFormat input_format_;
 };
