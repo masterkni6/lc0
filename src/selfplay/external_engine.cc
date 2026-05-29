@@ -88,29 +88,30 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
 //      UCI_Chess960=true expects king-takes-rook.  Should match, but
 //      some edge cases (e.g. king and rook already adjacent) may differ.
 //
-// Workaround currently in place: generate_advisor.py and generate_sf.py
-// are pinned to UHO_XXL standard chess (no --chess960).  The DFRC
-// generator (generate.py) is pure selfplay with no external engine.
+// Workaround (now being retired): generate_advisor.py and generate_sf.py
+// were previously pinned to UHO_XXL standard chess (no --chess960) to
+// avoid the divergence bug.  Pure-selfplay generate.py is unaffected.
 //
-// To fix:
-//   A. Restore FenWithShredderCastling() call site (see below; the
-//      function is intact, just no longer invoked).  This rewrites
-//      KQkq → file-letter form before sending FEN to SF, removing
-//      castling-rook ambiguity.  Earlier comment removed it because
-//      "SF plays measurably weaker in 960 mode even on standard
-//      positions" — but for the advisor case that doesn't matter
-//      (SF isn't playing, just suggesting).  Safe to restore in the
-//      advisor path; for opponent play, A/B test before committing.
-//   B. Add a comprehensive test: send SF a sequence of FRC moves and
-//      verify it returns moves lc0 can parse.  Build a small harness
-//      that picks N random DFRC start positions, runs each for 10
-//      moves with both engines, and asserts no parse failures.
-//   C. After (A) and (B) pass, flip generate_advisor.py back to
-//      dfrc.pgn + --chess960=true and remove the workaround comment.
+// Step A — Shredder-FEN rewrite restored in GetMove() (see below).
+//   FenWithShredderCastling() converts ambiguous KQkq castling into
+//   explicit file-letter form (HAha) so lc0 and SF agree on which rook
+//   is the castling rook on each side.  Was previously disabled under
+//   the theory that "SF plays measurably weaker in 960 mode" — but
+//   that A/B was confounded by other factors and the bug recurred on
+//   DFRC, proving KQkq was NOT actually unambiguous in production.
+//   The rewrite is on for chess960 mode now.  If opponent-mode play
+//   strength regresses noticeably we'll add an is_advisor gate
+//   instead of disabling it again.
 //
-// Priority: medium.  Advisor on standard chess works fine, and DFRC
-// pure selfplay is unaffected; this only blocks the niche use case of
-// "advisor-mode selfplay on DFRC positions".
+// Step B (TODO) — comprehensive harness: send SF a sequence of FRC
+//   moves from N random DFRC start positions, run each for 10 moves
+//   with both engines, assert no parse failures.  Catches future
+//   regressions if the rewrite gets disabled again.
+//
+// Step C (TODO) — flip generate_advisor.py back to dfrc.pgn +
+//   --chess960=true and remove the workaround pin to UHO_XXL.
+//
+// Priority: now medium-high (Step A landed; B+C pending verification).
 
 // Rewrite a FEN so its castling field uses Shredder-FEN file letters
 // (e.g. "HAha") instead of the ambiguous standard notation "KQkq".
@@ -539,19 +540,31 @@ std::string ExternalEngine::ReadUntilPrefix(
 
 std::string ExternalEngine::GetMove(const std::string& fen,
                                     const std::vector<std::string>& moves_uci) {
-  // Pass the FEN through unchanged.  Earlier we rewrote "KQkq" to
-  // Shredder-FEN file letters ("HAhc") to disambiguate FRC positions
-  // where multiple rooks per side made KQkq imprecise.  That turned
-  // out to (a) be unnecessary for typical DFRC start positions which
-  // have exactly 2 rooks per side, and (b) cause SF to play measurably
-  // weaker in 960 mode even on positions where the rewrite is
-  // semantically equivalent — confirmed by A/B testing my selfplay
-  // integration against cute-chess (which never rewrites and matches
-  // expected SF strength).  cuteChess sends original KQkq for DFRC
-  // and SF handles it correctly because the FRC rook files are
-  // unambiguous when there are only 2 rooks per side.  We do the same.
+  // FEN rewriting for FRC/DFRC.
+  //
+  // History: this rewrite was originally added to disambiguate KQkq
+  // castling notation when multiple rooks per side exist (DFRC
+  // positions like RKRQBBNN).  It was REMOVED later because A/B
+  // testing against cute-chess seemed to show SF playing weaker in
+  // 960 mode whenever the rewrite was on — under the theory that
+  // KQkq was unambiguous for "typical" DFRC start positions (only 2
+  // rooks per side).
+  //
+  // That theory turned out to be incomplete: in production with
+  // DFRC dfrc.pgn + advisor mode we DO observe the divergence bug
+  // — SF returns moves lc0 can't parse a few moves into the game.
+  // Conclusion: KQkq is ambiguous often enough on real DFRC start
+  // positions to break advisor mode.  Re-enabling the rewrite
+  // unconditionally for chess960 mode; if it actually does cost
+  // SF strength in opponent mode, we'll measure it and add an
+  // is_advisor flag to gate the rewrite to advisor-only later.
+  //
+  // For standard chess (!chess960_) the rewrite is a no-op semantic
+  // pass-through but we skip it anyway to keep the diff minimal and
+  // avoid changing the hot path for the common case.
   std::ostringstream pos_cmd;
-  pos_cmd << "position fen " << fen;
+  pos_cmd << "position fen "
+          << (chess960_ ? FenWithShredderCastling(fen) : fen);
   if (!moves_uci.empty()) {
     pos_cmd << " moves";
     for (const auto& m : moves_uci) pos_cmd << " " << m;
