@@ -72,27 +72,17 @@ struct EvalResult {
   // Same length as `p` when populated.
   std::vector<float> p_optimistic;
 
-  // Pre-reserve capacity for the maximum number of legal moves in any
-  // chess position (218, achievable in pathological constructed
-  // positions; typical games are 30-50).  This is set at construction
-  // and means subsequent resize() calls in search.cc's allocation gate
-  // never trigger heap allocation — just an O(size) value-init memset
-  // for the new elements, which is cache-friendly.
-  //
-  // Under blend mode with parallelism=16, the previous per-node-fetched
-  // vector allocations were a measurable allocator hot path; with
-  // capacity reserved up-front, the cumulative resize() calls during
-  // a search burst hit only the in-place fast path.
-  //
-  // Cost: 2 × 218 × 4 = 1744 bytes of reserved-but-unused memory per
-  // EvalResult.  At a typical minibatch of 128 NodeToProcess × per-
-  // worker, that's ~220 KB extra RAM per worker — trivial vs the
-  // savings on allocator contention.
-  EvalResult() {
-    constexpr size_t kMaxLegalMovesInChess = 218;
-    p.reserve(kMaxLegalMovesInChess);
-    p_optimistic.reserve(kMaxLegalMovesInChess);
-  }
+  // Note: tried adding a constructor that reserves 218 floats (max legal
+  // moves in chess) for p and p_optimistic to avoid the resize-time
+  // allocation in search.cc.  That was REVERTED — the reserve just moved
+  // the allocation from resize() time to constructor time without
+  // reducing total allocation count, AND added a wasted alloc per
+  // EvalResult for non-blend users (where p_optimistic stays empty).
+  // Memory pressure went UP, not down, for the common non-blend case.
+  // Each NodeToProcess gets a fresh EvalResult per minibatch iteration
+  // (no reuse), so an upfront reserve can't amortize over multiple
+  // uses.  If a future change makes EvalResult reusable (e.g. via a
+  // per-worker pool), the reserve becomes worth re-trying.
 
   EvalResultPtr AsPtr() {
     return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p,
