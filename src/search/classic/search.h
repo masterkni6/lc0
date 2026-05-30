@@ -531,21 +531,6 @@ class SearchWorker {
   std::vector<std::thread> task_threads_;
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
-
-  // Per-worker reusable scratch for the blend-policy code path.
-  // FetchMinibatchResults / FetchSingleNodeResult run serially per
-  // SearchWorker thread.  Each call calls `.clear()` then refills, so
-  // capacity is retained across calls and push_back hits the in-place
-  // path after the first call — was a per-node-fetched
-  // `std::vector<float> blended` allocation that ran 4000+ times/sec
-  // under blend mode at parallelism=16, contributing measurably to
-  // allocator hot-path contention.
-  //
-  // (Note: PrefetchIntoCache's `scores` vector cannot be shared this
-  // way because that function recurses and continues iterating after
-  // the recursive call returns.  Sharing would clobber outer state.)
-  std::vector<float> blended_buffer_;
-
   bool exiting_ = false;
 };
 

@@ -2972,12 +2972,20 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
     const float one_minus_a = 1.0f - kOptAlpha;
     constexpr float kFloor = 1e-30f;
     const size_t n_edges = node_to_process->eval->p.size();
-    // Reuse the per-worker scratch buffer.  clear() preserves capacity,
-    // so subsequent calls don't re-allocate.  At 4000 fetches/sec under
-    // blend mode, this saves a per-call heap alloc + the corresponding
-    // dealloc-on-scope-exit pair, which previously contended on the
-    // process-wide allocator lock at parallelism=16.
-    std::vector<float>& blended = blended_buffer_;
+    // Reuse a thread-local scratch buffer to avoid per-call heap
+    // allocations.  Must be thread_local (NOT a SearchWorker member)
+    // because FetchSingleNodeResult is called from both the main
+    // SearchWorker thread (via FetchMinibatchResults) AND from task
+    // worker threads (via ProcessPickedTask → out-of-order eval at
+    // search.cc:2098).  A shared member buffer would race under
+    // --task-workers > 0.  thread_local gives each calling thread its
+    // own buffer, persisting across calls for the thread's lifetime —
+    // capacity retained, so push_back hits the in-place fast path
+    // after the first call.  At 4000 fetches/sec under blend mode,
+    // this saves the per-call heap alloc + dealloc-on-scope-exit
+    // pair that previously contended on the process-wide allocator
+    // lock at parallelism=16.
+    thread_local std::vector<float> blended;
     blended.clear();
     blended.reserve(n_edges);
     double sum = 0.0;
