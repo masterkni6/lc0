@@ -2785,6 +2785,12 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
 
   // Populate all subnodes and their scores.
   typedef std::pair<float, EdgeAndNode> ScoredEdge;
+  // NOTE: This function recurses (see PrefetchIntoCache call below) and
+  // continues iterating `scores` after the recursion returns.  A shared
+  // per-worker buffer would be clobbered by the recursive call's
+  // clear+refill, so this stays as a local allocation.  If this ever
+  // becomes a hot bottleneck, the fix is a stack-of-buffers indexed by
+  // recursion depth, not a single member buffer.
   std::vector<ScoredEdge> scores;
   const float cpuct =
       ComputeCpuct(params_, node->GetN(), node == search_->root_node_);
@@ -2966,7 +2972,13 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
     const float one_minus_a = 1.0f - kOptAlpha;
     constexpr float kFloor = 1e-30f;
     const size_t n_edges = node_to_process->eval->p.size();
-    std::vector<float> blended;
+    // Reuse the per-worker scratch buffer.  clear() preserves capacity,
+    // so subsequent calls don't re-allocate.  At 4000 fetches/sec under
+    // blend mode, this saves a per-call heap alloc + the corresponding
+    // dealloc-on-scope-exit pair, which previously contended on the
+    // process-wide allocator lock at parallelism=16.
+    std::vector<float>& blended = blended_buffer_;
+    blended.clear();
     blended.reserve(n_edges);
     double sum = 0.0;
     for (size_t p_idx = 0; p_idx < n_edges; ++p_idx) {
