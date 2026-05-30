@@ -72,6 +72,28 @@ struct EvalResult {
   // Same length as `p` when populated.
   std::vector<float> p_optimistic;
 
+  // Pre-reserve capacity for the maximum number of legal moves in any
+  // chess position (218, achievable in pathological constructed
+  // positions; typical games are 30-50).  This is set at construction
+  // and means subsequent resize() calls in search.cc's allocation gate
+  // never trigger heap allocation — just an O(size) value-init memset
+  // for the new elements, which is cache-friendly.
+  //
+  // Under blend mode with parallelism=16, the previous per-node-fetched
+  // vector allocations were a measurable allocator hot path; with
+  // capacity reserved up-front, the cumulative resize() calls during
+  // a search burst hit only the in-place fast path.
+  //
+  // Cost: 2 × 218 × 4 = 1744 bytes of reserved-but-unused memory per
+  // EvalResult.  At a typical minibatch of 128 NodeToProcess × per-
+  // worker, that's ~220 KB extra RAM per worker — trivial vs the
+  // savings on allocator contention.
+  EvalResult() {
+    constexpr size_t kMaxLegalMovesInChess = 218;
+    p.reserve(kMaxLegalMovesInChess);
+    p_optimistic.reserve(kMaxLegalMovesInChess);
+  }
+
   EvalResultPtr AsPtr() {
     return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p,
                          .p_optimistic = p_optimistic};
