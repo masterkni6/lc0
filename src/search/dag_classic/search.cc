@@ -1859,6 +1859,21 @@ void SearchWorker::PickNodesToExtendTask(
           }
 
           float score = current_score[idx];
+          // Advisor floor (selfplay): force the advisor's recommended root
+          // edge to be picked until it reaches advisor_min_visits, then fall
+          // back to normal PUCT.  Root-only and a no-op unless an advisor move
+          // was set (advisor_min_visits_ == 0 otherwise), so non-advisor search
+          // is byte-identical.  Reuses the loop's normal visit machinery; the
+          // per-pick count is capped below.  Limitation: relies on the lazy
+          // edge fill reaching this edge, so a very-low-policy advisor move may
+          // not be fully forced within the visit budget (advisor is
+          // best-effort, so that degrades gracefully).
+          if (is_root_node && search_->advisor_min_visits_ > 0 &&
+              current_nstarted[idx] < search_->advisor_min_visits_ &&
+              !cur_iters[idx].IsTerminal() &&
+              cur_iters[idx].GetMove() == search_->advisor_move_) {
+            score = std::numeric_limits<float>::max();
+          }
           if (score > best) {
             second_best = best;
             second_best_edge = best_edge;
@@ -1895,6 +1910,17 @@ void SearchWorker::PickNodesToExtendTask(
         } else {
           // No second best - only one edge, so everything goes in here.
           new_visits = cur_limit;
+        }
+        // Advisor floor: when the forced advisor edge was selected, cap this
+        // pick to exactly the visits needed to reach advisor_min_visits rather
+        // than the PUCT estimate (which, with the score override above, could
+        // otherwise dump the whole remaining budget on it).
+        if (is_root_node && best_idx >= 0 && search_->advisor_min_visits_ > 0 &&
+            current_nstarted[best_idx] < search_->advisor_min_visits_ &&
+            best_edge.GetMove() == search_->advisor_move_) {
+          new_visits =
+              std::min(cur_limit,
+                       search_->advisor_min_visits_ - current_nstarted[best_idx]);
         }
         if (best_idx >= vtp_last_filled.back()) {
           auto* vtp_array = visits_to_perform.back().get()->data();

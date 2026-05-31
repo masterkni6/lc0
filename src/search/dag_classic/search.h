@@ -102,6 +102,15 @@ class Search {
 
   void RecordNPSStartTime();
 
+  // Advisor override (selfplay): force at least `min_visits` root visits onto
+  // `m` (an external engine's recommended move).  Must be called after
+  // construction and before RunBlocking so all workers observe it.  min_visits
+  // <= 0 disables.  Mirrors classic::Search::SetAdvisorMove.
+  void SetAdvisorMove(Move m, int min_visits) {
+    advisor_move_ = m;
+    advisor_min_visits_ = std::max(0, min_visits);
+  }
+
  private:
   // Computes the best move, maybe with temperature (according to the settings).
   void EnsureBestMoveKnown();
@@ -208,6 +217,14 @@ class Search {
 
   std::unique_ptr<UciResponder> uci_responder_;
   ContemptMode contempt_mode_;
+
+  // Advisor override (set once before workers start, read-only during search).
+  // When advisor_min_visits_ > 0, PickNodesToExtendTask forces the root edge
+  // whose move == advisor_move_ up to advisor_min_visits_ visits before normal
+  // PUCT proceeds.  Unguarded like the other set-before-RunBlocking fields.
+  Move advisor_move_;
+  int advisor_min_visits_ = 0;
+
   friend class SearchWorker;
 };
 
