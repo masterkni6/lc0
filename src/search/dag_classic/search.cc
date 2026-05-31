@@ -1112,7 +1112,13 @@ void Search::Abort() {
 }
 
 void Search::Wait() {
-  NodeGarbageCollector::Instance().Wait();
+  // NB: do NOT wait on the shared GC here.  The worker-thread join below is the
+  // real barrier (it also guarantees ZeroNInFlight); the GC only ever frees
+  // already-released nodes that are disjoint from this search's live tree, so
+  // it runs independently.  Waiting on the process-wide GC's Sleeping state
+  // used to couple unrelated parallel searches' Wait() latency together (and,
+  // with Stop() now a no-op, would deadlock since the GC no longer force-sleeps
+  // per search).
   Mutex::Lock lock(threads_mutex_);
   bool active_threads = !threads_.empty();
   while (!threads_.empty()) {

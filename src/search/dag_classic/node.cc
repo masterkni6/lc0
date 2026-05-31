@@ -784,8 +784,17 @@ void NodeGarbageCollector::Start() {
 }
 
 void NodeGarbageCollector::Stop() {
-  State old = Running;
-  SetState(old, GoToSleep);
+  // Intentionally a no-op.  This GC is a process-wide singleton shared by every
+  // search.  Previously each search put it to GoToSleep here when it finished a
+  // move, which — under selfplay with many parallel games — meant one search's
+  // move-end repeatedly slept the GC (and abandoned the in-progress free batch
+  // via the IsActive() check in GCThread) even while other searches still had
+  // garbage to reclaim, thrashing reclamation and letting released nodes pile
+  // up.  The GC already self-sleeps when its queue drains (see GCThread) and is
+  // re-woken by Start() (the watchdog mid-search and ~NodeTree per game), so a
+  // per-search Stop() is unnecessary.  Kept as a no-op so existing call sites
+  // (Search::Stop/Abort, the watchdog) remain valid.  Process shutdown still
+  // works: ~NodeGarbageCollector sets Exit directly.
 }
 
 void NodeGarbageCollector::Abort() {
