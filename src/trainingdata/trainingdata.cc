@@ -34,6 +34,10 @@
 #include <numeric>
 #include <sstream>
 
+// For the dag_classic::Node explicit instantiation of Add() below.  The body
+// only uses the duck-typed node surface shared with classic::Node.
+#include "search/dag_classic/node.h"
+
 namespace lczero {
 
 namespace {
@@ -118,8 +122,9 @@ void V7TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
   }
 }
 
+template <typename NodeT>
 void V7TrainingDataArray::Add(
-    const classic::Node* node, const PositionHistory& history,
+    const NodeT* node, const PositionHistory& history,
     classic::Eval best_eval, classic::Eval played_eval, bool best_is_proven,
     Move best_move, Move played_move, std::span<Move> legal_moves,
     const std::optional<EvalResult>& nneval, float policy_softmax_temp,
@@ -379,6 +384,19 @@ void V7TrainingDataArray::Add(
   result.plies_left = 0;
   training_data_.push_back(result);
 }
+
+// Explicit instantiations: classic search tree and the transposition-aware
+// dag-preview tree.  Both node types satisfy the duck-typed surface the body
+// uses (GetNumEdges / GetChildrenVisits / Edges / GetN / GetWL / GetD / GetM),
+// so a single body serves both.
+template void V7TrainingDataArray::Add<classic::Node>(
+    const classic::Node*, const PositionHistory&, classic::Eval, classic::Eval,
+    bool, Move, Move, std::span<Move>, const std::optional<EvalResult>&, float,
+    const std::vector<float>*);
+template void V7TrainingDataArray::Add<dag_classic::Node>(
+    const dag_classic::Node*, const PositionHistory&, classic::Eval,
+    classic::Eval, bool, Move, Move, std::span<Move>,
+    const std::optional<EvalResult>&, float, const std::vector<float>*);
 
 void V7TrainingDataArray::AddPlaceholder(const PositionHistory& history,
                                          Move played_move) {

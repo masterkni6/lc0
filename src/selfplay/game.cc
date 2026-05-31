@@ -650,23 +650,40 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
 void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                               bool training, SyzygyTablebase* syzygy_tb,
                               bool enable_resign) {
-  // ── Stage 1 scope guards ──
-  // A dag side supports move generation only.  Training-data extraction
-  // (Stage 2) and external opponent/advisor engines aren't wired for the dag
-  // tree yet, so refuse rather than silently produce wrong/no data.
-  if (training) {
-    throw Exception(
-        "dag-preview selfplay does not generate training data yet "
-        "(Stage 1: move generation only). Run with --training=false, or set "
-        "both sides to --search-algorithm=classic for training games.");
-  }
+  // ── Scope guards ──
+  // External opponent/advisor engines aren't wired for the dag tree yet, so
+  // refuse rather than silently produce wrong/no data.
   if (!options_[0].external_engine_path.empty() ||
       !options_[1].external_engine_path.empty() ||
       !options_[0].advisor_engine_path.empty() ||
       !options_[1].advisor_engine_path.empty()) {
     throw Exception(
         "dag-preview selfplay does not support external opponent/advisor "
-        "engines yet (Stage 1). Use --search-algorithm=classic for those.");
+        "engines yet. Use --search-algorithm=classic for those.");
+  }
+  // PlayPerSide writes the raw root visit-count distribution as the policy
+  // target for BOTH branches (see capture_training below) — it does not port
+  // classic's improved-policy target reshaping (PTP / forced-exploration /
+  // Grill / Gumbel) to this path.  The dag search has no such reshaping at
+  // all, and replicating it for the classic branch here would silently
+  // diverge from the real Play() path.  So refuse those on EITHER side when a
+  // dag side is present, rather than write a mistargeted policy.  (Advisor
+  // forcing is already refused above; both-classic games never reach here and
+  // keep full target support via Play().)
+  if (training) {
+    for (int s = 0; s < 2; ++s) {
+      const classic::SearchParams sp(*options_[s].uci_options);
+      if (sp.GetForcedExplorationFactor() > 0.0f ||
+          sp.GetUsePolicyTargetPruning() || sp.GetUseGrillImprovedTarget() ||
+          sp.GetUseGumbelImprovedTarget()) {
+        throw Exception(
+            "dag-preview training writes raw visit-count policy targets; "
+            "improved-policy targets (--forced-exploration-factor, "
+            "--policy-target-pruning, Grill, Gumbel) are not supported when a "
+            "dag side is present (they would mistarget the policy). Disable "
+            "them, or run both sides with --search-algorithm=classic.");
+      }
+    }
   }
 
   // Helpers operating across the two (possibly different-typed) trees, which
@@ -708,6 +725,48 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     }
   }
 
+  // Shared training-data capture, generic over the tree/search type so the
+  // dag and classic branches call it identically; the templated
+  // V7TrainingDataArray::Add resolves on the concrete node type.  Only called
+  // when `training`.  The policy target is the raw per-root-edge visit count
+  // (classic's GetTrainingTargetVisits fast path); passing it as
+  // `processed_visits` makes Add normalize by THEIR sum, which is exact and
+  // self-consistent even for the dag tree (root moves never transpose to each
+  // other, so each root edge's N is clean per-move visits).
+  auto capture_training = [&](int tr_idx, auto& tree_ref, auto& search_ref,
+                              Move best_move, bool best_is_terminal,
+                              classic::Eval best_eval,
+                              classic::Eval played_eval, Move played_move) {
+    auto* head = tree_ref.GetCurrentHead();
+    // Proof flag: best is proven only if no sibling has a strictly better
+    // proven upper bound (mirrors the classic Play() training block).
+    bool best_is_proof = best_is_terminal;
+    if (best_is_proof && best_eval.wl < 1) {
+      auto best =
+          (best_eval.wl == 0) ? GameResult::DRAW : GameResult::BLACK_WON;
+      auto upper = best;
+      for (const auto& edge : head->Edges()) {
+        upper = std::max(edge.GetBounds().second, upper);
+      }
+      if (best < upper) best_is_proof = false;
+    }
+    std::vector<Move> legal_moves =
+        tree_ref.GetPositionHistory().Last().GetBoard().GenerateLegalMoves();
+    std::optional<EvalResult> nneval =
+        options_[tr_idx].backend->GetCachedEvaluation(EvalPosition{
+            tree_ref.GetPositionHistory().GetPositions(), legal_moves});
+    std::vector<float> processed_visits;
+    processed_visits.reserve(head->GetNumEdges());
+    for (const auto& edge : head->Edges()) {
+      processed_visits.push_back(static_cast<float>(edge.GetN()));
+    }
+    training_data_.Add(head, tree_ref.GetPositionHistory(), best_eval,
+                       played_eval, best_is_proof, best_move, played_move,
+                       legal_moves, nneval,
+                       search_ref.GetParams().GetPolicySoftmaxTemp(),
+                       &processed_visits);
+  };
+
   while (!abort_) {
     game_result_ = ref_history().ComputeGameResult();
     if (game_result_ != GameResult::UNDECIDED) break;
@@ -728,11 +787,15 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       }
     }
 
-    // The played move (board frame) and the side-to-move's root eval, set by
-    // whichever engine this side uses.
+    // The played move (board frame) plus the data needed for the resign
+    // decision and (when `training`) the training chunk, set by whichever
+    // engine this side uses.  best_eval/played_eval are classic::Eval {wl,d,ml}
+    // even on a dag side — dag_classic::Eval has the same fields, copied over.
     Move move;
-    float wl = 0.0f;
-    float d = 0.0f;
+    Move best_move;
+    bool best_is_terminal = false;
+    classic::Eval best_eval{};    // root eval, no temperature.
+    classic::Eval played_eval{};  // == best_eval until the played edge found.
 
     if (side_uses_dag_[idx]) {
       // ── dag-preview side ──
@@ -757,9 +820,12 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       move_count_++;
       nodes_total_ += dag_search_->GetTotalPlayouts();
       if (abort_) break;
-      const auto best_eval = dag_search_->GetBestEval();
-      wl = best_eval.wl;
-      d = best_eval.d;
+      const auto raw_eval =
+          dag_search_->GetBestEval(&best_move, &best_is_terminal);
+      best_eval.wl = raw_eval.wl;
+      best_eval.d = raw_eval.d;
+      best_eval.ml = raw_eval.ml;
+      played_eval = best_eval;
       auto node = dag_tree_[idx]->GetCurrentHead();
       while (true) {
         move = dag_search_->GetBestMove().first;
@@ -769,6 +835,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           if (edge.GetN() > max_n) max_n = edge.GetN();
           if (edge.GetMove(dag_tree_[idx]->IsBlackToMove()) == move) {
             cur_n = edge.GetN();
+            played_eval.wl = edge.GetWL(-node->GetWL());
+            played_eval.d = edge.GetD(node->GetD());
+            played_eval.ml = edge.GetM(node->GetM() - 1) + 1;
           }
         }
         if (cur_n == max_n ||
@@ -786,6 +855,10 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           options_[idx].discarded_callback({orig_fen_, discard});
         }
         dag_search_->ResetBestMove();
+      }
+      if (training) {
+        capture_training(idx, *dag_tree_[idx], *dag_search_, best_move,
+                         best_is_terminal, best_eval, played_eval, move);
       }
       dag_search_.reset();
     } else {
@@ -809,9 +882,11 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       move_count_++;
       nodes_total_ += search_->GetTotalPlayouts();
       if (abort_) break;
-      const auto best_eval = search_->GetBestEval();
-      wl = best_eval.wl;
-      d = best_eval.d;
+      const auto raw_eval = search_->GetBestEval(&best_move, &best_is_terminal);
+      best_eval.wl = raw_eval.wl;
+      best_eval.d = raw_eval.d;
+      best_eval.ml = raw_eval.ml;
+      played_eval = best_eval;
       auto node = tree_[idx]->GetCurrentHead();
       while (true) {
         move = search_->GetBestMove().first;
@@ -821,6 +896,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           if (edge.GetN() > max_n) max_n = edge.GetN();
           if (edge.GetMove(tree_[idx]->IsBlackToMove()) == move) {
             cur_n = edge.GetN();
+            played_eval.wl = edge.GetWL(-node->GetWL());
+            played_eval.d = edge.GetD(node->GetD());
+            played_eval.ml = edge.GetM(node->GetM() - 1) + 1;
           }
         }
         if (cur_n == max_n ||
@@ -839,10 +917,16 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
         }
         search_->ResetBestMove();
       }
+      if (training) {
+        capture_training(idx, *tree_[idx], *search_, best_move,
+                         best_is_terminal, best_eval, played_eval, move);
+      }
       search_.reset();
     }
 
     // ── shared post-search: eval tracking + resign + advance ──
+    const float wl = best_eval.wl;
+    const float d = best_eval.d;
     float eval = (wl + 1) / 2;
     if (eval < min_eval_[idx]) min_eval_[idx] = eval;
     const int move_number = ref_history().GetLength() / 2 + 1;

@@ -50,7 +50,16 @@ class V7TrainingDataArray {
   // raw `edge.GetN()` for the policy training target — implements
   // KataGo-style policy-target pruning when forced exploration is
   // active.  When null (default), raw edge visit counts are used.
-  void Add(const classic::Node* node, const PositionHistory& history,
+  //
+  // Templated on the node type so both `classic::Node` and
+  // `dag_classic::Node` work: the body only touches the duck-typed node
+  // surface (GetNumEdges / GetChildrenVisits / Edges / GetN / GetWL / GetD
+  // / GetM), and both node types expose it identically.  Defined in the .cc
+  // with explicit instantiations for the two concrete node types, so the
+  // body lives in exactly one place.  Eval params stay `classic::Eval`
+  // (a POD {wl,d,ml}); the dag caller fills one from `dag_classic::Eval`.
+  template <typename NodeT>
+  void Add(const NodeT* node, const PositionHistory& history,
            classic::Eval best_eval, classic::Eval played_eval,
            bool best_is_proven, Move best_move, Move played_move,
            std::span<Move> legal_moves,
