@@ -66,6 +66,12 @@ const OptionId kOpeningStopProbId{
     "opening-stop-prob", "OpeningStopProb",
     "From each opening move, start a self-play game with probability max(p, "
     "1/n), where p is the value given and n the opening moves remaining."};
+const OptionId kSearchAlgorithmId{
+    "search-algorithm", "SearchAlgorithm",
+    "Which search to use for selfplay games: \"classic\" (default) or "
+    "\"dag-preview\" (transposition-aware DAG search). Stage 1: dag-preview "
+    "supports move generation only; training data with dag is not yet "
+    "implemented and will throw if --training is set."};
 }  // namespace
 
 void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
@@ -78,6 +84,8 @@ void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
   PopulateTimeManagementOptions(classic::RunType::kSelfplay, options);
   options->Add<StringOption>(kSyzygyTablebaseId);
   options->Add<FloatOption>(kOpeningStopProbId, 0.0f, 1.0f) = 0.0f;
+  std::vector<std::string> search_algorithms = {"classic", "dag-preview"};
+  options->Add<ChoiceOption>(kSearchAlgorithmId, search_algorithms) = "classic";
 }
 
 SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
@@ -89,6 +97,53 @@ SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
                      classic::SearchParams(*black.uci_options).GetHistoryFill(),
                      pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE) {
   orig_fen_ = opening.start_fen;
+  shared_tree_ = shared_tree;
+  use_dag_search_ =
+      white.uci_options->Get<std::string>(kSearchAlgorithmId) ==
+          "dag-preview" ||
+      black.uci_options->Get<std::string>(kSearchAlgorithmId) == "dag-preview";
+
+  auto white_prob = white.uci_options->Get<float>(kOpeningStopProbId);
+  auto black_prob = black.uci_options->Get<float>(kOpeningStopProbId);
+  if (white_prob != black_prob && white_prob != 0 && black_prob != 0) {
+    throw Exception("Stop probabilities must be both equal or zero!");
+  }
+
+  if (use_dag_search_) {
+    // dag-preview tree construction, mirroring the classic block below.
+    // dag_classic::NodeTree exposes the same ResetToPosition(fen, moves) /
+    // IsBlackToMove() / MakeMove() API as classic::NodeTree.
+    dag_tree_[0] = std::make_shared<dag_classic::NodeTree>();
+    dag_tree_[0]->ResetToPosition(orig_fen_, {});
+    if (shared_tree) {
+      dag_tree_[1] = dag_tree_[0];
+    } else {
+      dag_tree_[1] = std::make_shared<dag_classic::NodeTree>();
+      dag_tree_[1]->ResetToPosition(orig_fen_, {});
+    }
+    int ply = 0;
+    for (Move m : opening.moves) {
+      auto exit_prob_now =
+          dag_tree_[0]->IsBlackToMove() ? black_prob : white_prob;
+      auto exit_prob_next =
+          dag_tree_[0]->IsBlackToMove() ? white_prob : black_prob;
+      int positions = opening.moves.size() - ply + 1;
+      if (exit_prob_now > 0.0f &&
+          Random::Get().GetFloat(1.0f) <
+              std::max(exit_prob_now,
+                       exit_prob_now / (exit_prob_now * ((positions + 1) / 2) +
+                                        exit_prob_next * (positions / 2)))) {
+        break;
+      }
+      if (dag_tree_[0]->IsBlackToMove()) m.Flip();
+      dag_tree_[0]->MakeMove(m);
+      if (dag_tree_[0] != dag_tree_[1]) dag_tree_[1]->MakeMove(m);
+      ply++;
+    }
+    start_ply_ = ply;
+    return;
+  }
+
   tree_[0] = std::make_shared<classic::NodeTree>();
   tree_[0]->ResetToPosition(orig_fen_, {});
 
@@ -99,11 +154,6 @@ SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
     tree_[1]->ResetToPosition(orig_fen_, {});
   }
   int ply = 0;
-  auto white_prob = white.uci_options->Get<float>(kOpeningStopProbId);
-  auto black_prob = black.uci_options->Get<float>(kOpeningStopProbId);
-  if (white_prob != black_prob && white_prob != 0 && black_prob != 0) {
-    throw Exception("Stop probabilities must be both equal or zero!");
-  }
 
   for (Move m : opening.moves) {
     // For early exit from the opening, we support two cases: a) where both
@@ -131,6 +181,10 @@ SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
 
 void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
                         SyzygyTablebase* syzygy_tb, bool enable_resign) {
+  if (use_dag_search_) {
+    PlayDag(white_threads, black_threads, training, syzygy_tb, enable_resign);
+    return;
+  }
   bool blacks_move = tree_[0]->IsBlackToMove();
 
   // Take syzygy tablebases from player1 options.
@@ -560,7 +614,177 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
   }
 }
 
+void SelfPlayGame::PlayDag(int white_threads, int black_threads, bool training,
+                           SyzygyTablebase* syzygy_tb, bool enable_resign) {
+  // ── Stage 1 scope guards ──
+  // dag-preview selfplay currently supports pure lc0-vs-lc0 move generation
+  // only.  Training-data extraction (Stage 2) and external opponent/advisor
+  // engines are not wired for the dag tree yet, so refuse rather than
+  // silently produce wrong/no data.
+  if (training) {
+    throw Exception(
+        "dag-preview selfplay does not generate training data yet "
+        "(Stage 1: move generation only). Run with --training=false, or use "
+        "--search-algorithm=classic for training games.");
+  }
+  if (!options_[0].external_engine_path.empty() ||
+      !options_[1].external_engine_path.empty() ||
+      !options_[0].advisor_engine_path.empty() ||
+      !options_[1].advisor_engine_path.empty()) {
+    throw Exception(
+        "dag-preview selfplay does not support external opponent/advisor "
+        "engines yet (Stage 1). Use --search-algorithm=classic for those.");
+  }
+
+  bool blacks_move = dag_tree_[0]->IsBlackToMove();
+
+  // Syzygy tablebases from player1 options (mirrors Play()).
+  std::string tb_paths =
+      options_[0].uci_options->Get<std::string>(kSyzygyTablebaseId);
+  if (!tb_paths.empty()) {
+    syzygy_tb_ = std::make_unique<SyzygyTablebase>();
+    CERR << "Loading Syzygy tablebases from " << tb_paths;
+    if (!syzygy_tb_->init(tb_paths)) {
+      CERR << "Failed to load Syzygy tablebases!";
+      syzygy_tb_ = nullptr;
+    }
+  }
+
+  while (!abort_) {
+    game_result_ = dag_tree_[0]->GetPositionHistory().ComputeGameResult();
+    if (game_result_ != GameResult::UNDECIDED) break;
+    if (dag_tree_[0]->GetPositionHistory().Last().GetGamePly() >= 450) {
+      adjudicated_ = true;
+      break;
+    }
+    const int idx = blacks_move ? 1 : 0;
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (abort_) break;
+      auto stoppers = options_[idx].search_limits.MakeSearchStopper();
+      classic::PopulateIntrinsicStoppers(stoppers.get(),
+                                         *options_[idx].uci_options);
+      std::unique_ptr<UciResponder> responder =
+          std::make_unique<CallbackUciResponder>(
+              options_[idx].best_move_callback, options_[idx].info_callback);
+      // Per-tree transposition table; shared trees share dag_tt_[0].
+      dag_classic::TranspositionTable* tt = &dag_tt_[shared_tree_ ? 0 : idx];
+      dag_search_ = std::make_unique<dag_classic::Search>(
+          *dag_tree_[idx], options_[idx].backend, std::move(responder),
+          /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
+          std::move(stoppers), /* infinite */ false, /* ponder */ false,
+          *options_[idx].uci_options, tt, syzygy_tb);
+    }
+
+    dag_search_->RunBlocking(blacks_move ? black_threads : white_threads);
+    move_count_++;
+    nodes_total_ += dag_search_->GetTotalPlayouts();
+    if (abort_) break;
+
+    // Stage 1 has no training, so we don't need the best move/terminal flag
+    // from GetBestEval (the actually-played move comes from GetBestMove
+    // below); call with defaults to avoid unused-variable warnings.
+    const auto best_eval = dag_search_->GetBestEval();
+    float eval = best_eval.wl;
+    eval = (eval + 1) / 2;
+    if (eval < min_eval_[idx]) min_eval_[idx] = eval;
+    const int move_number =
+        dag_tree_[0]->GetPositionHistory().GetLength() / 2 + 1;
+    auto best_w = (best_eval.wl + 1.0f - best_eval.d) / 2.0f;
+    auto best_d = best_eval.d;
+    auto best_l = best_w - best_eval.wl;
+    max_eval_[0] = std::max(max_eval_[0], blacks_move ? best_l : best_w);
+    max_eval_[1] = std::max(max_eval_[1], best_d);
+    max_eval_[2] = std::max(max_eval_[2], blacks_move ? best_w : best_l);
+    if (enable_resign && move_number >= options_[idx].uci_options->Get<int>(
+                                            kResignEarliestMoveId)) {
+      const float resignpct =
+          options_[idx].uci_options->Get<float>(kResignPercentageId) / 100;
+      if (options_[idx].uci_options->Get<bool>(kResignWDLStyleId)) {
+        auto threshold = 1.0f - resignpct;
+        if (best_w > threshold) {
+          game_result_ =
+              blacks_move ? GameResult::BLACK_WON : GameResult::WHITE_WON;
+          adjudicated_ = true;
+          break;
+        }
+        if (best_l > threshold) {
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+        if (best_d > threshold) {
+          game_result_ = GameResult::DRAW;
+          adjudicated_ = true;
+          break;
+        }
+      } else {
+        if (eval < resignpct) {
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+      }
+    }
+
+    auto node = dag_tree_[idx]->GetCurrentHead();
+    Move move;
+    while (true) {
+      move = dag_search_->GetBestMove().first;
+      uint32_t max_n = 0;
+      uint32_t cur_n = 0;
+      for (auto& edge : node->Edges()) {
+        if (edge.GetN() > max_n) max_n = edge.GetN();
+        if (edge.GetMove(dag_tree_[idx]->IsBlackToMove()) == move) {
+          cur_n = edge.GetN();
+        }
+      }
+      if (cur_n == max_n ||
+          static_cast<int>(cur_n) >=
+              options_[idx].uci_options->Get<int>(kMinimumAllowedVistsId)) {
+        break;
+      }
+      PositionHistory history_copy = dag_tree_[idx]->GetPositionHistory();
+      Move move_for_history = move;
+      if (dag_tree_[idx]->IsBlackToMove()) move_for_history.Flip();
+      history_copy.Append(move_for_history);
+      if (history_copy.ComputeGameResult() == GameResult::UNDECIDED) {
+        auto move_list_to_discard = GetMoves();
+        move_list_to_discard.push_back(move);
+        options_[idx].discarded_callback({orig_fen_, move_list_to_discard});
+      }
+      dag_search_->ResetBestMove();
+    }
+
+    // Must reset the search before mutating the tree.
+    dag_search_.reset();
+
+    // Add best move to the tree.
+    if (dag_tree_[0]->IsBlackToMove()) move.Flip();
+    dag_tree_[0]->MakeMove(move);
+    if (dag_tree_[0] != dag_tree_[1]) dag_tree_[1]->MakeMove(move);
+    blacks_move = !blacks_move;
+  }
+}
+
 std::vector<Move> SelfPlayGame::GetMoves() const {
+  if (use_dag_search_) {
+    // A DAG node has no unique parent, so we can't walk head→begin like the
+    // classic path.  dag_classic::NodeTree stores the played moves directly
+    // (internal/flipped frame, oldest-first); replay them forward to recover
+    // board-frame moves using the same un-flip rule as the classic path.
+    std::vector<Move> result;
+    Position pos = dag_tree_[0]->GetPositionHistory().Starting();
+    for (Move move : dag_tree_[0]->GetMoves()) {
+      pos = Position(pos, move);
+      if (!pos.IsBlackToMove()) move.Flip();
+      result.push_back(move);
+    }
+    return result;
+  }
   std::vector<Move> moves;
   for (classic::Node* node = tree_[0]->GetCurrentHead();
        node != tree_[0]->GetGameBeginNode(); node = node->GetParent()) {
@@ -600,6 +824,7 @@ void SelfPlayGame::Abort() {
   std::lock_guard<std::mutex> lock(mutex_);
   abort_ = true;
   if (search_) search_->Abort();
+  if (dag_search_) dag_search_->Abort();
 }
 
 void SelfPlayGame::WriteTrainingData(TrainingDataWriter* writer) const {

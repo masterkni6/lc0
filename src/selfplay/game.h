@@ -33,6 +33,8 @@
 #include "neural/backend.h"
 #include "search/classic/search.h"
 #include "search/classic/stoppers/stoppers.h"
+#include "search/dag_classic/node.h"
+#include "search/dag_classic/search.h"
 #include "selfplay/external_engine.h"
 #include "trainingdata/trainingdata.h"
 #include "utils/optionsparser.h"
@@ -134,6 +136,13 @@ class SelfPlayGame {
   uint64_t nodes_total_ = 0;
 
  private:
+  // Stage-1 dag-preview selfplay (move generation only; training data with
+  // dag is Stage 2 and currently throws).  When use_dag_search_ is true the
+  // game runs through PlayDag() using the dag_classic:: search/tree types
+  // instead of the classic ones; the classic Play() path is left untouched.
+  void PlayDag(int white_threads, int black_threads, bool training,
+               SyzygyTablebase* syzygy_tb, bool enable_resign);
+
   // options_[0] is for white player, [1] for black.
   PlayerOptions options_[2];
   // Node tree for player1 and player2. If the tree is shared between players,
@@ -141,6 +150,23 @@ class SelfPlayGame {
   std::shared_ptr<classic::NodeTree> tree_[2];
   std::string orig_fen_;
   int start_ply_;
+
+  // ── dag-preview path (parallel to the classic members above) ──
+  // Selected at construction from the "search-algorithm" option.  When true,
+  // the dag_* members below are populated/used instead of the classic ones.
+  bool use_dag_search_ = false;
+  // Whether the two players share one tree (training games).  Needed by the
+  // dag path to decide whether to share one transposition table too.
+  bool shared_tree_ = false;
+  // dag node trees, mirroring tree_[2].
+  std::shared_ptr<dag_classic::NodeTree> dag_tree_[2];
+  // Per-tree transposition table (holds weak refs to the tree's low nodes,
+  // so its lifetime is tied to the tree).  When shared_tree_, both players
+  // use dag_tt_[0].
+  dag_classic::TranspositionTable dag_tt_[2];
+  // dag search in progress (Abort() stops whichever of search_/dag_search_
+  // is active).
+  std::unique_ptr<dag_classic::Search> dag_search_;
 
   // Search that is currently in progress. Stored in members so that Abort()
   // can stop it.
