@@ -96,6 +96,17 @@ class Search {
   // Returns the search parameters.
   const SearchParams& GetParams() const { return params_; }
 
+  // Per-root-edge visit counts for the policy training target, aligned with
+  // root_node_->Edges() iteration order.  Without pruning machinery enabled
+  // this is just raw edge.GetN().  When the advisor forced visits onto a move
+  // (or explicit policy-target-pruning is on) it applies the KataGo-style
+  // equilibrium clamp so the advisor's forced visits don't distort the trained
+  // policy.  Faithful port of classic::Search::GetTrainingTargetVisits; the
+  // forced-exploration-factor trigger is inert here because the dag search does
+  // not apply that factor and a dag training side refuses it at startup, so in
+  // practice only the advisor (and explicit PTP) trigger the clamp.
+  std::vector<float> GetTrainingTargetVisits() const;
+
   // If called after GetBestMove, another call to GetBestMove will have results
   // from temperature having been applied again.
   void ResetBestMove();

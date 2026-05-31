@@ -735,11 +735,13 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     std::optional<EvalResult> nneval =
         options_[tr_idx].backend->GetCachedEvaluation(EvalPosition{
             tree_ref.GetPositionHistory().GetPositions(), legal_moves});
-    std::vector<float> processed_visits;
-    processed_visits.reserve(head->GetNumEdges());
-    for (const auto& edge : head->Edges()) {
-      processed_visits.push_back(static_cast<float>(edge.GetN()));
-    }
+    // Per-edge policy target.  Without pruning machinery this is just raw root
+    // visit counts; when the advisor forced visits onto a move (or explicit
+    // policy-target-pruning is set), GetTrainingTargetVisits applies the KataGo
+    // equilibrium clamp so the advisor's forced visits don't bias the trained
+    // policy.  The returned vector is aligned with root_node_->Edges(), which is
+    // the same node `head` that Add iterates, so the per-edge values line up.
+    std::vector<float> processed_visits = search_ref.GetTrainingTargetVisits();
     training_data_.Add(head, tree_ref.GetPositionHistory(), best_eval,
                        played_eval, best_is_proof, best_move, played_move,
                        legal_moves, nneval,

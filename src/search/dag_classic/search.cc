@@ -733,6 +733,114 @@ std::int64_t Search::GetTotalPlayouts() const {
   return total_playouts_;
 }
 
+std::vector<float> Search::GetTrainingTargetVisits() const {
+  // Policy Target Pruning (KataGo Wu 2019 §5.1; lc0 PR 2415).  Faithful port of
+  // classic::Search::GetTrainingTargetVisits.  The cap clamps each non-most-
+  // visited root edge down to the visit count where its full PUCT score (Q+M+U)
+  // would equal the most-visited child's, removing visits that PUCT itself
+  // wouldn't have made — which is exactly the advisor's forced visits.
+  // Lock-free like the classic version: only called from selfplay after
+  // RunBlocking()/Wait() has joined all worker threads, so the tree is quiescent.
+  std::vector<float> result;
+  if (root_node_ == nullptr) return result;
+  result.reserve(root_node_->GetNumEdges());
+
+  // Fast path: no pruning machinery enabled → raw N.  (The forced-exploration
+  // factor term is inert for the dag search — it never applies that factor, and
+  // a dag training side refuses it at startup — so in practice only the advisor
+  // and explicit policy-target-pruning trigger the clamp.)
+  const float factor = params_.GetForcedExplorationFactor();
+  const bool ptp_explicit = params_.GetUsePolicyTargetPruning();
+  const bool any_prune =
+      (factor > 0.0f) || (advisor_min_visits_ > 0) || ptp_explicit;
+  if (!any_prune) {
+    for (const auto& edge : root_node_->Edges()) {
+      result.push_back(static_cast<float>(edge.GetN()));
+    }
+    return result;
+  }
+
+  // Q/M/U scaffolding for the root (mirrors classic + dag's own PUCT setup).
+  const bool is_root = true;
+  const bool is_odd_depth = !is_root;  // root depth is even
+  const float draw_score = GetDrawScore(is_odd_depth);
+  const float cpuct = ComputeCpuct(params_, root_node_->GetN(), is_root);
+  const float n_total_for_uct =
+      std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+  const float U_coeff = cpuct * n_total_for_uct;
+  const float fpu = GetFpu(params_, root_node_, is_root, draw_score);
+  const auto m_evaluator = backend_attributes_.has_mlh
+                               ? MEvaluator(params_, root_node_)
+                               : MEvaluator();
+
+  // Step 1: find c* (child with most playouts).
+  int c_star_idx = -1;
+  uint32_t c_star_n = 0;
+  int idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    const uint32_t n = edge.GetN();
+    if (n > c_star_n) {
+      c_star_n = n;
+      c_star_idx = idx;
+    }
+    ++idx;
+  }
+  if (c_star_idx < 0) {  // No visits at all → raw counts.
+    for (const auto& edge : root_node_->Edges()) {
+      result.push_back(static_cast<float>(edge.GetN()));
+    }
+    return result;
+  }
+
+  // Step 2: best_utility = Q(c*) + M(c*) + U(c*) at c*'s N.
+  float best_utility = 0.0f;
+  idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    if (idx == c_star_idx) {
+      const float q_star = edge.GetQ(fpu, draw_score);
+      const float m_star = m_evaluator.GetMUtility(edge, q_star);
+      const float u_star =
+          U_coeff * edge.GetP() / (1.0f + static_cast<float>(c_star_n));
+      best_utility = q_star + m_star + u_star;
+      break;
+    }
+    ++idx;
+  }
+
+  // Step 3 + 4: per-edge equilibrium clamp.
+  idx = 0;
+  for (const auto& edge : root_node_->Edges()) {
+    const uint32_t n_raw_u = edge.GetN();
+    const float n_raw = static_cast<float>(n_raw_u);
+    if (idx == c_star_idx) {
+      result.push_back(n_raw);  // c* keeps all visits.
+      ++idx;
+      continue;
+    }
+    if (n_raw_u == 0) {
+      result.push_back(0.0f);
+      ++idx;
+      continue;
+    }
+    const float p = edge.GetP();
+    const float q = edge.GetQ(fpu, draw_score);
+    const float m = m_evaluator.GetMUtility(edge, q);
+    const float u_now = U_coeff * p / (1.0f + n_raw);
+    const float qm = q + m;
+    // PUCT would have visited c at least n_raw times → no reduction.
+    if (qm + u_now >= best_utility) {
+      result.push_back(n_raw);
+      ++idx;
+      continue;
+    }
+    // N_eq: where PUCT(c at N_eq) == best_utility.
+    const float n_eq = U_coeff * p / (best_utility - qm) - 1.0f;
+    result.push_back(std::max(0.0f, std::min(n_eq, n_raw)));
+    ++idx;
+  }
+  return result;
+}
+
 void Search::ResetBestMove() {
   SharedMutex::Lock nodes_lock(nodes_mutex_);
   Mutex::Lock lock(counters_mutex_);

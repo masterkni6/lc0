@@ -295,12 +295,15 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       }
     }
   }
-  // dag-preview training writes raw visit-count policy targets; it does not
-  // port classic's improved-policy target reshaping.  When a dag side is
-  // present, SelfPlayGame::PlayPerSide writes raw-N for BOTH sides, so refuse
-  // those options on either player rather than silently mistarget the policy.
-  // Checked here (startup, main thread) so a misconfig errors cleanly instead
-  // of throwing from a worker thread mid-run.
+  // dag-preview training supports raw-N policy targets AND policy-target-pruning
+  // (dag_classic::Search::GetTrainingTargetVisits applies the KataGo equilibrium
+  // clamp, which is what prunes an advisor's forced root visits).  It does NOT
+  // implement the forced-exploration *factor* in the search itself, nor the
+  // Grill/Gumbel improved-policy targets, so refuse those on either player when
+  // a dag side is present rather than silently mistarget the policy.  (Advisor
+  // forcing and --policy-target-pruning are fine.)  Checked here (startup, main
+  // thread) so a misconfig errors cleanly instead of throwing from a worker
+  // thread mid-run.
   if (kTraining) {
     bool any_dag = false;
     for (int pl = 0; pl < 2; ++pl) {
@@ -315,15 +318,14 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
         for (int color = 0; color < 2; ++color) {
           const classic::SearchParams sp(player_options_[pl][color]);
           if (sp.GetForcedExplorationFactor() > 0.0f ||
-              sp.GetUsePolicyTargetPruning() ||
               sp.GetUseGrillImprovedTarget() ||
               sp.GetUseGumbelImprovedTarget()) {
             throw Exception(
-                "dag-preview training writes raw visit-count policy targets; "
-                "improved-policy targets (--forced-exploration-factor, "
-                "--policy-target-pruning, Grill, Gumbel) are not supported when "
-                "a dag side is present. Disable them, or run both sides with "
-                "--search-algorithm=classic.");
+                "dag-preview training does not support --forced-exploration-"
+                "factor (the dag search does not apply it) or the Grill/Gumbel "
+                "improved-policy targets. Disable them, or run both sides with "
+                "--search-algorithm=classic. (--policy-target-pruning and the "
+                "advisor ARE supported.)");
           }
         }
       }
