@@ -2256,20 +2256,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   // Check the transposition table first and NN cache second before asking for
   // NN evaluation.
   picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
-  // Force the root to MISS the transposition table when root Dirichlet noise is
-  // enabled.  A TT hit reuses a previously-evaluated LowNode and never runs the
-  // noise application (FetchSingleNodeResult only noises on a fresh NN eval),
-  // which would silently drop the configured root exploration in selfplay
-  // (dag's per-game TT can keep the just-played position live across the move).
-  // Re-evaluating the root — one extra NN eval per move — guarantees fresh noise
-  // every search, matching classic.  No effect when noise is off (e.g. strength
-  // tests / pure value games), so the TT still serves the root there.  (Minor:
-  // the fresh noised root LowNode may enter the TT, so a rare transposition back
-  // to the exact root position would see noised priors — negligible.)
-  const bool force_root_miss =
-      params_.GetNoiseEpsilon() > 0.0f && node == search_->root_node_;
-  auto tt_iter = force_root_miss ? search_->tt_->end()
-                                 : search_->tt_->find(picked_node.hash);
+  auto tt_iter = search_->tt_->find(picked_node.hash);
   // Transposition table entry might be expired.
   if (tt_iter != search_->tt_->end()) {
     picked_node.tt_low_node = tt_iter->second.lock();
@@ -2315,7 +2302,26 @@ void SearchWorker::FetchMinibatchResults() {
 }
 
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
-  if (!node_to_process->nn_queried) return;
+  Node* node = node_to_process->node;
+  if (!node_to_process->nn_queried) {
+    // No fresh NN eval here (transposition-table hit, or terminal). If this is
+    // the root and root Dirichlet noise is enabled, apply it to the REUSED
+    // LowNode's edge priors now — noise only perturbs the priors (a CPU op,
+    // independent of the NN value), so we keep dag's cross-move root reuse (the
+    // just-played position was already evaluated last move) and add fresh root
+    // exploration WITHOUT re-evaluating the root.  Runs once per search (the
+    // root is extended exactly once).  The reused priors are clean — the
+    // position was an internal, un-noised node when first evaluated — so the
+    // noise does not compound.  (tt_low_node is null for a terminal node, so the
+    // guard also skips the impossible "terminal root mid-search" case.)
+    if (node == search_->root_node_ && params_.GetNoiseEpsilon() &&
+        node_to_process->tt_low_node) {
+      ApplyDirichletNoise(node_to_process->tt_low_node.get(),
+                          params_.GetNoiseEpsilon(), params_.GetNoiseAlpha());
+      node_to_process->tt_low_node->SortEdges();
+    }
+    return;
+  }
 
   auto wdl_rescale = [&]() {
     if (params_.GetWDLRescaleRatio() != 1.0f ||
@@ -2347,7 +2353,6 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   // only on a TT miss (nn_queried), so a LowNode reached as both root and
   // internal via transposition keeps its first-touch alpha — acceptable, and
   // exact for the common case where the root is freshly evaluated each move.
-  Node* node = node_to_process->node;
   {
     const float opt_alpha = (node == search_->root_node_)
                                 ? params_.GetOptimisticPolicyWeight()
