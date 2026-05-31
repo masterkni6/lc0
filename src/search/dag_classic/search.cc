@@ -2256,20 +2256,13 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   // Check the transposition table first and NN cache second before asking for
   // NN evaluation.
   picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
-  // Split optimistic-policy blend: the root must use --optimistic-policy-weight,
-  // but the shared per-game TT would hand back the just-played position's
-  // LowNode — which was evaluated as an INTERNAL node last move (and last move
-  // for the other side), i.e. blended at --optimistic-policy-weight-internal.
-  // Only the blended priors are stored, so it can't be re-blended to the root
-  // alpha.  When the two alphas differ, force the root to MISS the TT so it is
-  // freshly evaluated and gets the correct root-alpha blend (and fresh root
-  // noise) via the eval path below.  Costs ~1 root NN eval/move; no effect when
-  // the alphas are equal (uniform blend / off), where TT reuse is already
-  // correct.  Internal nodes are never force-missed and keep full TT reuse.
+  // The root's priors are search-local (Dirichlet noise / root-specific blend
+  // alpha), so it must not reuse a shared LowNode from the TT — see
+  // RootNeedsPrivateLowNode.  Force it to MISS the lookup so it is evaluated
+  // fresh (the backup likewise skips inserting it, keeping the LowNode private).
+  // Internal nodes are never force-missed and keep full TT reuse.
   const bool force_root_miss =
-      node == search_->root_node_ &&
-      params_.GetOptimisticPolicyWeight() !=
-          params_.GetOptimisticPolicyWeightInternal();
+      node == search_->root_node_ && RootNeedsPrivateLowNode();
   auto tt_iter = force_root_miss ? search_->tt_->end()
                                  : search_->tt_->find(picked_node.hash);
   // Transposition table entry might be expired.
@@ -2282,10 +2275,6 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   } else {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
-    // A force-missed root gets a PRIVATE LowNode: the backup must not insert it
-    // into (or dedupe it against) the shared TT, else the existing internal-alpha
-    // entry would be re-attached and the root-alpha blend lost (see backup).
-    picked_node.private_low_node = force_root_miss;
     picked_node.eval->p.resize(legal_moves.size());
     // Request the optimistic policy head when the blend is enabled at either
     // depth class, so the backend fills eval->p_optimistic (FetchSingleNodeResult
@@ -2321,27 +2310,9 @@ void SearchWorker::FetchMinibatchResults() {
 }
 
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
-  Node* node = node_to_process->node;
-  if (!node_to_process->nn_queried) {
-    // No fresh NN eval here (transposition-table hit, or terminal). If this is
-    // the root and root Dirichlet noise is enabled, apply it to the REUSED
-    // LowNode's edge priors now — noise only perturbs the priors (a CPU op,
-    // independent of the NN value), so we keep dag's cross-move root reuse (the
-    // just-played position was already evaluated last move) and add fresh root
-    // exploration WITHOUT re-evaluating the root.  Runs once per search (the
-    // root is extended exactly once).  The reused priors are clean — the
-    // position was an internal, un-noised node when first evaluated — so the
-    // noise does not compound.  (tt_low_node is null for a terminal node, so the
-    // guard also skips the impossible "terminal root mid-search" case.)
-    if (node == search_->root_node_ && params_.GetNoiseEpsilon() &&
-        node_to_process->tt_low_node) {
-      ApplyDirichletNoise(node_to_process->tt_low_node.get(),
-                          params_.GetNoiseEpsilon(), params_.GetNoiseAlpha());
-      node_to_process->tt_low_node->SortEdges();
-    }
-    return;
-  }
+  if (!node_to_process->nn_queried) return;
 
+  Node* node = node_to_process->node;
   auto wdl_rescale = [&]() {
     if (params_.GetWDLRescaleRatio() != 1.0f ||
         (params_.GetWDLRescaleDiff() != 0.0f &&
@@ -2369,11 +2340,11 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   // order).  alpha is selected by depth class: --optimistic-policy-weight at
   // the root, --optimistic-policy-weight-internal elsewhere.  No-op when the
   // weight is 0 or the backend didn't expose p_optimistic.  Runs on a fresh
-  // eval (nn_queried); in split mode (root alpha != internal) ExtendNode
-  // force-misses the root, so it's freshly evaluated here and gets the root
-  // alpha — otherwise it would reuse the just-played position's internal-alpha
-  // LowNode from the shared TT.  Internal nodes reached via transposition all
-  // share the single internal alpha, so there's no per-node alpha ambiguity.
+  // eval (nn_queried); the root is freshly evaluated here because ExtendNode
+  // force-misses it (RootNeedsPrivateLowNode), so it gets the root alpha instead
+  // of reusing the just-played position's internal-alpha LowNode from the shared
+  // TT.  Internal nodes reached via transposition all share the single internal
+  // alpha, so there's no per-node alpha ambiguity.
   {
     const float opt_alpha = (node == search_->root_node_)
                                 ? params_.GetOptimisticPolicyWeight()
@@ -2502,13 +2473,14 @@ void SearchWorker::DoBackupUpdateSingleNode(
   auto path = node_to_process.path;
 
   if (node_to_process.nn_queried) {
-    if (node_to_process.private_low_node) {
-      // Force-missed root (split optimistic blend): attach its PRIVATE LowNode
-      // directly — do NOT insert into or dedupe against the shared TT.  Without
-      // this, try_emplace would find the position's existing internal-alpha
-      // entry and re-attach THAT (dropping the root's root-alpha blend + noise),
-      // defeating the force-miss.  Leaving the root out of the TT also keeps
-      // internal transpositions to this position on the internal alpha.
+    if (node_to_process.node == search_->root_node_ &&
+        RootNeedsPrivateLowNode()) {
+      // Root with search-local priors: attach its PRIVATE LowNode directly — do
+      // NOT insert into or dedupe against the shared TT.  Otherwise try_emplace
+      // would find the position's existing (internal-alpha) entry and re-attach
+      // THAT, dropping the root's noise + root-alpha and defeating the
+      // force-miss.  Keeping the root out of the TT also leaves internal
+      // transpositions to this position on the internal alpha.
       node_to_process.node->SetLowNode(node_to_process.tt_low_node);
     } else {
       auto [tt_iter, is_tt_miss] = search_->tt_->try_emplace(

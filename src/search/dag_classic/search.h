@@ -360,12 +360,6 @@ class SearchWorker {
     bool is_tt_hit = false;
     bool is_cache_hit = false;
     bool is_collision = false;
-    // This node's LowNode is PRIVATE: it must not be looked up in or inserted
-    // into the shared transposition table.  Set for the force-missed root in
-    // split optimistic-blend mode, so the root keeps its own root-alpha blend
-    // (and noise) instead of sharing/being-deduped-onto the position's
-    // internal-alpha LowNode.  See ExtendNode / DoBackupUpdateSingleNode.
-    bool private_low_node = false;
 
     // Details that are filled in as we go.
     uint64_t hash;
@@ -506,6 +500,20 @@ class SearchWorker {
   void ProcessPickedTask(int batch_start, int batch_end);
   void ExtendNode(NodeToProcess& picked_node);
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
+  // The root carries SEARCH-LOCAL priors — Dirichlet noise and/or a
+  // root-specific optimistic-blend alpha — that must not flow through the
+  // shared transposition table: a shared LowNode would leak the root's noise to
+  // other paths reaching that position, or hand the root the internal alpha it
+  // was first evaluated with.  When this is true the root gets a PRIVATE
+  // LowNode (force-missed at TT lookup, not inserted at backup) and is evaluated
+  // fresh, so the normal eval path applies its noise + root alpha.  When the two
+  // alphas are equal and there's no noise, the root has nothing search-local and
+  // may share its LowNode like any other node.
+  bool RootNeedsPrivateLowNode() const {
+    return params_.GetNoiseEpsilon() > 0.0f ||
+           params_.GetOptimisticPolicyWeight() !=
+               params_.GetOptimisticPolicyWeightInternal();
+  }
   std::tuple<PickTask*, int, int> PickTaskToProcess();
   void ProcessTask(PickTask* task, int id,
                    std::vector<NodeToProcess>* receiver,
