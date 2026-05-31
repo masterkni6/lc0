@@ -654,35 +654,17 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
 void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                               bool training, SyzygyTablebase* syzygy_tb,
                               bool enable_resign) {
-  // ── Scope guards ──
+  // ── Scope ──
   // External opponent (a non-lc0 engine that plays a side) and advisor (which
   // only biases lc0's own search) are both supported below, the same way
-  // classic Play() does it — so no engine-type refusal here.
+  // classic Play() does it.
   //
   // PlayPerSide writes the raw root visit-count distribution as the policy
   // target for BOTH branches (see capture_training below) — it does not port
   // classic's improved-policy target reshaping (PTP / forced-exploration /
-  // Grill / Gumbel) to this path.  The dag search has no such reshaping at
-  // all, and replicating it for the classic branch here would silently
-  // diverge from the real Play() path.  So refuse those on EITHER side when a
-  // dag side is present, rather than write a mistargeted policy.  (Advisor
-  // forcing is already refused above; both-classic games never reach here and
-  // keep full target support via Play().)
-  if (training) {
-    for (int s = 0; s < 2; ++s) {
-      const classic::SearchParams sp(*options_[s].uci_options);
-      if (sp.GetForcedExplorationFactor() > 0.0f ||
-          sp.GetUsePolicyTargetPruning() || sp.GetUseGrillImprovedTarget() ||
-          sp.GetUseGumbelImprovedTarget()) {
-        throw Exception(
-            "dag-preview training writes raw visit-count policy targets; "
-            "improved-policy targets (--forced-exploration-factor, "
-            "--policy-target-pruning, Grill, Gumbel) are not supported when a "
-            "dag side is present (they would mistarget the policy). Disable "
-            "them, or run both sides with --search-algorithm=classic.");
-      }
-    }
-  }
+  // Grill / Gumbel).  Those options are refused (when a dag side is present and
+  // training) at tournament-construction time so a misconfig fails cleanly at
+  // startup rather than throwing from this worker thread.
 
   // Helpers operating across the two (possibly different-typed) trees, which
   // both track the same game.  Side 0 is the reference for position queries.
@@ -1122,10 +1104,15 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                          best_is_terminal, best_eval, played_eval, move);
       }
     }
-    if (side_uses_dag_[idx]) {
-      dag_search_.reset();
-    } else {
-      search_.reset();
+    // Reset under mutex_: Abort() reads search_/dag_search_ under the same
+    // lock, so the destroy must not race its dereference.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (side_uses_dag_[idx]) {
+        dag_search_.reset();
+      } else {
+        search_.reset();
+      }
     }
 
     // Advance every tree with the played move (board frame → internal).

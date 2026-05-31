@@ -233,6 +233,16 @@ if get_option('dag_classic')
     'src/search/dag_classic/search.cc',
     'src/search/dag_classic/wrapper.cc',
   ]
+else
+  # The selfplay layer (src/selfplay/game.{cc,h}) and the training-data writer
+  # (src/trainingdata/trainingdata.cc) now hard-depend on the dag_classic
+  # search: per-side dag-preview selfplay, dag training-data extraction, and the
+  # V7TrainingDataArray::Add<dag_classic::Node> instantiation all reference its
+  # symbols unconditionally.  A -Ddag_classic=false build therefore fails at
+  # link with undefined dag_classic::Search/NodeTree symbols.  Fail fast here
+  # with a clear reason instead of a cryptic linker error.
+  error('dag_classic is required by the selfplay layer; re-run meson with ' +
+        '-Ddag_classic=true (the default).')
 endif
 
 #############################################################################

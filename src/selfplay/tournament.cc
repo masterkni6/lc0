@@ -295,6 +295,40 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       }
     }
   }
+  // dag-preview training writes raw visit-count policy targets; it does not
+  // port classic's improved-policy target reshaping.  When a dag side is
+  // present, SelfPlayGame::PlayPerSide writes raw-N for BOTH sides, so refuse
+  // those options on either player rather than silently mistarget the policy.
+  // Checked here (startup, main thread) so a misconfig errors cleanly instead
+  // of throwing from a worker thread mid-run.
+  if (kTraining) {
+    bool any_dag = false;
+    for (int pl = 0; pl < 2; ++pl) {
+      for (int color = 0; color < 2; ++color) {
+        if (SelfPlayGame::IsDagRequested(player_options_[pl][color])) {
+          any_dag = true;
+        }
+      }
+    }
+    if (any_dag) {
+      for (int pl = 0; pl < 2; ++pl) {
+        for (int color = 0; color < 2; ++color) {
+          const classic::SearchParams sp(player_options_[pl][color]);
+          if (sp.GetForcedExplorationFactor() > 0.0f ||
+              sp.GetUsePolicyTargetPruning() ||
+              sp.GetUseGrillImprovedTarget() ||
+              sp.GetUseGumbelImprovedTarget()) {
+            throw Exception(
+                "dag-preview training writes raw visit-count policy targets; "
+                "improved-policy targets (--forced-exploration-factor, "
+                "--policy-target-pruning, Grill, Gumbel) are not supported when "
+                "a dag side is present. Disable them, or run both sides with "
+                "--search-algorithm=classic.");
+          }
+        }
+      }
+    }
+  }
   // If playing just one game, the player1 is white, otherwise randomize.
   if (kTotalGames != 1) {
     first_game_black_ = Random::Get().GetBool();
