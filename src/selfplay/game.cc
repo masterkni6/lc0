@@ -655,16 +655,10 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                               bool training, SyzygyTablebase* syzygy_tb,
                               bool enable_resign) {
   // ── Scope guards ──
-  // An external OPPONENT (a non-lc0 engine that plays a side's moves) is not
-  // wired for the dag path — PlayPerSide has no opponent-move branch like
-  // Play() — so refuse it.  The ADVISOR engine (which only biases lc0's own
-  // search via forced root visits) IS supported below for dag sides.
-  if (!options_[0].external_engine_path.empty() ||
-      !options_[1].external_engine_path.empty()) {
-    throw Exception(
-        "dag-preview selfplay does not support an external opponent engine "
-        "yet. Use --search-algorithm=classic for that.");
-  }
+  // External opponent (a non-lc0 engine that plays a side) and advisor (which
+  // only biases lc0's own search) are both supported below, the same way
+  // classic Play() does it — so no engine-type refusal here.
+  //
   // PlayPerSide writes the raw root visit-count distribution as the policy
   // target for BOTH branches (see capture_training below) — it does not port
   // classic's improved-policy target reshaping (PTP / forced-exploration /
@@ -780,6 +774,87 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     }
     const int idx = blacks_move ? 1 : 0;
     const int threads = blacks_move ? black_threads : white_threads;
+
+    // ─── External UCI opponent path ───
+    // If this side is played by an external (non-lc0) engine, get its move,
+    // apply it to both trees, and skip lc0 search + training for this move.
+    // A placeholder chunk (training only) keeps consecutive lc0-side chunks one
+    // ply apart for the rescorer.  Mirrors classic Play()'s opponent path and
+    // works whichever engine the lc0 side(s) use.  On spawn/query/parse failure
+    // we adjudicate the game as a loss for the opponent (same as classic), so
+    // we never write result-less garbage.
+    if (!options_[idx].external_engine_path.empty()) {
+      const bool is_frc_position = chess960_;
+      if (!external_engines_[idx]) {
+        try {
+          external_engines_[idx] = std::make_unique<ExternalEngine>(
+              options_[idx].external_engine_path,
+              options_[idx].external_engine_args,
+              options_[idx].external_engine_uci_options,
+              options_[idx].external_engine_go_command,
+              /*chess960=*/is_frc_position);
+        } catch (const Exception& e) {
+          CERR << "External engine spawn failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — adjudicating as loss for opponent.";
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+      }
+      const std::vector<Move> played_moves = GetMoves();
+      std::vector<std::string> moves_uci;
+      moves_uci.reserve(played_moves.size());
+      for (const Move& m : played_moves) {
+        moves_uci.push_back(m.ToString(is_frc_position));
+      }
+      std::string uci_move;
+      try {
+        uci_move = external_engines_[idx]->GetMove(orig_fen_, moves_uci);
+      } catch (const Exception& e) {
+        external_engines_[idx].reset();
+        CERR << "External engine error on side " << (blacks_move ? "B" : "W")
+             << ": " << e.what() << " — adjudicating as loss for opponent.";
+        game_result_ =
+            blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+        adjudicated_ = true;
+        break;
+      }
+      // Parse against the to-move side's board (dag- or classic-typed); both
+      // expose the same PositionHistory/ChessBoard API.  ParseMove returns the
+      // move in storage form (already un-mirrored for black-to-move).
+      const PositionHistory& ph = side_uses_dag_[idx]
+                                      ? dag_tree_[idx]->GetPositionHistory()
+                                      : tree_[idx]->GetPositionHistory();
+      Move move;
+      try {
+        move = ph.Last().GetBoard().ParseMove(uci_move);
+      } catch (const Exception& e) {
+        CERR << "External engine returned unparseable move '" << uci_move
+             << "': " << e.what() << " — adjudicating as loss for opponent. "
+             << "(orig fen: " << orig_fen_ << ")";
+        external_engines_[idx].reset();
+        game_result_ =
+            blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+        adjudicated_ = true;
+        break;
+      }
+      // Placeholder chunk (training only): AddPlaceholder wants board frame,
+      // but `move` is storage form, so flip for a black-to-move position.
+      if (training) {
+        Move real_move = move;
+        if (blacks_move) real_move.Flip();
+        training_data_.AddPlaceholder(ph, real_move);
+      }
+      // `move` is storage form already (unlike the lc0 path where GetBestMove
+      // returns board frame) — apply directly to both trees, do NOT flip.
+      // Do NOT bump move_count_/nodes_total_: those track lc0-side search so
+      // the tournament's npm stays "nodes per lc0 move".
+      make_move_all(move);
+      blacks_move = !blacks_move;
+      continue;
+    }
 
     // Trim the to-move side's tree unless reuse-tree is set (mirrors the
     // classic Play() path so dag and classic sides reuse/trim identically).
