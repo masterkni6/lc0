@@ -182,7 +182,16 @@ class Edge {
 
   // Returns move from the point of view of the player making it (if as_opponent
   // is false) or as opponent (if as_opponent is true).
-  Move GetMove(bool as_opponent = false) const;
+  // Defined inline (rather than out-of-line in node.cc) so it is available to
+  // out-of-module template instantiations — notably the training-data writer's
+  // V7TrainingDataArray::Add<dag_classic::Node> — without leaving an
+  // out-of-line symbol that LTO can inline-and-drop, which broke the link.
+  Move GetMove(bool as_opponent = false) const {
+    if (!as_opponent) return move_;
+    Move m = move_;
+    m.Flip();
+    return m;
+  }
 
   // Returns or sets value of Move policy prior returned from the neural net
   // (but can be changed by adding Dirichlet noise). Must be in [0,1].
@@ -883,6 +892,18 @@ inline Node::ConstIterator Node::Edges() const {
   return {this->GetLowNode().get()};
 }
 inline Node::Iterator Node::Edges() { return {this->GetLowNode().get()}; }
+
+// Defined inline here (after LowNode is complete) rather than out-of-line in
+// node.cc, so they are available to out-of-module template instantiations —
+// notably V7TrainingDataArray::Add<dag_classic::Node> in the training-data
+// writer — without an out-of-line symbol that LTO inlines-and-drops (which
+// produced undefined-reference link errors from the explicit instantiation).
+inline uint32_t Node::GetChildrenVisits() const {
+  return low_node_ ? low_node_->GetChildrenVisits() : 0;
+}
+inline uint8_t Node::GetNumEdges() const {
+  return low_node_ ? low_node_->GetNumEdges() : 0;
+}
 
 // TODO(crem) Replace this with less hacky iterator once we support C++17.
 // This class has multiple hypostases within one class:

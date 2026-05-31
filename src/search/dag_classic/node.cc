@@ -48,12 +48,7 @@ namespace dag_classic {
 // Edge
 /////////////////////////////////////////////////////////////////////////
 
-Move Edge::GetMove(bool as_opponent) const {
-  if (!as_opponent) return move_;
-  Move m = move_;
-  m.Flip();
-  return m;
-}
+// Edge::GetMove is defined inline in node.h (see note there).
 
 // Policy priors (P) are stored in a compressed 16-bit format.
 //
@@ -167,9 +162,7 @@ uint32_t Node::GetNInFlight() const {
   return n_in_flight_.load(std::memory_order_acquire);
 }
 
-uint32_t Node::GetChildrenVisits() const {
-  return low_node_ ? low_node_->GetChildrenVisits() : 0;
-}
+// Node::GetChildrenVisits is defined inline in node.h (see note there).
 
 uint32_t Node::GetTotalVisits() const {
   return low_node_ ? low_node_->GetN() : 0;
@@ -266,9 +259,7 @@ void LowNode::SetBounds(GameResult lower, GameResult upper) {
   upper_bound_ = upper;
 }
 
-uint8_t Node::GetNumEdges() const {
-  return low_node_ ? low_node_->GetNumEdges() : 0;
-}
+// Node::GetNumEdges is defined inline in node.h (see note there).
 
 void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
   SetBounds(result, result);
