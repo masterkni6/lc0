@@ -114,6 +114,11 @@ class SelfPlayGame {
   // Populate command line options that it uses.
   static void PopulateUciParams(OptionsParser* options);
 
+  // True if `opts` selects the dag-preview search (vs classic).  Exposed so
+  // the tournament can refuse dag in code paths that don't honor it (e.g. the
+  // batched value/policy-mode games run by MultiSelfPlayGames).
+  static bool IsDagRequested(const OptionsDict& opts);
+
   // Starts the game and blocks until the game is finished.
   void Play(int white_threads, int black_threads, bool training,
             SyzygyTablebase* syzygy_tb, bool enable_resign = true);

@@ -279,6 +279,22 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
         "the "
         "opening book more than once.");
   }
+  // The batched value/policy-mode games run through MultiSelfPlayGames, which
+  // is hard-wired to the classic search and ignores --search-algorithm.  Refuse
+  // dag-preview here rather than silently run classic and invalidate the run.
+  if (multi_games_size_ > 0) {
+    for (int pl = 0; pl < 2; ++pl) {
+      for (int color = 0; color < 2; ++color) {
+        if (SelfPlayGame::IsDagRequested(player_options_[pl][color])) {
+          throw Exception(
+              "--search-algorithm=dag-preview is not supported with "
+              "--value-mode-size / --policy-mode-size (those run the classic "
+              "batched value/policy path). Use normal selfplay games (drop "
+              "value/policy-mode-size) to exercise dag-preview.");
+        }
+      }
+    }
+  }
   // If playing just one game, the player1 is white, otherwise randomize.
   if (kTotalGames != 1) {
     first_game_black_ = Random::Get().GetBool();

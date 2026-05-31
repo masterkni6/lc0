@@ -88,6 +88,10 @@ void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
   options->Add<ChoiceOption>(kSearchAlgorithmId, search_algorithms) = "classic";
 }
 
+bool SelfPlayGame::IsDagRequested(const OptionsDict& opts) {
+  return opts.Get<std::string>(kSearchAlgorithmId) == "dag-preview";
+}
+
 SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
                            bool shared_tree, const Opening& opening)
     : options_{white, black},
@@ -651,15 +655,15 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                               bool training, SyzygyTablebase* syzygy_tb,
                               bool enable_resign) {
   // ── Scope guards ──
-  // External opponent/advisor engines aren't wired for the dag tree yet, so
-  // refuse rather than silently produce wrong/no data.
+  // An external OPPONENT (a non-lc0 engine that plays a side's moves) is not
+  // wired for the dag path — PlayPerSide has no opponent-move branch like
+  // Play() — so refuse it.  The ADVISOR engine (which only biases lc0's own
+  // search via forced root visits) IS supported below for dag sides.
   if (!options_[0].external_engine_path.empty() ||
-      !options_[1].external_engine_path.empty() ||
-      !options_[0].advisor_engine_path.empty() ||
-      !options_[1].advisor_engine_path.empty()) {
+      !options_[1].external_engine_path.empty()) {
     throw Exception(
-        "dag-preview selfplay does not support external opponent/advisor "
-        "engines yet. Use --search-algorithm=classic for those.");
+        "dag-preview selfplay does not support an external opponent engine "
+        "yet. Use --search-algorithm=classic for that.");
   }
   // PlayPerSide writes the raw root visit-count distribution as the policy
   // target for BOTH branches (see capture_training below) — it does not port
@@ -797,6 +801,59 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     classic::Eval best_eval{};    // root eval, no temperature.
     classic::Eval played_eval{};  // == best_eval until the played edge found.
 
+    // ─── Optional: consult advisor engine (e.g. Stockfish) ───
+    // Mirrors the classic Play() advisor path: query the configured advisor for
+    // a move, then force advisor_min_visits onto it at the root.  Works whether
+    // the to-move side uses dag or classic (both Search types have
+    // SetAdvisorMove).  Best-effort: spawn/query failure logs and proceeds
+    // without the advisor (no adjudication).
+    Move advisor_move;
+    bool has_advisor_move = false;
+    if (!options_[idx].advisor_engine_path.empty() &&
+        options_[idx].advisor_min_visits > 0) {
+      const bool is_frc_position = chess960_;
+      if (!advisor_engines_[idx]) {
+        try {
+          advisor_engines_[idx] = std::make_unique<ExternalEngine>(
+              options_[idx].advisor_engine_path,
+              options_[idx].advisor_engine_args,
+              options_[idx].advisor_engine_uci_options,
+              options_[idx].advisor_engine_go_command,
+              /*chess960=*/is_frc_position);
+        } catch (const Exception& e) {
+          CERR << "Advisor engine spawn failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — continuing without advisor for the rest of this game.";
+        }
+      }
+      if (advisor_engines_[idx]) {
+        try {
+          const std::vector<Move> played_moves = GetMoves();
+          std::vector<std::string> moves_uci;
+          moves_uci.reserve(played_moves.size());
+          for (const Move& m : played_moves) {
+            moves_uci.push_back(m.ToString(is_frc_position));
+          }
+          std::string uci_move =
+              advisor_engines_[idx]->GetMove(orig_fen_, moves_uci);
+          // Parse against the to-move side's board (dag- or classic-typed);
+          // both expose the same PositionHistory/ChessBoard API.
+          const ChessBoard& board =
+              (side_uses_dag_[idx] ? dag_tree_[idx]->GetPositionHistory()
+                                   : tree_[idx]->GetPositionHistory())
+                  .Last()
+                  .GetBoard();
+          advisor_move = board.ParseMove(uci_move);
+          has_advisor_move = true;
+        } catch (const Exception& e) {
+          CERR << "Advisor engine query failed on side "
+               << (blacks_move ? "B" : "W") << ": " << e.what()
+               << " — skipping advisor for this move.";
+          advisor_engines_[idx].reset();
+        }
+      }
+    }
+
     if (side_uses_dag_[idx]) {
       // ── dag-preview side ──
       {
@@ -815,6 +872,12 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
             /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
             std::move(stoppers), /* infinite */ false, /* ponder */ false,
             *options_[idx].uci_options, tt, syzygy_tb);
+        // Inject advisor move before workers start (set-once, read-only
+        // during search), mirroring classic Play().
+        if (has_advisor_move) {
+          dag_search_->SetAdvisorMove(advisor_move,
+                                      options_[idx].advisor_min_visits);
+        }
       }
       dag_search_->RunBlocking(threads);
       move_count_++;
@@ -856,11 +919,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
         }
         dag_search_->ResetBestMove();
       }
-      if (training) {
-        capture_training(idx, *dag_tree_[idx], *dag_search_, best_move,
-                         best_is_terminal, best_eval, played_eval, move);
-      }
-      dag_search_.reset();
+      // NB: training capture + search reset happen in the shared block below,
+      // AFTER the resign decision — so a resign-adjudicated position is not
+      // written as a chunk (matching classic Play()'s ordering).
     } else {
       // ── classic side ──
       {
@@ -877,6 +938,12 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
             /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
             std::move(stoppers), /* infinite */ false, /* ponder */ false,
             *options_[idx].uci_options, syzygy_tb);
+        // Inject advisor move before workers start (mirrors classic Play());
+        // a classic side inside a mixed dag/classic game gets advisor too.
+        if (has_advisor_move) {
+          search_->SetAdvisorMove(advisor_move,
+                                  options_[idx].advisor_min_visits);
+        }
       }
       search_->RunBlocking(threads);
       move_count_++;
@@ -917,11 +984,8 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
         }
         search_->ResetBestMove();
       }
-      if (training) {
-        capture_training(idx, *tree_[idx], *search_, best_move,
-                         best_is_terminal, best_eval, played_eval, move);
-      }
-      search_.reset();
+      // NB: training capture + search reset happen in the shared block below,
+      // AFTER the resign decision (matching classic Play()'s ordering).
     }
 
     // ── shared post-search: eval tracking + resign + advance ──
@@ -967,6 +1031,26 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           break;
         }
       }
+    }
+
+    // Capture the training chunk for this position AFTER the resign decision
+    // (so a resign-adjudicated position is not written — matching classic
+    // Play()), while the search is still alive (it holds the root node + edges
+    // capture_training reads).  Then reset the search before mutating the tree
+    // (the search references the tree; MakeMove restructures it).
+    if (training) {
+      if (side_uses_dag_[idx]) {
+        capture_training(idx, *dag_tree_[idx], *dag_search_, best_move,
+                         best_is_terminal, best_eval, played_eval, move);
+      } else {
+        capture_training(idx, *tree_[idx], *search_, best_move,
+                         best_is_terminal, best_eval, played_eval, move);
+      }
+    }
+    if (side_uses_dag_[idx]) {
+      dag_search_.reset();
+    } else {
+      search_.reset();
     }
 
     // Advance every tree with the played move (board frame → internal).
