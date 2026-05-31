@@ -1217,15 +1217,29 @@ class CudaNetwork : public Network {
                           scratch_mem, scratch_size_, nullptr, cublas,
                           compute_stream);  // pol FC  // POLICY
     }
-    ReportCUDAErrors(cudaEventRecord(io->policy_done_event_, compute_stream));
-    ReportCUDAErrors(
-        cudaStreamWaitEvent(download_stream, io->policy_done_event_, 0));
+    // When a GPU-side blend is active, the blend kernel below OVERWRITES
+    // op_policy_mem_gpu_ (the vanilla slot) on compute_stream *after* the
+    // vanilla policy map.  If we copied the vanilla slot to host here —
+    // gated only on policy_done_event_ (recorded before the optimistic
+    // chain + blend) — the copy would (a) race the blend kernel's write
+    // across streams, and (b) capture PRE-blend vanilla logits, so the
+    // blend's effect on the vanilla slot would never reach the host.
+    // Defer the vanilla copy to after the blend in that case (see the
+    // matching block below).  When no blend overwrites the vanilla slot,
+    // copy eagerly here so the D2H transfer overlaps the optimistic chain.
+    const bool gpu_blend_active =
+        has_optimistic_policy_ && gpu_blend_alpha_ > 0.0f;
+    if (!gpu_blend_active) {
+      ReportCUDAErrors(cudaEventRecord(io->policy_done_event_, compute_stream));
+      ReportCUDAErrors(
+          cudaStreamWaitEvent(download_stream, io->policy_done_event_, 0));
 
-    // Copy policy output from device memory to host memory.
-    ReportCUDAErrors(cudaMemcpyAsync(
-        io->op_policy_mem_, io->op_policy_mem_gpu_,
-        sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
-        cudaMemcpyDeviceToHost, download_stream));
+      // Copy policy output from device memory to host memory.
+      ReportCUDAErrors(cudaMemcpyAsync(
+          io->op_policy_mem_, io->op_policy_mem_gpu_,
+          sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
+          cudaMemcpyDeviceToHost, download_stream));
+    }
 
     // Optimistic policy head — runs on compute_stream right after the
     // vanilla policy chain, reads the SAME encoder output (`flow`)
@@ -1304,6 +1318,23 @@ class CudaNetwork : public Network {
             (const DataType*)io->op_policy_mem_gpu_,  // input vanilla
             (const DataType*)io->op_policy_opt_mem_gpu_, gpu_blend_alpha_,
             compute_stream);
+      }
+      // Deferred vanilla copy (see the gpu_blend_active comment above the
+      // optimistic chain).  Now that the blend kernel has written its
+      // result into op_policy_mem_gpu_ on compute_stream, record the
+      // policy_done_event_ AFTER the blend and copy the (blended) vanilla
+      // slot to host.  This is the copy that was skipped earlier so it
+      // wouldn't race the blend / capture pre-blend vanilla.  Only the
+      // gpu_blend_active path reaches here with the early copy skipped.
+      if (gpu_blend_active) {
+        ReportCUDAErrors(
+            cudaEventRecord(io->policy_done_event_, compute_stream));
+        ReportCUDAErrors(
+            cudaStreamWaitEvent(download_stream, io->policy_done_event_, 0));
+        ReportCUDAErrors(cudaMemcpyAsync(
+            io->op_policy_mem_, io->op_policy_mem_gpu_,
+            sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
+            cudaMemcpyDeviceToHost, download_stream));
       }
       if (io->op_policy_opt_mem_ != nullptr) {
         // Host buffer was allocated → CPU pipeline expects the
