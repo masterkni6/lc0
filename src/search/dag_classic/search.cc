@@ -2282,6 +2282,10 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   } else {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
+    // A force-missed root gets a PRIVATE LowNode: the backup must not insert it
+    // into (or dedupe it against) the shared TT, else the existing internal-alpha
+    // entry would be re-attached and the root-alpha blend lost (see backup).
+    picked_node.private_low_node = force_root_miss;
     picked_node.eval->p.resize(legal_moves.size());
     // Request the optimistic policy head when the blend is enabled at either
     // depth class, so the backend fills eval->p_optimistic (FetchSingleNodeResult
@@ -2498,19 +2502,29 @@ void SearchWorker::DoBackupUpdateSingleNode(
   auto path = node_to_process.path;
 
   if (node_to_process.nn_queried) {
-    auto [tt_iter, is_tt_miss] = search_->tt_->try_emplace(
-        node_to_process.hash, node_to_process.tt_low_node);
-    if (is_tt_miss) {
-      assert(!tt_iter->second.expired());
+    if (node_to_process.private_low_node) {
+      // Force-missed root (split optimistic blend): attach its PRIVATE LowNode
+      // directly — do NOT insert into or dedupe against the shared TT.  Without
+      // this, try_emplace would find the position's existing internal-alpha
+      // entry and re-attach THAT (dropping the root's root-alpha blend + noise),
+      // defeating the force-miss.  Leaving the root out of the TT also keeps
+      // internal transpositions to this position on the internal alpha.
       node_to_process.node->SetLowNode(node_to_process.tt_low_node);
     } else {
-      auto tt_low_node = tt_iter->second.lock();
-      if (!tt_low_node) {
-        tt_iter->second = node_to_process.tt_low_node;
+      auto [tt_iter, is_tt_miss] = search_->tt_->try_emplace(
+          node_to_process.hash, node_to_process.tt_low_node);
+      if (is_tt_miss) {
+        assert(!tt_iter->second.expired());
         node_to_process.node->SetLowNode(node_to_process.tt_low_node);
       } else {
-        assert(!tt_iter->second.expired());
-        node_to_process.node->SetLowNode(tt_low_node);
+        auto tt_low_node = tt_iter->second.lock();
+        if (!tt_low_node) {
+          tt_iter->second = node_to_process.tt_low_node;
+          node_to_process.node->SetLowNode(node_to_process.tt_low_node);
+        } else {
+          assert(!tt_iter->second.expired());
+          node_to_process.node->SetLowNode(tt_low_node);
+        }
       }
     }
   } else if (node_to_process.is_tt_hit) {

@@ -360,6 +360,12 @@ class SearchWorker {
     bool is_tt_hit = false;
     bool is_cache_hit = false;
     bool is_collision = false;
+    // This node's LowNode is PRIVATE: it must not be looked up in or inserted
+    // into the shared transposition table.  Set for the force-missed root in
+    // split optimistic-blend mode, so the root keeps its own root-alpha blend
+    // (and noise) instead of sharing/being-deduped-onto the position's
+    // internal-alpha LowNode.  See ExtendNode / DoBackupUpdateSingleNode.
+    bool private_low_node = false;
 
     // Details that are filled in as we go.
     uint64_t hash;
