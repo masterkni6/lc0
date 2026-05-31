@@ -1002,6 +1002,23 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   // Root is at even depth.
   const float draw_score = GetDrawScore(/* is_odd_depth= */ false);
 
+  // KataGo recipe: when forced exploration / advisor forcing is active, sample
+  // the played move on PRUNED visit counts (the same KataGo equilibrium clamp
+  // used for the training target), not raw N — otherwise the advisor's forced
+  // visits inflate that move's temperature weight at play-selection and
+  // selfplay over-plays it.  GetTrainingTargetVisits() returns raw N on its
+  // fast path, so this is a clean no-op when nothing forced visits.  Mirrors
+  // classic; on dag the forced-exploration factor is inert (advisor_min_visits_
+  // is the live trigger).  pruned_visits is aligned with root_node_->Edges()
+  // iteration order, so idx must advance for EVERY edge, including filtered.
+  const bool any_force = params_.GetForcedExplorationFactor() > 0.0f ||
+                         advisor_min_visits_ > 0;
+  std::vector<float> pruned_visits;
+  if (any_force) pruned_visits = GetTrainingTargetVisits();
+  auto effective_n = [&](int i, const EdgeAndNode& edge) -> float {
+    return any_force ? pruned_visits[i] : static_cast<float>(edge.GetN());
+  };
+
   std::vector<float> cumulative_sums;
   float sum = 0.0;
   float max_n = 0.0;
@@ -1010,40 +1027,49 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   const float fpu =
       GetFpu(params_, root_node_, /* is_root= */ true, draw_score);
 
+  int idx = 0;
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
         std::find(root_move_filter_.begin(), root_move_filter_.end(),
                   edge.GetMove()) == root_move_filter_.end()) {
+      ++idx;
       continue;
     }
-    if (edge.GetN() + offset > max_n) {
-      max_n = edge.GetN() + offset;
+    const float n_eff = effective_n(idx, edge) + offset;
+    if (n_eff > max_n) {
+      max_n = n_eff;
       max_eval = edge.GetQ(fpu, draw_score);
     }
+    ++idx;
   }
 
   // TODO(crem) Simplify this code when samplers.h is merged.
   const float min_eval =
       max_eval - params_.GetTemperatureWinpctCutoff() / 50.0f;
+  idx = 0;
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
         std::find(root_move_filter_.begin(), root_move_filter_.end(),
                   edge.GetMove()) == root_move_filter_.end()) {
+      ++idx;
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
+    if (edge.GetQ(fpu, draw_score) < min_eval) {
+      ++idx;
+      continue;
+    }
     sum += std::pow(
-        std::max(0.0f,
-                 (max_n <= 0.0f
-                      ? edge.GetP()
-                      : ((static_cast<float>(edge.GetN()) + offset) / max_n))),
+        std::max(0.0f, (max_n <= 0.0f
+                            ? edge.GetP()
+                            : ((effective_n(idx, edge) + offset) / max_n))),
         1 / temperature);
     cumulative_sums.push_back(sum);
+    ++idx;
   }
   assert(sum);
 
   const float toss = Random::Get().GetFloat(cumulative_sums.back());
-  int idx =
+  int select =
       std::lower_bound(cumulative_sums.begin(), cumulative_sums.end(), toss) -
       cumulative_sums.begin();
 
@@ -1054,7 +1080,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
       continue;
     }
     if (edge.GetQ(fpu, draw_score) < min_eval) continue;
-    if (idx-- == 0) return edge;
+    if (select-- == 0) return edge;
   }
   assert(false);
   return {};
@@ -2230,7 +2256,20 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   // Check the transposition table first and NN cache second before asking for
   // NN evaluation.
   picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
-  auto tt_iter = search_->tt_->find(picked_node.hash);
+  // Force the root to MISS the transposition table when root Dirichlet noise is
+  // enabled.  A TT hit reuses a previously-evaluated LowNode and never runs the
+  // noise application (FetchSingleNodeResult only noises on a fresh NN eval),
+  // which would silently drop the configured root exploration in selfplay
+  // (dag's per-game TT can keep the just-played position live across the move).
+  // Re-evaluating the root — one extra NN eval per move — guarantees fresh noise
+  // every search, matching classic.  No effect when noise is off (e.g. strength
+  // tests / pure value games), so the TT still serves the root there.  (Minor:
+  // the fresh noised root LowNode may enter the TT, so a rare transposition back
+  // to the exact root position would see noised priors — negligible.)
+  const bool force_root_miss =
+      params_.GetNoiseEpsilon() > 0.0f && node == search_->root_node_;
+  auto tt_iter = force_root_miss ? search_->tt_->end()
+                                 : search_->tt_->find(picked_node.hash);
   // Transposition table entry might be expired.
   if (tt_iter != search_->tt_->end()) {
     picked_node.tt_low_node = tt_iter->second.lock();
@@ -2242,6 +2281,13 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
     picked_node.eval->p.resize(legal_moves.size());
+    // Request the optimistic policy head when the blend is enabled at either
+    // depth class, so the backend fills eval->p_optimistic (FetchSingleNodeResult
+    // blends it in).  Mirrors classic; no-op (empty span) when both weights are 0.
+    if (params_.GetOptimisticPolicyWeight() > 0.0f ||
+        params_.GetOptimisticPolicyWeightInternal() > 0.0f) {
+      picked_node.eval->p_optimistic.resize(legal_moves.size());
+    }
     picked_node.is_cache_hit = computation_->AddInput(
                                    EvalPosition{
                                        .pos = history.GetPositions(),
@@ -2290,10 +2336,55 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   };
   wdl_rescale();
   node_to_process->tt_low_node->SetNNEval(node_to_process->eval.get());
+
+  // Optimistic-policy blend (KataGo v1.13-style; also the consumer of the
+  // split gpu_blend's two policies).  Overwrite the just-set vanilla priors
+  // with the per-node blend BEFORE SortEdges, so the sort and Dirichlet noise
+  // operate on the blended priors (matches classic's "blend then noise"
+  // order).  alpha is selected by depth class: --optimistic-policy-weight at
+  // the root, --optimistic-policy-weight-internal elsewhere.  No-op when the
+  // weight is 0 or the backend didn't expose p_optimistic.  Caveat: this runs
+  // only on a TT miss (nn_queried), so a LowNode reached as both root and
+  // internal via transposition keeps its first-touch alpha — acceptable, and
+  // exact for the common case where the root is freshly evaluated each move.
+  Node* node = node_to_process->node;
+  {
+    const float opt_alpha = (node == search_->root_node_)
+                                ? params_.GetOptimisticPolicyWeight()
+                                : params_.GetOptimisticPolicyWeightInternal();
+    const EvalResult& eval = *node_to_process->eval;
+    if (opt_alpha > 0.0f && !eval.p_optimistic.empty() &&
+        eval.p_optimistic.size() == eval.p.size()) {
+      Edge* edges = node_to_process->tt_low_node->GetEdges();
+      const int ne = node_to_process->tt_low_node->GetNumEdges();
+      if (opt_alpha >= 1.0f) {
+        // Fast path: pure optimistic (byte-identical to policy_head=optimistic).
+        for (int i = 0; i < ne; i++) edges[i].SetP(eval.p_optimistic[i]);
+      } else {
+        // Geometric blend p_main^(1-a) * p_opt^a, renormalized.
+        const float one_minus_a = 1.0f - opt_alpha;
+        constexpr float kFloor = 1e-30f;
+        thread_local std::vector<float> blended;
+        blended.clear();
+        double sum = 0.0;
+        for (int i = 0; i < ne; i++) {
+          const float b =
+              std::pow(std::max(eval.p[i], kFloor), one_minus_a) *
+              std::pow(std::max(eval.p_optimistic[i], kFloor), opt_alpha);
+          blended.push_back(b);
+          sum += b;
+        }
+        if (sum > 0.0) {
+          const float renorm = static_cast<float>(1.0 / sum);
+          for (int i = 0; i < ne; i++) edges[i].SetP(blended[i] * renorm);
+        }
+        // sum==0 is impossible given kFloor; if it ever happened the vanilla
+        // priors from SetNNEval remain, which is a safe fallback.
+      }
+    }
+  }
   node_to_process->tt_low_node->SortEdges();
 
-  // Add NN results to node.
-  Node* node = node_to_process->node;
   // Add Dirichlet noise if enabled and at root.
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
     ApplyDirichletNoise(node_to_process->tt_low_node.get(),
