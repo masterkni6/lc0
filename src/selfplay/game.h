@@ -136,36 +136,41 @@ class SelfPlayGame {
   uint64_t nodes_total_ = 0;
 
  private:
-  // Stage-1 dag-preview selfplay (move generation only; training data with
-  // dag is Stage 2 and currently throws).  When use_dag_search_ is true the
-  // game runs through PlayDag() using the dag_classic:: search/tree types
-  // instead of the classic ones; the classic Play() path is left untouched.
-  void PlayDag(int white_threads, int black_threads, bool training,
-               SyzygyTablebase* syzygy_tb, bool enable_resign);
+  // Per-side search-algorithm support.  Each side (white = index 0, black =
+  // index 1) independently chooses "classic" or "dag-preview" via its
+  // player's --search-algorithm option, so a single game can pit dag on one
+  // side against classic on the other (the point of testing dag).  When
+  // EITHER side uses dag the game runs through PlayPerSide(); when both sides
+  // are classic the original Play() path runs untouched.
+  //
+  // Stage 1 scope: move generation only.  PlayPerSide throws if --training is
+  // set or an external opponent/advisor is configured for a dag side (dag
+  // training-data extraction is Stage 2).
+  void PlayPerSide(int white_threads, int black_threads, bool training,
+                   SyzygyTablebase* syzygy_tb, bool enable_resign);
 
   // options_[0] is for white player, [1] for black.
   PlayerOptions options_[2];
   // Node tree for player1 and player2. If the tree is shared between players,
-  // tree_[0] == tree_[1].
+  // tree_[0] == tree_[1].  For a side that uses dag-preview, the classic
+  // tree_[s] is null and dag_tree_[s] is used instead.
   std::shared_ptr<classic::NodeTree> tree_[2];
   std::string orig_fen_;
   int start_ply_;
 
-  // ── dag-preview path (parallel to the classic members above) ──
-  // Selected at construction from the "search-algorithm" option.  When true,
-  // the dag_* members below are populated/used instead of the classic ones.
-  bool use_dag_search_ = false;
-  // Whether the two players share one tree (training games).  Needed by the
-  // dag path to decide whether to share one transposition table too.
-  bool shared_tree_ = false;
-  // dag node trees, mirroring tree_[2].
+  // ── per-side dag-preview state (parallel to the classic tree_/search_) ──
+  // side_uses_dag_[s] selects the engine for side s.  separate_trees_ is true
+  // when the two sides keep distinct trees (always so when the sides differ
+  // in engine; also when shared_tree was not requested).
+  bool side_uses_dag_[2] = {false, false};
+  bool separate_trees_ = true;
+  // dag node trees, mirroring tree_[2] (only built for dag sides).
   std::shared_ptr<dag_classic::NodeTree> dag_tree_[2];
-  // Per-tree transposition table (holds weak refs to the tree's low nodes,
-  // so its lifetime is tied to the tree).  When shared_tree_, both players
-  // use dag_tt_[0].
+  // Per-tree transposition table (holds weak refs to the tree's low nodes, so
+  // its lifetime is tied to the tree).  Only used for dag sides.
   dag_classic::TranspositionTable dag_tt_[2];
   // dag search in progress (Abort() stops whichever of search_/dag_search_
-  // is active).
+  // is active).  Declared after dag_tree_/dag_tt_ so it destructs first.
   std::unique_ptr<dag_classic::Search> dag_search_;
 
   // Search that is currently in progress. Stored in members so that Abort()
