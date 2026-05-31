@@ -2256,7 +2256,22 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   // Check the transposition table first and NN cache second before asking for
   // NN evaluation.
   picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
-  auto tt_iter = search_->tt_->find(picked_node.hash);
+  // Split optimistic-policy blend: the root must use --optimistic-policy-weight,
+  // but the shared per-game TT would hand back the just-played position's
+  // LowNode — which was evaluated as an INTERNAL node last move (and last move
+  // for the other side), i.e. blended at --optimistic-policy-weight-internal.
+  // Only the blended priors are stored, so it can't be re-blended to the root
+  // alpha.  When the two alphas differ, force the root to MISS the TT so it is
+  // freshly evaluated and gets the correct root-alpha blend (and fresh root
+  // noise) via the eval path below.  Costs ~1 root NN eval/move; no effect when
+  // the alphas are equal (uniform blend / off), where TT reuse is already
+  // correct.  Internal nodes are never force-missed and keep full TT reuse.
+  const bool force_root_miss =
+      node == search_->root_node_ &&
+      params_.GetOptimisticPolicyWeight() !=
+          params_.GetOptimisticPolicyWeightInternal();
+  auto tt_iter = force_root_miss ? search_->tt_->end()
+                                 : search_->tt_->find(picked_node.hash);
   // Transposition table entry might be expired.
   if (tt_iter != search_->tt_->end()) {
     picked_node.tt_low_node = tt_iter->second.lock();
@@ -2349,10 +2364,12 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   // operate on the blended priors (matches classic's "blend then noise"
   // order).  alpha is selected by depth class: --optimistic-policy-weight at
   // the root, --optimistic-policy-weight-internal elsewhere.  No-op when the
-  // weight is 0 or the backend didn't expose p_optimistic.  Caveat: this runs
-  // only on a TT miss (nn_queried), so a LowNode reached as both root and
-  // internal via transposition keeps its first-touch alpha — acceptable, and
-  // exact for the common case where the root is freshly evaluated each move.
+  // weight is 0 or the backend didn't expose p_optimistic.  Runs on a fresh
+  // eval (nn_queried); in split mode (root alpha != internal) ExtendNode
+  // force-misses the root, so it's freshly evaluated here and gets the root
+  // alpha — otherwise it would reuse the just-played position's internal-alpha
+  // LowNode from the shared TT.  Internal nodes reached via transposition all
+  // share the single internal alpha, so there's no per-node alpha ambiguity.
   {
     const float opt_alpha = (node == search_->root_node_)
                                 ? params_.GetOptimisticPolicyWeight()
