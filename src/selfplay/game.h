@@ -99,6 +99,12 @@ struct PlayerOptions {
   // advisor's choice meaningful exploration weight without dominating
   // the search.  0 disables advisor mode for this side.
   int advisor_min_visits = 0;
+  // Probability of PLAYING the advisor's move (vs the temperature-sampled move)
+  // at a turn where the advisor was consulted.  0 = never force-play (advisor
+  // only forces search visits; conservative default).  >0 injects the advisor's
+  // move so the net learns its OUTCOME via the value head; the policy target is
+  // unaffected (stays PTP-clean).  Gated on temp-cutoff-move (no endgame inject).
+  float advisor_force_play_prob = 0.0f;
 };
 
 // Plays a single game vs itself.

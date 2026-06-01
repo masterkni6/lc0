@@ -144,6 +144,14 @@ const OptionId kAdvisorGoCommandId{
     "Argument string appended after 'go' on every advisor query, e.g. "
     "'movetime 100', 'nodes 100000'.  Lower = faster selfplay throughput; "
     "higher = stronger advisor recommendations."};
+const OptionId kAdvisorForcePlayId{
+    "advisor-force-play-prob", "AdvisorForcePlayProb",
+    "Probability of PLAYING the advisor's move (instead of the temperature-"
+    "sampled move) at an lc0-side turn where the advisor was consulted.  0 = "
+    "never force-play (the advisor only forces search visits — the conservative "
+    "default).  >0 injects the advisor's move into the game so the net learns "
+    "its outcome via the value head; the policy target is unaffected (stays "
+    "PTP-clean).  Gated on temp-cutoff-move (not applied in the greedy endgame)."};
 const OptionId kAdvisorMinVisitsId{
     "advisor-min-visits", "AdvisorMinVisits",
     "Number of root MCTS visits to force on the advisor's move at every "
@@ -206,6 +214,7 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<StringOption>(kAdvisorUciOptionsId) = "";
   options->Add<StringOption>(kAdvisorGoCommandId) = "movetime 100";
   options->Add<IntOption>(kAdvisorMinVisitsId, 0, 100000) = 0;
+  options->Add<FloatOption>(kAdvisorForcePlayId, 0.0f, 1.0f) = 0.0f;
   std::vector<std::string> opponent_sides = {"none", "white", "black",
                                               "alternate"};
   options->Add<ChoiceOption>(kOpponentSideId, opponent_sides) = "none";
@@ -595,6 +604,7 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     PlayerOptions& opt = options[color];
     opt.advisor_engine_path = advisor_path;
     opt.advisor_min_visits = advisor_min_visits;
+    opt.advisor_force_play_prob = dict.Get<float>(kAdvisorForcePlayId);
     opt.advisor_engine_go_command =
         dict.Get<std::string>(kAdvisorGoCommandId);
 

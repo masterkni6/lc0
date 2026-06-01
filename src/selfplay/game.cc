@@ -1047,6 +1047,49 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       // AFTER the resign decision (matching classic Play()'s ordering).
     }
 
+    // ── Optional: force-play the advisor's move (probabilistic SF injection) ──
+    // With probability advisor_force_play_prob, PLAY the advisor's move instead
+    // of the temperature-sampled `move`, so the game explores the advisor's line
+    // and the net learns it from the OUTCOME (value head).  The policy target is
+    // left untouched — it is the PTP-clean visit distribution, independent of
+    // which move is played — so the advisor's move is taught via value, never
+    // inflated into a one-hot policy.  Gated on the temperature schedule: not
+    // applied at/after temp-cutoff-move (the greedy endgame, where we want clean
+    // play).  played_eval is recomputed from the advisor edge so the recorded
+    // played_q/d/m match the move actually played.  No-op if the advisor edge
+    // can't be found (it always can — the advisor's move is a legal root edge).
+    if (has_advisor_move && options_[idx].advisor_force_play_prob > 0.0f) {
+      const int mv_no = ref_history().GetLength() / 2 + 1;
+      const int temp_cutoff =
+          classic::SearchParams(*options_[idx].uci_options)
+              .GetTemperatureCutoffMove();
+      const bool past_cutoff = temp_cutoff > 0 && mv_no >= temp_cutoff;
+      if (!past_cutoff && Random::Get().GetFloat(1.0f) <
+                              options_[idx].advisor_force_play_prob) {
+        // Adopt the advisor edge as the played move in the SAME board frame
+        // GetBestMove() returns: match advisor_move in storage frame
+        // (GetMove(false)), then express the played move as GetMove(black).
+        auto force_to_advisor = [&](auto* tree) {
+          auto node = tree->GetCurrentHead();
+          const bool black = tree->IsBlackToMove();
+          for (auto& edge : node->Edges()) {
+            if (edge.GetMove(false) == advisor_move) {
+              move = edge.GetMove(black);
+              played_eval.wl = edge.GetWL(-node->GetWL());
+              played_eval.d = edge.GetD(node->GetD());
+              played_eval.ml = edge.GetM(node->GetM() - 1) + 1;
+              return;
+            }
+          }
+        };
+        if (side_uses_dag_[idx]) {
+          force_to_advisor(dag_tree_[idx].get());
+        } else {
+          force_to_advisor(tree_[idx].get());
+        }
+      }
+    }
+
     // ── shared post-search: eval tracking + resign + advance ──
     const float wl = best_eval.wl;
     const float d = best_eval.d;
