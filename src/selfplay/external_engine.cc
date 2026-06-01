@@ -75,13 +75,14 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
 // silently — lc0 and SF agree on the first N moves and disagree from
 // some point on, after which every SF move is unparseable for lc0.
 //
-// Root cause (likely, not yet confirmed):
-//   1. KQkq castling field is ambiguous in FRC when multiple rooks per
-//      side exist (e.g. RKRQBBNN — there are two rooks on each side of
-//      the white king).  lc0 walks outward from the king to find the
-//      nearest rook on each side; SF uses a different inference rule.
-//      First castling move silently moves a different rook in each
-//      engine's view → positions diverge.
+// Root cause:
+//   1. KQkq castling-field ambiguity in FRC — *** 3-agent audit (2026)
+//      DEBUNKED this as the cause. ***  lc0's find_rook (board.cc:1176)
+//      and FenWithShredderCastling() below BOTH select the OUTERMOST rook
+//      on each side (edge-inward scan) and AGREE on every DFRC position
+//      tested (incl. the RKRQBBNN multi-rook case).  So the Shredder
+//      rewrite (Step A) fully disambiguates KQkq for SF — provided it
+//      actually runs, which requires --chess960=true (see below).
 //   2. Castling move format mismatch: FRC castling can be UCI
 //      "king-takes-rook" (e1h1) or standard (e1g1).  lc0's
 //      Move::ToString(is_chess960=true) emits king-takes-rook; SF with
@@ -122,12 +123,17 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
 //   there are multiple rooks on the same side of the king.  Engines
 //   then have to *infer* the castling rook positions, and they don't
 //   all use the same inference rule:
-//     - lc0: uses the rook nearest the king on each side.
-//     - Stockfish: scans outward from king but with quirks around
-//       positions like RKRQBBNN where there's no h1 rook at all.
-//   Result: lc0 and SF disagree on castling rights → SF eventually
-//   returns a castling move from a position where lc0 has no king,
-//   we get the "no piece to move" parse error.
+//     - lc0: find_rook (board.cc) scans EDGE-INWARD and uses the
+//       OUTERMOST rook on each side.  This rewrite uses the identical
+//       rule, so the file letters it emits match lc0's own castling-rook
+//       identity — lc0 and SF then agree.  (An earlier note here claimed
+//       lc0 uses "the rook nearest the king"; that was incorrect.)
+//   With the rewrite on AND --chess960=true (which is what gates the
+//   rewrite, the UCI_Chess960 setoption, and king-takes-rook move
+//   encoding), the FEN/flag/format path is consistent.  The residual
+//   divergence risk is ChessBoard::ParseMove's standard-form castling
+//   fallback (board.cc ~1348), which substitutes lc0's own inferred rook
+//   if SF ever emits non-king-takes-rook castling.
 //
 // Fix: emit explicit rook files so both engines agree.  Scan the back
 // ranks for the actual rook positions on each side of the king and
