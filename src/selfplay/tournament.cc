@@ -152,6 +152,18 @@ const OptionId kAdvisorForcePlayId{
     "default).  >0 injects the advisor's move into the game so the net learns "
     "its outcome via the value head; the policy target is unaffected (stays "
     "PTP-clean).  Gated on temp-cutoff-move (not applied in the greedy endgame)."};
+const OptionId kAdvisorForcePlayMatesId{
+    "advisor-force-play-mates", "AdvisorForcePlayMates",
+    "When on, always force-play (and play out, suppressing resign) a move the "
+    "advisor reports as a forced mate for the side to move — regardless of "
+    "advisor-force-play-prob and the temperature cutoff.  A reported mate is "
+    "guaranteed correct, so this injects deep mating lines the low-visit search "
+    "can't see.  Default on; only takes effect when the advisor is configured."};
+const OptionId kAdvisorForcePlayDisagreeId{
+    "advisor-force-play-on-disagree", "AdvisorForcePlayOnDisagree",
+    "When on, probabilistic advisor force-play only fires if the advisor's move "
+    "differs from the net's own best move (inject only on genuine disagreement). "
+    "Mates ignore this gate.  Default off (force-play purely on probability)."};
 const OptionId kAdvisorMinVisitsId{
     "advisor-min-visits", "AdvisorMinVisits",
     "Number of root MCTS visits to force on the advisor's move at every "
@@ -215,6 +227,8 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<StringOption>(kAdvisorGoCommandId) = "movetime 100";
   options->Add<IntOption>(kAdvisorMinVisitsId, 0, 100000) = 0;
   options->Add<FloatOption>(kAdvisorForcePlayId, 0.0f, 1.0f) = 0.0f;
+  options->Add<BoolOption>(kAdvisorForcePlayMatesId) = true;
+  options->Add<BoolOption>(kAdvisorForcePlayDisagreeId) = false;
   std::vector<std::string> opponent_sides = {"none", "white", "black",
                                               "alternate"};
   options->Add<ChoiceOption>(kOpponentSideId, opponent_sides) = "none";
@@ -605,6 +619,9 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     opt.advisor_engine_path = advisor_path;
     opt.advisor_min_visits = advisor_min_visits;
     opt.advisor_force_play_prob = dict.Get<float>(kAdvisorForcePlayId);
+    opt.advisor_force_play_mates = dict.Get<bool>(kAdvisorForcePlayMatesId);
+    opt.advisor_force_play_on_disagree =
+        dict.Get<bool>(kAdvisorForcePlayDisagreeId);
     opt.advisor_engine_go_command =
         dict.Get<std::string>(kAdvisorGoCommandId);
 

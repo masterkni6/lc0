@@ -868,6 +868,7 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     // without the advisor (no adjudication).
     Move advisor_move;
     bool has_advisor_move = false;
+    bool advisor_is_mate = false;  // SF reports a forced mate for side to move
     if (!options_[idx].advisor_engine_path.empty() &&
         options_[idx].advisor_min_visits > 0) {
       const bool is_frc_position = chess960_;
@@ -893,8 +894,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           for (const Move& m : played_moves) {
             moves_uci.push_back(m.ToString(is_frc_position));
           }
-          std::string uci_move =
-              advisor_engines_[idx]->GetMove(orig_fen_, moves_uci);
+          AdvisorScore advisor_score;
+          std::string uci_move = advisor_engines_[idx]->GetMove(
+              orig_fen_, moves_uci, &advisor_score);
           // Parse against the to-move side's board (dag- or classic-typed);
           // both expose the same PositionHistory/ChessBoard API.
           const ChessBoard& board =
@@ -904,6 +906,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
                   .GetBoard();
           advisor_move = board.ParseMove(uci_move);
           has_advisor_move = true;
+          // SF found a forced mate for the side to move (score mate N, N>0).
+          advisor_is_mate = advisor_score.valid && advisor_score.is_mate &&
+                            advisor_score.mate_in > 0;
         } catch (const Exception& e) {
           CERR << "Advisor engine query failed on side "
                << (blacks_move ? "B" : "W") << ": " << e.what()
@@ -1047,34 +1052,50 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       // AFTER the resign decision (matching classic Play()'s ordering).
     }
 
-    // ── Optional: force-play the advisor's move (probabilistic SF injection) ──
-    // With probability advisor_force_play_prob, PLAY the advisor's move instead
-    // of the temperature-sampled `move`, so the game explores the advisor's line
-    // and the net learns it from the OUTCOME (value head).  The policy target is
-    // left untouched — it is the PTP-clean visit distribution, independent of
-    // which move is played — so the advisor's move is taught via value, never
-    // inflated into a one-hot policy.  Gated on the temperature schedule: not
-    // applied at/after temp-cutoff-move (the greedy endgame, where we want clean
-    // play).  played_eval is recomputed from the advisor edge so the recorded
-    // played_q/d/m match the move actually played.  No-op if the advisor edge
-    // can't be found (it always can — the advisor's move is a legal root edge).
-    if (has_advisor_move && options_[idx].advisor_force_play_prob > 0.0f) {
-      const int mv_no = ref_history().GetLength() / 2 + 1;
-      const int temp_cutoff =
-          classic::SearchParams(*options_[idx].uci_options)
-              .GetTemperatureCutoffMove();
-      const bool past_cutoff = temp_cutoff > 0 && mv_no >= temp_cutoff;
-      if (!past_cutoff && Random::Get().GetFloat(1.0f) <
-                              options_[idx].advisor_force_play_prob) {
-        // Adopt the advisor edge as the played move in the SAME board frame
-        // GetBestMove() returns: match advisor_move in storage frame
-        // (GetMove(false)), then express the played move as GetMove(black).
+    // ── Optional: force-play the advisor's move (SF injection) ──
+    // Two triggers:
+    //   • Forced MATE (advisor_is_mate + advisor-force-play-mates): always play
+    //     it, ignoring the probability AND the temperature cutoff, and set
+    //     playing_out_mate_ so resign is suppressed and the line is played to
+    //     checkmate.  A reported mate is guaranteed correct, so this injects
+    //     deep mating sequences the low-visit search can't see.
+    //   • Probabilistic (advisor-force-play-prob): with that probability, before
+    //     the temperature cutoff, play the advisor's move — optionally only when
+    //     it differs from the net's best move (advisor-force-play-on-disagree).
+    // Either way the POLICY TARGET is untouched (the PTP-clean visit
+    // distribution is independent of which move is played); the advisor's move
+    // is taught via value/outcome, never inflated into a one-hot policy.
+    // played_eval is recomputed from the advisor edge to match the played move.
+    if (has_advisor_move) {
+      bool do_force = false;
+      bool require_disagree = false;
+      if (advisor_is_mate && options_[idx].advisor_force_play_mates) {
+        do_force = true;
+        playing_out_mate_ = true;  // suppress resign so the mate plays out
+      } else if (options_[idx].advisor_force_play_prob > 0.0f) {
+        const int mv_no = ref_history().GetLength() / 2 + 1;
+        const int temp_cutoff = classic::SearchParams(*options_[idx].uci_options)
+                                    .GetTemperatureCutoffMove();
+        const bool past_cutoff = temp_cutoff > 0 && mv_no >= temp_cutoff;
+        if (!past_cutoff && Random::Get().GetFloat(1.0f) <
+                                options_[idx].advisor_force_play_prob) {
+          do_force = true;
+          require_disagree = options_[idx].advisor_force_play_on_disagree;
+        }
+      }
+      if (do_force) {
+        // Match the advisor edge in storage frame (GetMove(false)), then adopt
+        // it as the played move in board frame (GetMove(black)) — the same frame
+        // GetBestMove() / best_move use.  With require_disagree, skip when it
+        // equals the net's best move so we inject only genuine disagreements.
         auto force_to_advisor = [&](auto* tree) {
           auto node = tree->GetCurrentHead();
           const bool black = tree->IsBlackToMove();
           for (auto& edge : node->Edges()) {
             if (edge.GetMove(false) == advisor_move) {
-              move = edge.GetMove(black);
+              const Move advisor_board = edge.GetMove(black);
+              if (require_disagree && advisor_board == best_move) return;
+              move = advisor_board;
               played_eval.wl = edge.GetWL(-node->GetWL());
               played_eval.d = edge.GetD(node->GetD());
               played_eval.ml = edge.GetM(node->GetM() - 1) + 1;
@@ -1102,8 +1123,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     max_eval_[0] = std::max(max_eval_[0], blacks_move ? best_l : best_w);
     max_eval_[1] = std::max(max_eval_[1], best_d);
     max_eval_[2] = std::max(max_eval_[2], blacks_move ? best_w : best_l);
-    if (enable_resign && move_number >= options_[idx].uci_options->Get<int>(
-                                            kResignEarliestMoveId)) {
+    if (enable_resign && !playing_out_mate_ &&
+        move_number >= options_[idx].uci_options->Get<int>(
+                           kResignEarliestMoveId)) {
       const float resignpct =
           options_[idx].uci_options->Get<float>(kResignPercentageId) / 100;
       if (options_[idx].uci_options->Get<bool>(kResignWDLStyleId)) {

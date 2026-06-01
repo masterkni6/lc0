@@ -105,6 +105,17 @@ struct PlayerOptions {
   // move so the net learns its OUTCOME via the value head; the policy target is
   // unaffected (stays PTP-clean).  Gated on temp-cutoff-move (no endgame inject).
   float advisor_force_play_prob = 0.0f;
+  // Always force-play (and play out — resign is suppressed) a move the advisor
+  // reports as a forced MATE for the side to move, regardless of
+  // advisor_force_play_prob or the temperature cutoff.  A reported mate is
+  // guaranteed correct, so this injects deep mating lines the low-visit search
+  // can't see.  Default on.
+  bool advisor_force_play_mates = true;
+  // Disagreement gate (first cut): when true, probabilistic force-play only
+  // fires if the advisor's move differs from the net's own best move — inject
+  // only where the advisor actually disagrees, not where the net already agrees.
+  // Mates bypass this gate.
+  bool advisor_force_play_on_disagree = false;
 };
 
 // Plays a single game vs itself.
@@ -190,6 +201,10 @@ class SelfPlayGame {
   bool abort_ = false;
   GameResult game_result_ = GameResult::UNDECIDED;
   bool adjudicated_ = false;
+  // Set once the advisor reports a forced mate and we begin force-playing it;
+  // suppresses resign for the rest of the game (both sides) so the mate plays
+  // out to checkmate and the whole mating line is captured.
+  bool playing_out_mate_ = false;
   // Track minimum eval for each player so that GetWorstEvalForWinnerOrDraw()
   // can be calculated after end of game.
   float min_eval_[2] = {1.0f, 1.0f};

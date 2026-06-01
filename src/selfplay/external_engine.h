@@ -34,6 +34,16 @@
 
 namespace lczero {
 
+// The external engine's evaluation of the position it was queried about, from
+// the side-to-move's perspective.  Optionally filled by GetMove() from the last
+// `info ... score ...` line before `bestmove`.
+struct AdvisorScore {
+  bool valid = false;    // false if no `score` line was parsed
+  bool is_mate = false;  // true if the engine reported `score mate N`
+  int mate_in = 0;       // N from `score mate N` (>0 = side-to-move mates)
+  int score_cp = 0;      // X from `score cp X` (valid iff !is_mate)
+};
+
 // Drives an external UCI engine subprocess (e.g. Stockfish) used as an
 // opponent during selfplay. One instance per side per game; reused across
 // moves within a game (re-instantiated per game so engine state is reset).
@@ -73,8 +83,13 @@ class ExternalEngine {
   // moves_uci is non-empty), then `go <go_command>`, then read until the
   // engine emits `bestmove <uci>`.  Returns the UCI move string.  Throws
   // on subprocess failure or parse failure.
+  // If `score` is non-null it is filled with the engine's final reported
+  // evaluation (mate/cp, side-to-move POV), parsed from the last
+  // `info ... score ...` line before `bestmove`.  Used by the advisor to detect
+  // forced mates (and to support eval-disagreement gating).
   std::string GetMove(const std::string& fen,
-                      const std::vector<std::string>& moves_uci);
+                      const std::vector<std::string>& moves_uci,
+                      AdvisorScore* score = nullptr);
 
  private:
   // Spawn the subprocess and set up stdin/stdout pipes.  Throws on
@@ -98,9 +113,12 @@ class ExternalEngine {
   // user can confirm NNUE loaded.  During gameplay we keep it false
   // because SF re-emits the NNUE info string on every `go` command,
   // which would flood the log.
+  // If `last_score_line` is non-null, the most recent dropped line containing
+  // " score " is copied there (the engine's deepest eval before `bestmove`).
   std::string ReadUntilPrefix(const std::string& prefix,
                               std::chrono::milliseconds timeout,
-                              bool echo_dropped = false);
+                              bool echo_dropped = false,
+                              std::string* last_score_line = nullptr);
 
 #ifdef _WIN32
   // Placeholder fields so the class still compiles on Windows.  The

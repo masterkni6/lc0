@@ -516,7 +516,7 @@ std::string ExternalEngine::ReadLine(std::chrono::milliseconds timeout) {
 
 std::string ExternalEngine::ReadUntilPrefix(
     const std::string& prefix, std::chrono::milliseconds timeout,
-    bool echo_dropped) {
+    bool echo_dropped, std::string* last_score_line) {
   auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
     auto now = std::chrono::steady_clock::now();
@@ -527,6 +527,11 @@ std::string ExternalEngine::ReadUntilPrefix(
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
     std::string line = Trim(ReadLine(remaining));
     if (StartsWith(line, prefix)) return line;
+    // Remember the deepest eval line (overwritten each iteration → last wins).
+    if (last_score_line != nullptr &&
+        line.find(" score ") != std::string::npos) {
+      *last_score_line = line;
+    }
     // Only echo during handshake (echo_dropped=true).  During gameplay
     // SF emits the NNUE/Network-replica info strings on every `go`
     // command, plus per-iteration search progress — would flood the
@@ -539,7 +544,8 @@ std::string ExternalEngine::ReadUntilPrefix(
 }
 
 std::string ExternalEngine::GetMove(const std::string& fen,
-                                    const std::vector<std::string>& moves_uci) {
+                                    const std::vector<std::string>& moves_uci,
+                                    AdvisorScore* score) {
   // FEN rewriting for FRC/DFRC.
   //
   // History: this rewrite was originally added to disambiguate KQkq
@@ -592,13 +598,44 @@ std::string ExternalEngine::GetMove(const std::string& fen,
     }
   }
 
-  std::string line = ReadUntilPrefix("bestmove", search_timeout);
+  std::string score_line;
+  std::string line = ReadUntilPrefix("bestmove", search_timeout,
+                                     /*echo_dropped=*/false, &score_line);
   // line is like "bestmove e2e4" or "bestmove e7e8q ponder ...".
   std::istringstream iss(line);
   std::string token, mv;
   iss >> token >> mv;  // "bestmove", then the move
   if (mv.empty() || mv == "(none)" || mv == "0000") {
     throw Exception("ExternalEngine: no move from engine ('" + line + "')");
+  }
+  // Parse the captured eval line: "... score mate N ..." or "... score cp X ..."
+  // (UCI score is from the side-to-move's perspective).
+  if (score != nullptr && !score_line.empty()) {
+    std::istringstream sss(score_line);
+    std::string stok;
+    while (sss >> stok) {
+      if (stok == "score") {
+        std::string kind;
+        if (sss >> kind) {
+          if (kind == "mate") {
+            int n = 0;
+            if (sss >> n) {
+              score->valid = true;
+              score->is_mate = true;
+              score->mate_in = n;
+            }
+          } else if (kind == "cp") {
+            int cp = 0;
+            if (sss >> cp) {
+              score->valid = true;
+              score->is_mate = false;
+              score->score_cp = cp;
+            }
+          }
+        }
+        break;
+      }
+    }
   }
   return mv;
 }
@@ -610,11 +647,13 @@ void ExternalEngine::Spawn(const std::string&,
 void ExternalEngine::WriteLine(const std::string&) {}
 std::string ExternalEngine::ReadLine(std::chrono::milliseconds) { return ""; }
 std::string ExternalEngine::ReadUntilPrefix(const std::string&,
-                                            std::chrono::milliseconds) {
+                                            std::chrono::milliseconds, bool,
+                                            std::string*) {
   return "";
 }
 std::string ExternalEngine::GetMove(const std::string&,
-                                    const std::vector<std::string>&) {
+                                    const std::vector<std::string>&,
+                                    AdvisorScore*) {
   return "";
 }
 
