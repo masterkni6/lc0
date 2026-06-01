@@ -90,6 +90,7 @@ void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
             : (info.game_result == GameResult::WHITE_WON) ? "whitewon"
                                                           : "blackwon");
   }
+  if (info.sf_forced_mate) res += " sf_forced_mate 1";
   if (!info.moves.empty()) {
     res += " moves";
     for (const auto& move : info.moves) res += " " + move.ToString(true);

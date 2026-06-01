@@ -121,6 +121,9 @@ struct GameInfo {
   // if resign had of been enabled.
   // Only provided if the game wasn't played with resign enabled.
   std::optional<float> min_false_positive_threshold;
+  // True if the advisor engine (e.g. Stockfish) reported a forced mate during
+  // this game and lc0 force-played it out to checkmate.
+  bool sf_forced_mate = false;
 
   using Callback = std::function<void(const GameInfo&)>;
 };

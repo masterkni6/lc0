@@ -687,6 +687,7 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     game_info.initial_fen = opening.start_fen;
     game_info.moves = game.GetMoves();
     game_info.play_start_ply = game.GetStartPly();
+    game_info.sf_forced_mate = game.DidForceAdvisorMate();
     if (!enable_resign) {
       game_info.min_false_positive_threshold =
           game.GetWorstEvalForWinnerOrDraw();

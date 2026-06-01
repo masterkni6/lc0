@@ -150,6 +150,8 @@ class SelfPlayGame {
   void WriteTrainingData(TrainingDataWriter* writer) const;
 
   GameResult GetGameResult() const { return game_result_; }
+  // True if the advisor reported a forced mate that was force-played out.
+  bool DidForceAdvisorMate() const { return playing_out_mate_; }
   std::vector<Move> GetMoves() const;
   // Gets the eval which required the biggest swing up to get the final outcome.
   // Eval is the expected outcome in the range 0<->1.
