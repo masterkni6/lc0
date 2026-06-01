@@ -72,6 +72,36 @@ const OptionId kSearchAlgorithmId{
     "\"dag-preview\" (transposition-aware DAG search). Stage 1: dag-preview "
     "supports move generation only; training data with dag is not yet "
     "implemented and will throw if --training is set."};
+
+// Detect a chess960/FRC game.  Primary signal is the --chess960 option, BUT it's
+// read from a per-player subdict and a *global* --chess960 does not reliably
+// propagate there (observed in production: chess960_=0 on DFRC advisor games even
+// with --chess960=true set).  So ALSO detect FRC from the opening position's
+// parsed castling structure, mirroring lc0's own standard-vs-FRC test
+// (ChessBoard::Castlings::as_string): castling rooks not on a1/h1, or — when
+// castling rights are present — a king off its e-file home (only possible in FRC;
+// a standard king retaining rights is always on e).  Without this, DFRC games ran
+// with chess960_=false, so the advisor sent standard-form castling + raw KQkq +
+// never set UCI_Chess960 on Stockfish → boards desynced ("no piece to move").
+bool DetectChess960(const PlayerOptions& white, const PlayerOptions& black,
+                    const std::string& start_fen) {
+  if (white.uci_options->Get<bool>(kUciChess960) ||
+      black.uci_options->Get<bool>(kUciChess960)) {
+    return true;
+  }
+  try {
+    ChessBoard board(start_fen);
+    const auto& c = board.castlings();
+    const bool standard_rooks =
+        c.our_queenside_rook == kFileA && c.our_kingside_rook == kFileH &&
+        c.their_queenside_rook == kFileA && c.their_kingside_rook == kFileH;
+    if (!standard_rooks) return true;
+    if (c.as_string() != "-" && board.OurKing().file() != kFileE) return true;
+    return false;
+  } catch (...) {
+    return false;
+  }
+}
 }  // namespace
 
 void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
@@ -95,8 +125,7 @@ bool SelfPlayGame::IsDagRequested(const OptionsDict& opts) {
 SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
                            bool shared_tree, const Opening& opening)
     : options_{white, black},
-      chess960_{white.uci_options->Get<bool>(kUciChess960) ||
-                black.uci_options->Get<bool>(kUciChess960)},
+      chess960_{DetectChess960(white, black, opening.start_fen)},
       training_data_(classic::SearchParams(*white.uci_options).GetHistoryFill(),
                      classic::SearchParams(*black.uci_options).GetHistoryFill(),
                      pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE) {
