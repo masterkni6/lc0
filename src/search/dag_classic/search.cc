@@ -734,12 +734,13 @@ std::int64_t Search::GetTotalPlayouts() const {
 }
 
 std::vector<float> Search::GetTrainingTargetVisits() const {
-  // Policy Target Pruning (KataGo Wu 2019 §5.1; lc0 PR 2415).  Faithful port of
-  // classic::Search::GetTrainingTargetVisits.  The cap clamps each non-most-
-  // visited root edge down to the visit count where its full PUCT score (Q+M+U)
-  // would equal the most-visited child's, removing visits that PUCT itself
-  // wouldn't have made — which is exactly the advisor's forced visits.
-  // Lock-free like the classic version: only called from selfplay after
+  // Policy Target Pruning (KataGo Wu 2019 §5.1; lc0 PR 2415).  For each
+  // non-most-visited root edge, subtract only its FORCED visits — and never
+  // below the PUCT equilibrium — so the genuine search distribution is left
+  // intact (target = max(N_eq, n_raw - n_forced); see per-edge math below).  In
+  // the dag search the only forced visits are the advisor's guaranteed floor on
+  // its own move, so pruning touches that one edge; every other edge keeps its
+  // real visit count.  Lock-free: only called from selfplay after
   // RunBlocking()/Wait() has joined all worker threads, so the tree is quiescent.
   std::vector<float> result;
   if (root_node_ == nullptr) return result;
@@ -833,9 +834,23 @@ std::vector<float> Search::GetTrainingTargetVisits() const {
       ++idx;
       continue;
     }
-    // N_eq: where PUCT(c at N_eq) == best_utility.
+    // N_eq: where PUCT(c at N_eq) == best_utility — the visit count the real
+    // search distribution settles this edge at.
     const float n_eq = U_coeff * p / (best_utility - qm) - 1.0f;
-    result.push_back(std::max(0.0f, std::min(n_eq, n_raw)));
+    // KataGo's actual rule: subtract only the FORCED visits, and never below the
+    // equilibrium — target = max(N_eq, n_raw - n_forced).  This is deliberately
+    // NOT min(N_eq, n_raw): that would also strip GENUINE over-equilibrium
+    // visits, pruning below the real distribution.  In the dag search the only
+    // forced visits are the advisor's guaranteed floor on its own move, so every
+    // other edge has n_forced = 0 and is returned unchanged — its real
+    // distribution is preserved exactly.  The advisor edge is reduced by at most
+    // its floor, and still never below N_eq.
+    const float n_forced =
+        (advisor_min_visits_ > 0 && edge.GetMove() == advisor_move_)
+            ? static_cast<float>(advisor_min_visits_)
+            : 0.0f;
+    const float target = std::max(n_eq, n_raw - n_forced);
+    result.push_back(std::max(0.0f, std::min(n_raw, target)));
     ++idx;
   }
   return result;
