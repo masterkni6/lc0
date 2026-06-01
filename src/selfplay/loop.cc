@@ -77,6 +77,11 @@ void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
         " fp_threshold " + std::to_string(*info.min_false_positive_threshold);
     responses.push_back(resign_res);
   }
+  // Signal that the advisor (SF) found a forced mate this game and lc0 played it
+  // out — its own line (like resign_report) so it's easy to grep/spot.
+  if (info.sf_forced_mate) {
+    responses.push_back("mate_report gameid " + std::to_string(info.game_id));
+  }
   std::string res = "gameready";
   if (!info.training_filename.empty())
     res += " trainingfile " + info.training_filename;
@@ -90,7 +95,6 @@ void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
             : (info.game_result == GameResult::WHITE_WON) ? "whitewon"
                                                           : "blackwon");
   }
-  if (info.sf_forced_mate) res += " sf_forced_mate 1";
   if (!info.moves.empty()) {
     res += " moves";
     for (const auto& move : info.moves) res += " " + move.ToString(true);
