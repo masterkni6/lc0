@@ -913,14 +913,15 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           CERR << "Advisor engine query failed on side "
                << (blacks_move ? "B" : "W") << ": " << e.what()
                << " — skipping advisor for this move.";
-          if (chess960_) {
-            // DFRC desync diagnostic: dump the exact reproducer — the start FEN
-            // and the board-frame move list we sent SF — so the diverging move
-            // (or a rejected FEN) can be replayed by hand.  SF's unparseable
-            // reply is in e.what() above.
+          {
+            // DFRC desync diagnostic (UNCONDITIONAL): dump chess960_ first — if
+            // it's 0, the advisor is wrongly in standard mode (no Shredder FEN,
+            // no UCI_Chess960, standard-form castling) and THAT is the desync
+            // cause.  Plus the start FEN + king-takes-rook move list to replay.
             std::string ml;
-            for (const Move& m : GetMoves()) ml += " " + m.ToString(chess960_);
-            CERR << "[advisor-desync] fen=" << orig_fen_ << " moves" << ml;
+            for (const Move& m : GetMoves()) ml += " " + m.ToString(true);
+            CERR << "[advisor-desync] chess960_=" << (chess960_ ? 1 : 0)
+                 << " startfen=" << orig_fen_ << " moves" << ml;
           }
           advisor_engines_[idx].reset();
         }
