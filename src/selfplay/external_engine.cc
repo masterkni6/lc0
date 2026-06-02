@@ -311,6 +311,12 @@ ExternalEngine::ExternalEngine(
     }
   }
 
+  // Ask the engine to report WDL (win/draw/loss per-mille) on its info lines.
+  // Harmless for the opponent path (ignored), and the advisor path parses it as
+  // a calibrated value target — sidesteps cp->WDL conversion.  Sent before the
+  // user setoption loop so an explicit user override (later) still wins.
+  WriteLine("setoption name UCI_ShowWDL value true");
+
   for (const auto& [name, value] : uci_options) {
     WriteLine("setoption name " + name + " value " + value);
   }
@@ -638,6 +644,22 @@ std::string ExternalEngine::GetMove(const std::string& fen,
               score->score_cp = cp;
             }
           }
+        }
+        break;
+      }
+    }
+    // WDL (when UCI_ShowWDL is on): "... wdl W D L ..." (per-mille, side-to-move
+    // POV) — a calibrated value target; no cp->WDL conversion needed.
+    std::istringstream wss(score_line);
+    std::string wtok;
+    while (wss >> wtok) {
+      if (wtok == "wdl") {
+        int w = 0, d = 0, l = 0;
+        if (wss >> w >> d >> l) {
+          score->has_wdl = true;
+          score->wdl_w = w;
+          score->wdl_d = d;
+          score->wdl_l = l;
         }
         break;
       }

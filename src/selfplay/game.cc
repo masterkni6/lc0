@@ -745,7 +745,8 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
   auto capture_training = [&](int tr_idx, auto& tree_ref, auto& search_ref,
                               Move best_move, bool best_is_terminal,
                               classic::Eval best_eval,
-                              classic::Eval played_eval, Move played_move) {
+                              classic::Eval played_eval, Move played_move,
+                              const AdvisorScore& advisor) {
     auto* head = tree_ref.GetCurrentHead();
     // Proof flag: best is proven only if no sibling has a strictly better
     // proven upper bound (mirrors the classic Play() training block).
@@ -771,11 +772,23 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     // policy.  The returned vector is aligned with root_node_->Edges(), which is
     // the same node `head` that Add iterates, so the per-edge values line up.
     std::vector<float> processed_visits = search_ref.GetTrainingTargetVisits();
+    // Stockfish WDL (when reported) as a calibrated value-target signal, stored
+    // in the chunk's reserved[] slots for the training-side value blend.
+    float sf_wdl[3];
+    const float* sf_wdl_ptr = nullptr;
+    if (advisor.has_wdl) {
+      const float sum = static_cast<float>(
+          std::max(1, advisor.wdl_w + advisor.wdl_d + advisor.wdl_l));
+      sf_wdl[0] = advisor.wdl_w / sum;
+      sf_wdl[1] = advisor.wdl_d / sum;
+      sf_wdl[2] = advisor.wdl_l / sum;
+      sf_wdl_ptr = sf_wdl;
+    }
     training_data_.Add(head, tree_ref.GetPositionHistory(), best_eval,
                        played_eval, best_is_proof, best_move, played_move,
                        legal_moves, nneval,
                        search_ref.GetParams().GetPolicySoftmaxTemp(),
-                       &processed_visits);
+                       &processed_visits, sf_wdl_ptr);
   };
 
   while (!abort_) {
@@ -898,6 +911,7 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     Move advisor_move;
     bool has_advisor_move = false;
     bool advisor_is_mate = false;  // SF reports a forced mate for side to move
+    AdvisorScore advisor_score;    // SF's eval (WDL/cp/mate); filled below
     if (!options_[idx].advisor_engine_path.empty() &&
         options_[idx].advisor_min_visits > 0) {
       const bool is_frc_position = chess960_;
@@ -923,7 +937,6 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
           for (const Move& m : played_moves) {
             moves_uci.push_back(m.ToString(is_frc_position));
           }
-          AdvisorScore advisor_score;
           std::string uci_move = advisor_engines_[idx]->GetMove(
               orig_fen_, moves_uci, &advisor_score);
           // Parse against the to-move side's board (dag- or classic-typed);
@@ -1204,10 +1217,12 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     if (training) {
       if (side_uses_dag_[idx]) {
         capture_training(idx, *dag_tree_[idx], *dag_search_, best_move,
-                         best_is_terminal, best_eval, played_eval, move);
+                         best_is_terminal, best_eval, played_eval, move,
+                         advisor_score);
       } else {
         capture_training(idx, *tree_[idx], *search_, best_move,
-                         best_is_terminal, best_eval, played_eval, move);
+                         best_is_terminal, best_eval, played_eval, move,
+                         advisor_score);
       }
     }
     // Reset under mutex_: Abort() reads search_/dag_search_ under the same

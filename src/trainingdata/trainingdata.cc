@@ -128,7 +128,7 @@ void V7TrainingDataArray::Add(
     classic::Eval best_eval, classic::Eval played_eval, bool best_is_proven,
     Move best_move, Move played_move, std::span<Move> legal_moves,
     const std::optional<EvalResult>& nneval, float policy_softmax_temp,
-    const std::vector<float>* processed_visits) {
+    const std::vector<float>* processed_visits, const float* sf_wdl) {
   V7TrainingData result;
   const auto& position = history.Last();
 
@@ -142,6 +142,16 @@ void V7TrainingDataArray::Add(
   result.opp_played_idx = 0;
   result.next_played_idx = 0;
   for (float& r : result.reserved) r = 0.0f;
+  // Optional Stockfish-advisor WDL as a calibrated value-target signal:
+  // reserved[0..2] = W/D/L in [0,1] (side-to-move POV), reserved[3] = 1.0 as a
+  // validity flag.  All-zero reserved → no SF eval for this row.  Consumed by
+  // the training-side value blend; readers that ignore reserved[] are unaffected.
+  if (sf_wdl != nullptr) {
+    result.reserved[0] = sf_wdl[0];
+    result.reserved[1] = sf_wdl[1];
+    result.reserved[2] = sf_wdl[2];
+    result.reserved[3] = 1.0f;
+  }
 
   // Populate planes.
   int transform;
@@ -392,11 +402,12 @@ void V7TrainingDataArray::Add(
 template void V7TrainingDataArray::Add<classic::Node>(
     const classic::Node*, const PositionHistory&, classic::Eval, classic::Eval,
     bool, Move, Move, std::span<Move>, const std::optional<EvalResult>&, float,
-    const std::vector<float>*);
+    const std::vector<float>*, const float*);
 template void V7TrainingDataArray::Add<dag_classic::Node>(
     const dag_classic::Node*, const PositionHistory&, classic::Eval,
     classic::Eval, bool, Move, Move, std::span<Move>,
-    const std::optional<EvalResult>&, float, const std::vector<float>*);
+    const std::optional<EvalResult>&, float, const std::vector<float>*,
+    const float*);
 
 void V7TrainingDataArray::AddPlaceholder(const PositionHistory& history,
                                          Move played_move) {

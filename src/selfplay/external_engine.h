@@ -42,6 +42,13 @@ struct AdvisorScore {
   bool is_mate = false;  // true if the engine reported `score mate N`
   int mate_in = 0;       // N from `score mate N` (>0 = side-to-move mates)
   int score_cp = 0;      // X from `score cp X` (valid iff !is_mate)
+  // SF's win/draw/loss, per-mille (sum ~1000), side-to-move POV, parsed from a
+  // `wdl W D L` token when UCI_ShowWDL is enabled.  has_wdl is false if absent.
+  // A calibrated value target — no cp->value conversion needed.
+  bool has_wdl = false;
+  int wdl_w = 0;
+  int wdl_d = 0;
+  int wdl_l = 0;
 };
 
 // Drives an external UCI engine subprocess (e.g. Stockfish) used as an

@@ -64,7 +64,8 @@ class V7TrainingDataArray {
            bool best_is_proven, Move best_move, Move played_move,
            std::span<Move> legal_moves,
            const std::optional<EvalResult>& nneval, float policy_softmax_temp,
-           const std::vector<float>* processed_visits = nullptr);
+           const std::vector<float>* processed_visits = nullptr,
+           const float* sf_wdl = nullptr);
 
   // Add a placeholder chunk for a position whose move was selected by an
   // external (non-lc0) source — e.g. an external UCI opponent during
