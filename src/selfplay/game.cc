@@ -772,23 +772,18 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
     // policy.  The returned vector is aligned with root_node_->Edges(), which is
     // the same node `head` that Add iterates, so the per-edge values line up.
     std::vector<float> processed_visits = search_ref.GetTrainingTargetVisits();
-    // Stockfish WDL (when reported) as a calibrated value-target signal, stored
-    // in the chunk's reserved[] slots for the training-side value blend.
-    float sf_wdl[3];
-    const float* sf_wdl_ptr = nullptr;
-    if (advisor.has_wdl) {
-      const float sum = static_cast<float>(
-          std::max(1, advisor.wdl_w + advisor.wdl_d + advisor.wdl_l));
-      sf_wdl[0] = advisor.wdl_w / sum;
-      sf_wdl[1] = advisor.wdl_d / sum;
-      sf_wdl[2] = advisor.wdl_l / sum;
-      sf_wdl_ptr = sf_wdl;
-    }
+    // Stockfish WDL (per-mille) packed losslessly into one float for reserved[0]
+    // (0 = no SF eval): packed = ((W<<10)|D)+1, with W,D in 0..1000 (<1024 each)
+    // and packed <2^24 → stored exactly in a float.  L is derived on unpack.
+    const float sf_wdl_packed =
+        advisor.has_wdl
+            ? static_cast<float>(((advisor.wdl_w << 10) | advisor.wdl_d) + 1)
+            : 0.0f;
     training_data_.Add(head, tree_ref.GetPositionHistory(), best_eval,
                        played_eval, best_is_proof, best_move, played_move,
                        legal_moves, nneval,
                        search_ref.GetParams().GetPolicySoftmaxTemp(),
-                       &processed_visits, sf_wdl_ptr);
+                       &processed_visits, sf_wdl_packed);
   };
 
   while (!abort_) {
