@@ -175,7 +175,15 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       vga_elem_gate_w(LayerAdapter(mha.vga_elem_gate_w()).as_vector()),
       vga_elem_gate_b(LayerAdapter(mha.vga_elem_gate_b()).as_vector()),
       gqa_w_k(LayerAdapter(mha.gqa_w_k()).as_vector()),
-      gqa_w_v(LayerAdapter(mha.gqa_w_v()).as_vector()) {
+      gqa_w_v(LayerAdapter(mha.gqa_w_v()).as_vector()),
+      bank_v_diag(LayerAdapter(mha.bank_v_diag()).as_vector()),
+      bank_v_b(LayerAdapter(mha.bank_v_b()).as_vector()),
+      bank_v_lr_a(LayerAdapter(mha.bank_v_lr_a()).as_vector()),
+      bank_v_lr_b(LayerAdapter(mha.bank_v_lr_b()).as_vector()),
+      bank_vga_diag(LayerAdapter(mha.bank_vga_diag()).as_vector()),
+      bank_vga_b(LayerAdapter(mha.bank_vga_b()).as_vector()),
+      bank_vga_lr_a(LayerAdapter(mha.bank_vga_lr_a()).as_vector()),
+      bank_vga_lr_b(LayerAdapter(mha.bank_vga_lr_b()).as_vector()) {
   if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
     throw Exception("RPE weights file not supported.");
   }
@@ -192,7 +200,11 @@ BaseWeights::FFN::FFN(const pblczero::Weights::FFN& ffn)
       up_proj_b(LayerAdapter(ffn.up_proj_b()).as_vector()),
       down_proj_w(LayerAdapter(ffn.down_proj_w()).as_vector()),
       down_proj_b(LayerAdapter(ffn.down_proj_b()).as_vector()),
-      pgb_ffn(LayerAdapter(ffn.pgb_ffn()).as_vector()) {}
+      pgb_ffn(LayerAdapter(ffn.pgb_ffn()).as_vector()),
+      bank_gate_diag(LayerAdapter(ffn.bank_gate_diag()).as_vector()),
+      bank_gate_b(LayerAdapter(ffn.bank_gate_b()).as_vector()),
+      bank_gate_lr_a(LayerAdapter(ffn.bank_gate_lr_a()).as_vector()),
+      bank_gate_lr_b(LayerAdapter(ffn.bank_gate_lr_b()).as_vector()) {}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
@@ -202,7 +214,9 @@ BaseWeights::EncoderLayer::EncoderLayer(
       ffn(FFN(encoder.ffn())),
       ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
       ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()),
-      exo_lambda(LayerAdapter(encoder.exo_lambda()).as_vector()) {}
+      exo_lambda(LayerAdapter(encoder.exo_lambda()).as_vector()),
+      gate_bank_w(LayerAdapter(encoder.gate_bank_w()).as_vector()),
+      gate_bank_b(LayerAdapter(encoder.gate_bank_b()).as_vector()) {}
 
 BaseWeights::Smolgen::Smolgen(const pblczero::Weights::Smolgen& smolgen)
     : compress(LayerAdapter(smolgen.compress()).as_vector()),

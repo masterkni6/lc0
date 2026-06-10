@@ -162,6 +162,23 @@ message Weights {
     // (heads, kv_heads) flat in encoder_head_count*kv_headcount floats.
     optional Layer gqa_w_k = 43;
     optional Layer gqa_w_v = 44;
+
+    // Shared gate bank adapters (A-Layout-2).  When the encoder layer
+    // carries gate_bank_w, the GLU-V and VGA-E gates no longer own full
+    // input projections (v_gate_w / vga_elem_gate_w are absent); instead
+    // each gate's pre-activation reads the layer's shared nonlinear bank
+    // h = silu(gate_bank_w·x + gate_bank_b):
+    //   pre = diag ⊙ h[..., :out] + lr_b(lr_a(h)) + b
+    // Shapes: diag/b = (out,), lr_a = (rank, bank), lr_b = (out, rank).
+    // lr_a/lr_b absent => rank 0 (diagonal-only adapter).
+    optional Layer bank_v_diag = 45;
+    optional Layer bank_v_b = 46;
+    optional Layer bank_v_lr_a = 47;
+    optional Layer bank_v_lr_b = 48;
+    optional Layer bank_vga_diag = 49;
+    optional Layer bank_vga_b = 50;
+    optional Layer bank_vga_lr_a = 51;
+    optional Layer bank_vga_lr_b = 52;
   }
 
   message FFN {
@@ -179,6 +196,15 @@ message Weights {
     optional Layer down_proj_w = 15;
     optional Layer down_proj_b = 16;
     optional Layer pgb_ffn = 17;  // Post-Gating Bias on SwiGLU hidden
+
+    // Shared gate bank adapter for the SwiGLU gate (A-Layout-2).
+    // Replaces gate_proj_w/gate_proj_b when the encoder layer carries
+    // gate_bank_w.  Same form as MHA.bank_*:
+    //   gate_pre = diag ⊙ h[..., :dff] + lr_b(lr_a(h)) + b
+    optional Layer bank_gate_diag = 18;
+    optional Layer bank_gate_b = 19;
+    optional Layer bank_gate_lr_a = 20;
+    optional Layer bank_gate_lr_b = 21;
   }
 
   // MUDD: per-layer per-stream aggregator weights.
@@ -221,6 +247,16 @@ message Weights {
     // Absence => regular residual add (no scaling).
     optional Layer ls_attn = 12;
     optional Layer ls_ffn  = 13;
+
+    // Shared gate bank (A-Layout-2): one per-layer nonlinear basis
+    //   h = silu(gate_bank_w·x + gate_bank_b)      (bank width, e.g. 640)
+    // consumed by the GLU-V / VGA-E / SwiGLU-FFN gates through per-site
+    // adapters (MHA.bank_v_*, MHA.bank_vga_*, FFN.bank_gate_*).  Presence
+    // of gate_bank_w enables the feature at inference; bank width and
+    // adapter rank are inferred from tensor sizes.  NLA-Q and K are
+    // deliberately NOT on the bank (Layout 2).
+    optional Layer gate_bank_w = 14;
+    optional Layer gate_bank_b = 15;
   }
 
   message PolicyHead {

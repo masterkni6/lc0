@@ -111,6 +111,21 @@ struct BaseWeights {
     // backend synthesizes block-selection weights at load time.
     Vec gqa_w_k;
     Vec gqa_w_v;
+
+    // Shared gate bank adapters (A-Layout-2).  Non-empty diag means the
+    // site reads the encoder layer's shared bank instead of owning a
+    // full projection (v_gate_w / vga_elem_gate_w are then empty):
+    //   pre = diag * h[..:out] + lr_b(lr_a(h)) + b
+    // lr_a = (rank, bank) row-major, lr_b = (out, rank) row-major.
+    // Empty lr_a/lr_b => rank 0 (diagonal-only).
+    Vec bank_v_diag;
+    Vec bank_v_b;
+    Vec bank_v_lr_a;
+    Vec bank_v_lr_b;
+    Vec bank_vga_diag;
+    Vec bank_vga_b;
+    Vec bank_vga_lr_a;
+    Vec bank_vga_lr_b;
   };
 
   struct FFN {
@@ -128,6 +143,13 @@ struct BaseWeights {
     Vec down_proj_w;
     Vec down_proj_b;
     Vec pgb_ffn;  // Post-Gating Bias on SwiGLU hidden
+
+    // Shared gate bank adapter for the SwiGLU gate (A-Layout-2);
+    // replaces gate_proj_w/gate_proj_b when non-empty.
+    Vec bank_gate_diag;
+    Vec bank_gate_b;
+    Vec bank_gate_lr_a;
+    Vec bank_gate_lr_b;
   };
 
   struct EncoderLayer {
@@ -141,6 +163,12 @@ struct BaseWeights {
 
     // ExoFormer: per-layer anchor blending coefficients (2 scalars)
     Vec exo_lambda;
+
+    // Shared gate bank (A-Layout-2): h = silu(gate_bank_w x + gate_bank_b),
+    // consumed by the GLU-V / VGA-E / FFN gate adapters (see MHA / FFN
+    // bank_* fields).  Non-empty gate_bank_w enables the feature.
+    Vec gate_bank_w;
+    Vec gate_bank_b;
   };
 
   // Input convnet.
