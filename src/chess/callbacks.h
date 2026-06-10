@@ -124,6 +124,9 @@ struct GameInfo {
   // True if the advisor engine (e.g. Stockfish) reported a forced mate during
   // this game and lc0 force-played it out to checkmate.
   bool sf_forced_mate = false;
+  // Mate distance from the advisor's first `score mate N` of the playout
+  // (UCI full moves; plies = 2N-1).  0 when sf_forced_mate is false.
+  int sf_mate_in = 0;
 
   using Callback = std::function<void(const GameInfo&)>;
 };

@@ -152,6 +152,10 @@ class SelfPlayGame {
   GameResult GetGameResult() const { return game_result_; }
   // True if the advisor reported a forced mate that was force-played out.
   bool DidForceAdvisorMate() const { return playing_out_mate_; }
+  // The advisor's mate distance (UCI `score mate N`, in full moves) from its
+  // FIRST mate report of this game — i.e. the depth of the mate it spotted,
+  // before the playout shrank it.  0 when no forced mate was played.
+  int ForcedAdvisorMateIn() const { return forced_mate_in_; }
   std::vector<Move> GetMoves() const;
   // Gets the eval which required the biggest swing up to get the final outcome.
   // Eval is the expected outcome in the range 0<->1.
@@ -207,6 +211,8 @@ class SelfPlayGame {
   // suppresses resign for the rest of the game (both sides) so the mate plays
   // out to checkmate and the whole mating line is captured.
   bool playing_out_mate_ = false;
+  // Mate distance (UCI moves) from the advisor's first mate report; 0 = none.
+  int forced_mate_in_ = 0;
   // Track minimum eval for each player so that GetWorstEvalForWinnerOrDraw()
   // can be calculated after end of game.
   float min_eval_[2] = {1.0f, 1.0f};

@@ -80,7 +80,13 @@ void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
   // Signal that the advisor (SF) found a forced mate this game and lc0 played it
   // out — its own line (like resign_report) so it's easy to grep/spot.
   if (info.sf_forced_mate) {
-    responses.push_back("mate_report gameid " + std::to_string(info.game_id));
+    std::string mate_res = "mate_report gameid " + std::to_string(info.game_id);
+    if (info.sf_mate_in > 0) {
+      // UCI `mate N` is full moves; the mating side's line is 2N-1 plies.
+      mate_res += " mate_in " + std::to_string(info.sf_mate_in) + " plies " +
+                  std::to_string(2 * info.sf_mate_in - 1);
+    }
+    responses.push_back(mate_res);
   }
   std::string res = "gameready";
   if (!info.training_filename.empty())

@@ -1119,6 +1119,9 @@ void SelfPlayGame::PlayPerSide(int white_threads, int black_threads,
       if (advisor_is_mate && options_[idx].advisor_force_play_mates) {
         do_force = true;
         playing_out_mate_ = true;  // suppress resign so the mate plays out
+        // Keep the FIRST reported distance (the deepest): this branch refires
+        // on every move of the playout with a shrinking mate count.
+        if (forced_mate_in_ == 0) forced_mate_in_ = advisor_score.mate_in;
       } else if (options_[idx].advisor_force_play_prob > 0.0f) {
         const int mv_no = ref_history().GetLength() / 2 + 1;
         const int temp_cutoff = classic::SearchParams(*options_[idx].uci_options)
