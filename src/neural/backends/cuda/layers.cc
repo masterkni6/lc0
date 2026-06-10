@@ -2044,30 +2044,34 @@ EncoderBlock<DataType>::EncoderBlock(
     lr_a_cat.insert(lr_a_cat.end(), cpu_weights.ffn.bank_gate_lr_a.begin(),
                     cpu_weights.ffn.bank_gate_lr_a.end());
     allocAndUpload<DataType>(&bank_lr_a_w_, lr_a_cat, scratch);
+  }
 
-    // Loud load-time validation: every gate site must have either its full
-    // projection or its bank adapter.  Catches incomplete pb exports HERE,
-    // with the missing field named, instead of surfacing later as a
-    // null-weight CUBLAS_STATUS_INVALID_VALUE deep inside Eval.  (The
-    // python exporter silently drops fields absent from a stale net_pb2 —
-    // a pb written that way loads but lacks the adapters.)
-    if (has_glu_attn_ && mha_v_gate_w_ == nullptr && !has_bank_v_) {
-      throw Exception(
-          "gate-bank net: GLU-V has neither v_gate_w nor bank_v_* in the "
-          "proto — re-export with a net_pb2 regenerated from the current "
-          "net.proto.");
-    }
-    if (has_vga_elem_ && vga_elem_gate_w_ == nullptr && !has_bank_vga_) {
-      throw Exception(
-          "gate-bank net: VGA-E has neither vga_elem_gate_w nor bank_vga_* "
-          "in the proto — re-export with a regenerated net_pb2.");
-    }
-    if (has_swiglu_ && ffn_gate_w_ == nullptr && !has_bank_ffn_) {
-      throw Exception(
-          "gate-bank net: SwiGLU FFN has neither gate_proj_w nor "
-          "bank_gate_* in the proto — re-export with a regenerated "
-          "net_pb2.");
-    }
+  // ── Load-time structural validation (ALL nets, not just detected bank
+  // nets) ──  An incomplete pb — e.g. a gate-bank model exported through
+  // an old torchprocess.py (which never writes bank_* at all) or through
+  // a stale net_pb2 (whose unknown fields the exporter silently drops) —
+  // carries NO bank fields, so has_gate_bank_ is false and the net looks
+  // like a regular net with null gate weights.  Without these checks that
+  // dies later as CUBLAS_STATUS_INVALID_VALUE (A=nil) mid-Eval.
+  if (has_swiglu_ && ffn_gate_w_ == nullptr && !has_bank_ffn_) {
+    throw Exception(
+        "SwiGLU FFN has neither gate_proj_w nor bank_gate_* in the proto. "
+        "Incomplete export: sync torchprocess.py on the trainer, "
+        "regenerate net_pb2.py from the current net.proto, restart "
+        "training, and re-export the net.");
+  }
+  if (cpu_weights.mha.v_up_w.size() > 0 &&
+      cpu_weights.mha.v_gate_w.size() == 0 && !has_bank_v_) {
+    throw Exception(
+        "GLU-V has an up-projection (v_up_w) but neither v_gate_w nor "
+        "bank_v_* in the proto — incomplete export (sync torchprocess.py "
+        "+ regenerate net_pb2.py, then re-export).");
+  }
+  if (has_vga_elem_ && vga_elem_gate_w_ == nullptr && !has_bank_vga_) {
+    throw Exception(
+        "VGA-E has neither vga_elem_gate_w nor bank_vga_* in the proto — "
+        "incomplete export (sync torchprocess.py + regenerate net_pb2.py, "
+        "then re-export).");
   }
 
   // Persistent LN1 cache for Pre-Norm paths. Computes LN1 once per Eval.
