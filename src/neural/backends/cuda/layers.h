@@ -398,15 +398,14 @@ class EncoderBlock {
             DataType* smol_interm2 = nullptr,
             // Shared gate bank context (all null = no bank).
             //   bank_h_buf:   (max_batch*64, bank) — h, written on main.
-            //   bank_lr_buf:  (max_batch*64, Σrank) — lr_a stage output.
-            //   bank_lrb_buf: per-site lr_b segments at fixed max-token
-            //                 strides, [v | vga | ffn] order (rank>0 only).
-            //   bank_done_event: recorded on main once h + lrb are ready;
+            //   bank_lr_buf:  (max_batch*64, Σrank) — lr_a stage output;
+            //                 the lr_b stage is folded into the consuming
+            //                 kernels.
+            //   bank_done_event: recorded on main once h + lr_a are ready;
             //                 the FFN stream waits on it before its
             //                 BankGatedMul.
             DataType* bank_h_buf = nullptr,
             DataType* bank_lr_buf = nullptr,
-            DataType* bank_lrb_buf = nullptr,
             cudaEvent_t bank_done_event = nullptr) const;
 
   // Weight arena (or nullptr).  Captured at construction time from
@@ -894,7 +893,6 @@ class AttentionBody : public BaseLayer<DataType> {
   bool has_gate_bank_ = false;
   DataType* bank_h_buf_ = nullptr;
   DataType* bank_lr_buf_ = nullptr;
-  DataType* bank_lrb_buf_ = nullptr;
   cudaEvent_t bank_done_events_[kMaxEncoderLayers] = {};
 
   // Third-stream VGA-E overlap. Runs VGA-E precompute GEMM concurrently with

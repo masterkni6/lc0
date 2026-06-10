@@ -1890,13 +1890,21 @@ EncoderBlock<DataType>::EncoderBlock(
   // the pre-existing 5*qkv layout.
   const bool fused_qkv_scratch_fits =
       (kv_heads_ * 2 <= encoder_heads_);
-  if (has_nla_ && nla_q_only_ && is_gqa && has_glu_attn_ &&
-      mha_vg_vu_w_ != nullptr && mha_q_w != nullptr && mha_k_w != nullptr &&
-      fused_qkv_scratch_fits) {
+  // Shared-gate-bank variant: V has only an up-projection (the gate reads
+  // the bank), so the fused weight is [Wq1 | Wk | Wv_up] with
+  // M = d_model + 2*kv_dim.  Detected from cpu_weights directly because
+  // the bank fields are loaded after this builder runs.
+  const bool bank_fused_v = cpu_weights.gate_bank_w.size() > 0 &&
+                            cpu_weights.mha.bank_v_diag.size() > 0 &&
+                            mha_v_up_w_ != nullptr;
+  if (has_nla_ && nla_q_only_ && is_gqa &&
+      ((has_glu_attn_ && mha_vg_vu_w_ != nullptr) || bank_fused_v) &&
+      mha_q_w != nullptr && mha_k_w != nullptr && fused_qkv_scratch_fits) {
     const size_t emb = (size_t)embedding_op_size_;
     const size_t d_model = (size_t)mha_q_size_;
     const size_t kv_dim  = (size_t)(kv_heads_ * (mha_q_size_ / encoder_heads_));
-    const size_t M_fused = d_model + 3 * kv_dim;
+    const size_t v_cols  = bank_fused_v ? kv_dim : 2 * kv_dim;
+    const size_t M_fused = d_model + kv_dim + v_cols;
     const size_t total_bytes = M_fused * emb * sizeof(DataType);
     auto err = cudaMalloc(&mha_qkv_fused_w_, total_bytes);
     if (err == cudaSuccess) {
@@ -1905,11 +1913,11 @@ EncoderBlock<DataType>::EncoderBlock(
       // Concat along the j (output) axis:
       //   j ∈ [0, d_model)               → Wq (col-major, ld=emb)
       //   j ∈ [d_model, d_model+kv_dim)  → Wk
-      //   j ∈ [d_model+kv_dim, d_model+3*kv_dim) → mha_vg_vu_w_ (2*kv_dim
-      //                                            wide, already concat'd)
+      //   j ∈ [d_model+kv_dim, M_fused)  → mha_vg_vu_w_ ([gate;up],
+      //                                    2*kv_dim) or Wv_up (bank, kv_dim)
       const size_t bytes_q  = d_model * emb * sizeof(DataType);
       const size_t bytes_k  = kv_dim  * emb * sizeof(DataType);
-      const size_t bytes_vv = 2 * kv_dim * emb * sizeof(DataType);
+      const size_t bytes_v  = v_cols * emb * sizeof(DataType);
       ReportCUDAErrors(cudaMemcpy(
           mha_qkv_fused_w_,                                  mha_q_w,
           bytes_q, cudaMemcpyDeviceToDevice));
@@ -1917,8 +1925,9 @@ EncoderBlock<DataType>::EncoderBlock(
           mha_qkv_fused_w_ + d_model * emb,                  mha_k_w,
           bytes_k, cudaMemcpyDeviceToDevice));
       ReportCUDAErrors(cudaMemcpy(
-          mha_qkv_fused_w_ + (d_model + kv_dim) * emb,       mha_vg_vu_w_,
-          bytes_vv, cudaMemcpyDeviceToDevice));
+          mha_qkv_fused_w_ + (d_model + kv_dim) * emb,
+          bank_fused_v ? mha_v_up_w_ : mha_vg_vu_w_,
+          bytes_v, cudaMemcpyDeviceToDevice));
       mha_qkv_fused_M_ = (int)M_fused;
     } else {
       mha_qkv_fused_w_ = nullptr;
@@ -2413,7 +2422,6 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* smol_interm2,
                                   DataType* bank_h_buf,
                                   DataType* bank_lr_buf,
-                                  DataType* bank_lrb_buf,
                                   cudaEvent_t bank_done_event) const {
   int _lid = g_enc_layer_counter.fetch_add(1, std::memory_order_relaxed);
 
@@ -2505,12 +2513,12 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // sublayers read.  Post-norm only — asserted at construction.
   const bool use_bank = has_gate_bank_ && !is_prenorm_ &&
                         bank_h_buf != nullptr && bank_done_event != nullptr;
+  const int bank_total_rank = bank_rank_v_ + bank_rank_vga_ + bank_rank_ffn_;
   DataType* bank_lrb_v = nullptr;
   DataType* bank_lrb_vga = nullptr;
   DataType* bank_lrb_ffn = nullptr;
   if (use_bank) {
     const int bank_batch = N * 64;
-    const size_t bank_max_tokens = (size_t)max_batch_size_ * 64;
     cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, gate_bank_size_,
                           bank_batch, embedding_op_size_, 1.0f,
                           (const DataType*)gate_bank_w_, embedding_op_size_,
@@ -2519,20 +2527,20 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     addBiasBatched<DataType>(bank_h_buf, bank_h_buf, gate_bank_b_, 1,
                              bank_batch, gate_bank_size_, ACTIVATION_SWISH,
                              stream);
-    const int bank_total_rank = bank_rank_v_ + bank_rank_vga_ + bank_rank_ffn_;
-    if (bank_total_rank > 0 && bank_lr_buf != nullptr &&
-        bank_lrb_buf != nullptr) {
-      // Stage 1: one GEMM over the concatenated [v; vga; ffn] lr_a rows.
+    // Rank-r mixers: stage 1 is one GEMM over the concatenated
+    // [v; vga; ffn] lr_a rows; stage 2 is per-site lr_b GEMMs whose
+    // outputs are carved out of bank_lr_buf AFTER the lr_a region, at
+    // fixed max-token strides in [v | vga | ffn] order (must match the
+    // AttentionBody allocation).  Folding stage 2 into the consuming
+    // kernels was measured slower (see note in common_kernels.cu).
+    if (bank_total_rank > 0 && bank_lr_buf != nullptr) {
+      const size_t bank_max_tokens = (size_t)max_batch_size_ * 64;
       cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, bank_total_rank,
                             bank_batch, gate_bank_size_, 1.0f,
                             (const DataType*)bank_lr_a_w_, gate_bank_size_,
                             bank_h_buf, gate_bank_size_, 0.0f,
                             bank_lr_buf, bank_total_rank);
-      // Stage 2: per-site lr_b GEMMs reading their row slice of
-      // bank_lr_buf (ldb = total rank).  Output segments are carved out
-      // of bank_lrb_buf at fixed max-token strides in [v | vga | ffn]
-      // order — must match the AttentionBody allocation exactly.
-      DataType* seg = bank_lrb_buf;
+      DataType* seg = bank_lr_buf + bank_max_tokens * bank_total_rank;
       int r_off = 0;
       if (bank_rank_v_ > 0) {
         bank_lrb_v = seg;
@@ -2722,7 +2730,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         BankGatedMul<DataType>(batch, dff, gate_bank_size_, hidden_out,
                                bank_h_buf, bank_lrb_ffn, up_out,
                                bank_ffn_diag_, bank_ffn_bias_, ffn_up_b_,
-                               ffn_pgb_, swiglu_softcap_, ffn_s);
+                               ffn_pgb_, swiglu_softcap_, /*up_stride=*/0,
+                               ffn_s);
       } else if (ffn_gate_up_w_ != nullptr) {
         cublasXgemm(ffn_h, CUBLAS_OP_T, CUBLAS_OP_N, 2 * dff, batch,
                     num_inputs, 1.0f, (const DataType*)ffn_gate_up_w_,
@@ -3029,18 +3038,29 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                    ACTIVATION_NONE, stream);
         }
 
-        // 5) SwiGLU on the gate_up region of qkv_fused_out → v_kv_fused.
-        //    gate is at offset d_model+kv_dim, up at offset d_model+2*kv_dim;
-        //    pass the base pointer at d_model+kv_dim and column_stride=M_fused.
-        //    Within each column, gate=[0..kv_dim), up=[kv_dim..2*kv_dim).
+        // 5) Gate the V up-projection → v_kv_fused.
         //    (No pgb here — V's PGB is folded into expandKVWeighted below.)
-        SwiGLUFusedGateUp<DataType>(
-            batch, kv_dim_f, v_kv_fused,
-            qkv_fused_out + (d_model + kv_dim_f),
-            mha_v_gate_b_, mha_v_up_b_, stream,
-            /*swiglu_softcap=*/0.0f,  // V-side SwiGLU never used softcap
-            /*pgb_bias=*/nullptr,
-            /*column_stride=*/M_fused);
+        if (use_bank && has_bank_v_) {
+          // Bank layout [Wq1|Wk|Wv_up]: up lives at offset d_model+kv_dim
+          // with row stride M_fused; the gate comes from the shared bank.
+          BankGatedMul<DataType>(
+              batch, kv_dim_f, gate_bank_size_, v_kv_fused, bank_h_buf,
+              bank_lrb_v, qkv_fused_out + (d_model + kv_dim_f), bank_v_diag_,
+              bank_v_bias_, mha_v_up_b_, /*pgb=*/(const DataType*)nullptr,
+              /*softcap=*/0.0f, /*up_stride=*/M_fused, stream);
+        } else {
+          // GLU layout [Wq1|Wk|Wvgate|Wvup]: gate at offset d_model+kv_dim,
+          // up at d_model+2*kv_dim; pass the base pointer at d_model+kv_dim
+          // and column_stride=M_fused.  Within each column, gate=[0..kv_dim),
+          // up=[kv_dim..2*kv_dim).
+          SwiGLUFusedGateUp<DataType>(
+              batch, kv_dim_f, v_kv_fused,
+              qkv_fused_out + (d_model + kv_dim_f),
+              mha_v_gate_b_, mha_v_up_b_, stream,
+              /*swiglu_softcap=*/0.0f,  // V-side SwiGLU never used softcap
+              /*pgb_bias=*/nullptr,
+              /*column_stride=*/M_fused);
+        }
 
         // 6) expandKVWeighted reads K from qkv_fused_out at offset d_model
         //    with stride M_fused; V from v_kv_fused at stride kv_dim_f.
@@ -3187,7 +3207,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                  bank_h_buf, bank_lrb_v, v_dst,
                                  bank_v_diag_, bank_v_bias_, mha_v_up_b_,
                                  /*pgb=*/(const DataType*)nullptr,
-                                 /*softcap=*/0.0f, stream);
+                                 /*softcap=*/0.0f, /*up_stride=*/0, stream);
         } else if (mha_vg_vu_w_ != nullptr) {
           // Under GQA, the fused [gate;up] output lives in gu_kv (carved
           // earlier from nla_qk_temp).  In the non-GQA case we reuse
@@ -3660,7 +3680,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   if (has_vga_elem_) {
     if (use_bank && has_bank_vga_) {
       // Bank-adapter VGA-E: gate pre-activation comes from the shared
-      // bank (diag ⊙ h + b + lrb) — no gate GEMM at all.
+      // bank (diag ⊙ h + b + folded rank-r mixer) — no gate GEMM at all.
       FusedVGAEBank<DataType>(N * 64 * d_model, buffer2, bank_h_buf,
                               gate_bank_size_, bank_lrb_vga,
                               bank_vga_diag_, bank_vga_bias_, d_model,
@@ -4707,14 +4727,15 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
           const int total_rank = enc0->bank_rank_v_ + enc0->bank_rank_vga_ +
                                  enc0->bank_rank_ffn_;
           if (total_rank > 0) {
-            size_t lrb_width = 0;
-            if (enc0->bank_rank_v_ > 0) lrb_width += enc0->mha_v_size_;
-            if (enc0->bank_rank_vga_ > 0) lrb_width += enc0->mha_q_size_;
-            if (enc0->bank_rank_ffn_ > 0) lrb_width += enc0->ffn_dff_;
+            // Layout: [lr_a output (total_rank) | lrb_v | lrb_vga |
+            // lrb_ffn], each at max-token stride — must match the carve
+            // in EncoderBlock::Eval.
+            size_t width = total_rank;
+            if (enc0->bank_rank_v_ > 0) width += enc0->mha_v_size_;
+            if (enc0->bank_rank_vga_ > 0) width += enc0->mha_q_size_;
+            if (enc0->bank_rank_ffn_ > 0) width += enc0->ffn_dff_;
             ReportCUDAErrors(cudaMalloc(
-                &bank_lr_buf_, max_tokens * total_rank * sizeof(DataType)));
-            ReportCUDAErrors(cudaMalloc(
-                &bank_lrb_buf_, max_tokens * lrb_width * sizeof(DataType)));
+                &bank_lr_buf_, max_tokens * width * sizeof(DataType)));
           }
           for (int i = 0; i < num_encoder_layers_; i++) {
             ReportCUDAErrors(cudaEventCreateWithFlags(
@@ -4879,7 +4900,6 @@ AttentionBody<DataType>::~AttentionBody() {
   FreeWeight(ffn_buf_out_, arena_);              // runtime buffer
   FreeWeight(bank_h_buf_, arena_);               // runtime buffer
   FreeWeight(bank_lr_buf_, arena_);              // runtime buffer
-  FreeWeight(bank_lrb_buf_, arena_);             // runtime buffer
   for (int i = 0; i < num_encoder_layers_; i++) {
     if (ln1_done_events_[i]) cudaEventDestroy(ln1_done_events_[i]);
     if (ffn_done_events_[i]) cudaEventDestroy(ffn_done_events_[i]);
@@ -5614,7 +5634,6 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                // cannot gate from the bank).
                has_gate_bank_ ? bank_h_buf_ : nullptr,
                has_gate_bank_ ? bank_lr_buf_ : nullptr,
-               has_gate_bank_ ? bank_lrb_buf_ : nullptr,
                has_gate_bank_ ? bank_done_events_[enc_idx] : nullptr);
 
     if (kLayerTimingEnabled && !in_capture) {

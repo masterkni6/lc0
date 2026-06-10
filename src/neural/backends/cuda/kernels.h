@@ -377,17 +377,20 @@ void FusedVGAE(int total, T* output, const T* gate, const T* bias,
 // h is the encoder layer's shared nonlinear basis silu(W_bank x + b),
 // stored column-major (bank_dim, tokens).  Site gate pre-activation:
 //   pre = diag[c] * h[token, c] + gate_b[c] (+ lrb[token, c])
-// lrb (optional, (out_dim, tokens)) is the rank-r mixer output; null for
-// rank-0 (diagonal-only) adapters.
+// lrb (optional, (out_dim, tokens)) is the rank-r mixer output,
+// materialized by small cuBLAS GEMMs (folding it into these kernels was
+// measured slower — see note in common_kernels.cu).  Null => rank-0.
 //
 // BankGatedMul (GLU-V / SwiGLU-FFN sites):
 //   output = silu(pre) * (up + up_b) [+ pgb] [tanh-softcap]
-// out == up aliasing is safe (each thread reads then writes one index).
+// up is read at row stride `up_stride` (0 => out_dim, contiguous) so it
+// can live inside a wider fused-GEMM output.  out == up aliasing is safe
+// when up_stride == out_dim (same-index read-then-write).
 template <typename T>
 void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
                   const T* h, const T* lrb, const T* up, const T* diag,
                   const T* gate_b, const T* up_b, const T* pgb,
-                  float softcap, cudaStream_t stream);
+                  float softcap, int up_stride, cudaStream_t stream);
 
 // FusedVGAEBank (VGA-E site): output[i] *= sigmoid(pre).
 template <typename T>

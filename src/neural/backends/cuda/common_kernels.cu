@@ -1904,12 +1904,21 @@ void FusedVGAE(int total, T* output, const T* gate, const T* bias,
 //
 // bank_gated_mul: V/FFN consumption — out = silu(pre) * (up + up_b)
 // [+ pgb] [softcap].  out == up aliasing is safe (same-index read/write).
+// NOTE on the rank-r mixer (lr_b) stage: folding it into these kernels as
+// a per-element rank-length dot was tried and measured SLOWER than the
+// GEMM form — 4.5x slower with channel-major lr_b (uncoalesced), still
+// 1.4x slower with rank-major (coalesced) lr_b, because the fold turns a
+// tensor-core GEMM into ~0.5 GB/site/layer of L2-bandwidth-bound scalar
+// loads.  The lrb tensors are therefore materialized by small cuBLAS
+// GEMMs (see EncoderBlock::Eval) and consumed here via a plain indexed
+// read.
 template <typename T>
 __global__ void bank_gated_mul_kernel(int total, int out_dim, int bank_dim,
                                       T* output, const T* h, const T* lrb,
                                       const T* up, const T* diag,
                                       const T* gate_b, const T* up_b,
-                                      const T* pgb, float softcap) {
+                                      const T* pgb, float softcap,
+                                      int up_stride) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int c = i % out_dim;
@@ -1917,7 +1926,7 @@ __global__ void bank_gated_mul_kernel(int total, int out_dim, int bank_dim,
   float pre = (float)diag[c] * (float)h[row * bank_dim + c] + (float)gate_b[c];
   if (lrb) pre += (float)lrb[i];
   const float gate = pre / (1.0f + expf(-pre));  // silu
-  float u = (float)up[i];
+  float u = (float)up[row * (size_t)up_stride + c];
   if (up_b) u += (float)up_b[c];
   float val = gate * u;
   if (pgb) val += (float)pgb[c];
@@ -1929,13 +1938,14 @@ template <typename T>
 void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
                   const T* h, const T* lrb, const T* up, const T* diag,
                   const T* gate_b, const T* up_b, const T* pgb,
-                  float softcap, cudaStream_t stream) {
+                  float softcap, int up_stride, cudaStream_t stream) {
   const int total = batch * out_dim;
   const int kBlockSize = 256;
   int blocks = DivUp(total, kBlockSize);
+  if (up_stride <= 0) up_stride = out_dim;
   bank_gated_mul_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
       total, out_dim, bank_dim, output, h, lrb, up, diag, gate_b, up_b, pgb,
-      softcap);
+      softcap, up_stride);
   ReportCUDAErrors(cudaGetLastError());
 }
 
@@ -3543,13 +3553,14 @@ template void BankGatedMul<half>(int batch, int out_dim, int bank_dim,
                                  const half* up, const half* diag,
                                  const half* gate_b, const half* up_b,
                                  const half* pgb, float softcap,
-                                 cudaStream_t stream);
+                                 int up_stride, cudaStream_t stream);
 template void BankGatedMul<float>(int batch, int out_dim, int bank_dim,
                                   float* output, const float* h,
                                   const float* lrb, const float* up,
                                   const float* diag, const float* gate_b,
                                   const float* up_b, const float* pgb,
-                                  float softcap, cudaStream_t stream);
+                                  float softcap, int up_stride,
+                                  cudaStream_t stream);
 
 template void FusedVGAEBank<half>(int total, half* output, const half* h,
                                   int bank_dim, const half* lrb,
