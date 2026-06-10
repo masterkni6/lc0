@@ -2044,6 +2044,30 @@ EncoderBlock<DataType>::EncoderBlock(
     lr_a_cat.insert(lr_a_cat.end(), cpu_weights.ffn.bank_gate_lr_a.begin(),
                     cpu_weights.ffn.bank_gate_lr_a.end());
     allocAndUpload<DataType>(&bank_lr_a_w_, lr_a_cat, scratch);
+
+    // Loud load-time validation: every gate site must have either its full
+    // projection or its bank adapter.  Catches incomplete pb exports HERE,
+    // with the missing field named, instead of surfacing later as a
+    // null-weight CUBLAS_STATUS_INVALID_VALUE deep inside Eval.  (The
+    // python exporter silently drops fields absent from a stale net_pb2 —
+    // a pb written that way loads but lacks the adapters.)
+    if (has_glu_attn_ && mha_v_gate_w_ == nullptr && !has_bank_v_) {
+      throw Exception(
+          "gate-bank net: GLU-V has neither v_gate_w nor bank_v_* in the "
+          "proto — re-export with a net_pb2 regenerated from the current "
+          "net.proto.");
+    }
+    if (has_vga_elem_ && vga_elem_gate_w_ == nullptr && !has_bank_vga_) {
+      throw Exception(
+          "gate-bank net: VGA-E has neither vga_elem_gate_w nor bank_vga_* "
+          "in the proto — re-export with a regenerated net_pb2.");
+    }
+    if (has_swiglu_ && ffn_gate_w_ == nullptr && !has_bank_ffn_) {
+      throw Exception(
+          "gate-bank net: SwiGLU FFN has neither gate_proj_w nor "
+          "bank_gate_* in the proto — re-export with a regenerated "
+          "net_pb2.");
+    }
   }
 
   // Persistent LN1 cache for Pre-Norm paths. Computes LN1 once per Eval.
@@ -2427,6 +2451,18 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       ffn_stream && ffn_cublas && ln1_done_event && ffn_done_event &&
       ffn_buf_wide && ffn_buf_out &&
       (has_swiglu_ ? ffn_swiglu_ready : ffn_dense1_w != nullptr);
+
+  // Bank nets cannot take the single-stream parallel-FFN fallback (it has
+  // no path to gate from the bank, and would issue a GEMM with the null
+  // gate_proj weight).  Fail with words instead of a nil-pointer cuBLAS
+  // error.  Reachable causes: LC0_FORCE_SINGLE_STREAM set, or the caller
+  // didn't provide the FFN/bank stream context.
+  if (has_gate_bank_ && is_parallel_ffn_ && !ms_ffn) {
+    throw Exception(
+        "shared-gate-bank net requires the multi-stream FFN path, but "
+        "ms_ffn is disabled (LC0_FORCE_SINGLE_STREAM set, or FFN/bank "
+        "stream context missing).");
+  }
 
   DataType* mha_input = in_out_tensor;
 
@@ -5567,12 +5603,15 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                ms_smol ? smol_gen_out_ : nullptr,
                ms_smol ? smol_intermediate_ : nullptr,
                ms_smol ? smol_intermediate2_ : nullptr,
-               // Shared gate bank context: requires the multi-stream FFN
-               // path (the FFN gate adapter runs on ffn_stream_).
-               (has_gate_bank_ && ms) ? bank_h_buf_ : nullptr,
-               (has_gate_bank_ && ms) ? bank_lr_buf_ : nullptr,
-               (has_gate_bank_ && ms) ? bank_lrb_buf_ : nullptr,
-               (has_gate_bank_ && ms) ? bank_done_events_[enc_idx] : nullptr);
+               // Shared gate bank context.  NOT gated on `ms`: the V/VGA
+               // adapters run on the main stream and need h regardless;
+               // EncoderBlock::Eval itself rejects bank nets if the FFN
+               // multi-stream path is unavailable (single-stream fallback
+               // cannot gate from the bank).
+               has_gate_bank_ ? bank_h_buf_ : nullptr,
+               has_gate_bank_ ? bank_lr_buf_ : nullptr,
+               has_gate_bank_ ? bank_lrb_buf_ : nullptr,
+               has_gate_bank_ ? bank_done_events_[enc_idx] : nullptr);
 
     if (kLayerTimingEnabled && !in_capture) {
       cudaEventRecord(layer_ends[enc_idx], stream);
