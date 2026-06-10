@@ -1593,6 +1593,11 @@ EncoderBlock<DataType>::EncoderBlock(
   if (mha_v_size_ == 0) {
     mha_v_size_ = cpu_weights.mha.v_gate_b.size();
   }
+  if (mha_v_size_ == 0) {
+    // Shared-gate-bank nets: v_gate is replaced by a bank adapter, so only
+    // v_up carries the projection width.
+    mha_v_size_ = cpu_weights.mha.v_up_b.size();
+  }
   mha_dense_size_ = cpu_weights.mha.dense_b.size();
   ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
   ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
@@ -1657,6 +1662,11 @@ EncoderBlock<DataType>::EncoderBlock(
     allocAndUpload<DataType>(&ffn_down_w_, cpu_weights.ffn.down_proj_w, scratch);
     allocAndUpload<DataType>(&ffn_down_b_, cpu_weights.ffn.down_proj_b, scratch);
     ffn_dff_ = (int)(cpu_weights.ffn.gate_proj_w.size() / embedding_op_size_);
+    if (ffn_dff_ == 0) {
+      // Shared-gate-bank nets: gate_proj is replaced by a bank adapter,
+      // so derive dff from up_proj instead.
+      ffn_dff_ = (int)(cpu_weights.ffn.up_proj_w.size() / embedding_op_size_);
+    }
     ffn_dense1_w = nullptr; ffn_dense1_b = nullptr;
     ffn_dense2_w = nullptr; ffn_dense2_b = nullptr;
 
@@ -1809,8 +1819,11 @@ EncoderBlock<DataType>::EncoderBlock(
     }
   }
 
-  // GLU Attention (V): gated value projection.
-  has_glu_attn_ = cpu_weights.mha.v_gate_w.size() > 0;
+  // GLU Attention (V): gated value projection.  Under the shared gate
+  // bank, v_gate_w is absent (the gate reads the bank via an adapter) but
+  // the V path is still GLU-shaped — key off bank_v_diag too.
+  has_glu_attn_ = cpu_weights.mha.v_gate_w.size() > 0 ||
+                  cpu_weights.mha.bank_v_diag.size() > 0;
   if (has_glu_attn_) {
     allocAndUpload<DataType>(&mha_v_gate_w_, cpu_weights.mha.v_gate_w, scratch);
     allocAndUpload<DataType>(&mha_v_gate_b_, cpu_weights.mha.v_gate_b, scratch);
@@ -1824,7 +1837,7 @@ EncoderBlock<DataType>::EncoderBlock(
   // col-major output is exactly the layout SwiGLUFusedGateUp expects, so
   // the subsequent SwiGLU step reuses that kernel verbatim.  Cuts the
   // V-side GEMM count from 2 to 1 per encoder block.
-  if (has_glu_attn_) {
+  if (has_glu_attn_ && mha_v_gate_w_ != nullptr) {
     const size_t emb = (size_t)embedding_op_size_;
     // Under GQA, V_gate/V_up project to kv_dim, NOT d_model.  Use the
     // V bias width (= mha_v_size_ = kv_dim when GQA, = d_model otherwise)
@@ -1953,8 +1966,10 @@ EncoderBlock<DataType>::EncoderBlock(
     allocAndUpload<DataType>(&pgb_v_, cpu_weights.mha.pgb_v, scratch);
   }
 
-  // VGA-E (Element-wise gate on attention output).
-  has_vga_elem_ = cpu_weights.mha.vga_elem_gate_w.size() > 0;
+  // VGA-E (Element-wise gate on attention output).  Under the shared gate
+  // bank the full gate projection is absent — key off bank_vga_diag too.
+  has_vga_elem_ = cpu_weights.mha.vga_elem_gate_w.size() > 0 ||
+                  cpu_weights.mha.bank_vga_diag.size() > 0;
   if (has_vga_elem_) {
     allocAndUpload<DataType>(&vga_elem_gate_w_, cpu_weights.mha.vga_elem_gate_w, scratch);
     allocAndUpload<DataType>(&vga_elem_gate_b_, cpu_weights.mha.vga_elem_gate_b, scratch);
@@ -1968,6 +1983,67 @@ EncoderBlock<DataType>::EncoderBlock(
         cudaGetLastError();  // clear error
       }
     }
+  }
+
+  // ── Shared gate bank (A-Layout-2) ──
+  // One per-layer nonlinear basis h = silu(W_bank x + b) feeds the GLU-V /
+  // VGA-E / SwiGLU-FFN gates through per-site (diag + rank-r) adapters.
+  // Presence-detected from gate_bank_w; the replaced projections are
+  // absent in bank nets.  Training only wires this for the post-norm
+  // parallel-FFN path, so the export cannot produce other combinations.
+  has_gate_bank_ = cpu_weights.gate_bank_w.size() > 0;
+  if (has_gate_bank_) {
+    assert(!is_prenorm_ && is_parallel_ffn_ &&
+           "shared gate bank requires post-norm parallel FFN");
+    gate_bank_size_ = (int)cpu_weights.gate_bank_b.size();
+    allocAndUpload<DataType>(&gate_bank_w_, cpu_weights.gate_bank_w, scratch);
+    allocAndUpload<DataType>(&gate_bank_b_, cpu_weights.gate_bank_b, scratch);
+    has_bank_v_ = cpu_weights.mha.bank_v_diag.size() > 0;
+    has_bank_vga_ = cpu_weights.mha.bank_vga_diag.size() > 0;
+    has_bank_ffn_ = cpu_weights.ffn.bank_gate_diag.size() > 0;
+    if (has_bank_v_) {
+      allocAndUpload<DataType>(&bank_v_diag_, cpu_weights.mha.bank_v_diag,
+                               scratch);
+      allocAndUpload<DataType>(&bank_v_bias_, cpu_weights.mha.bank_v_b,
+                               scratch);
+      allocAndUpload<DataType>(&bank_v_lr_b_w_, cpu_weights.mha.bank_v_lr_b,
+                               scratch);
+      bank_rank_v_ =
+          (int)(cpu_weights.mha.bank_v_lr_a.size() / gate_bank_size_);
+    }
+    if (has_bank_vga_) {
+      allocAndUpload<DataType>(&bank_vga_diag_, cpu_weights.mha.bank_vga_diag,
+                               scratch);
+      allocAndUpload<DataType>(&bank_vga_bias_, cpu_weights.mha.bank_vga_b,
+                               scratch);
+      allocAndUpload<DataType>(&bank_vga_lr_b_w_,
+                               cpu_weights.mha.bank_vga_lr_b, scratch);
+      bank_rank_vga_ =
+          (int)(cpu_weights.mha.bank_vga_lr_a.size() / gate_bank_size_);
+    }
+    if (has_bank_ffn_) {
+      allocAndUpload<DataType>(&bank_ffn_diag_, cpu_weights.ffn.bank_gate_diag,
+                               scratch);
+      allocAndUpload<DataType>(&bank_ffn_bias_, cpu_weights.ffn.bank_gate_b,
+                               scratch);
+      allocAndUpload<DataType>(&bank_ffn_lr_b_w_,
+                               cpu_weights.ffn.bank_gate_lr_b, scratch);
+      bank_rank_ffn_ =
+          (int)(cpu_weights.ffn.bank_gate_lr_a.size() / gate_bank_size_);
+    }
+    // Concatenate the sites' lr_a rows ([v; vga; ffn] order) into one
+    // (Σrank, bank) weight so the mixers' first stage is a single GEMM.
+    std::vector<float> lr_a_cat;
+    lr_a_cat.reserve(cpu_weights.mha.bank_v_lr_a.size() +
+                     cpu_weights.mha.bank_vga_lr_a.size() +
+                     cpu_weights.ffn.bank_gate_lr_a.size());
+    lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_v_lr_a.begin(),
+                    cpu_weights.mha.bank_v_lr_a.end());
+    lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_vga_lr_a.begin(),
+                    cpu_weights.mha.bank_vga_lr_a.end());
+    lr_a_cat.insert(lr_a_cat.end(), cpu_weights.ffn.bank_gate_lr_a.begin(),
+                    cpu_weights.ffn.bank_gate_lr_a.end());
+    allocAndUpload<DataType>(&bank_lr_a_w_, lr_a_cat, scratch);
   }
 
   // Persistent LN1 cache for Pre-Norm paths. Computes LN1 once per Eval.
@@ -2306,7 +2382,11 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   cudaEvent_t smol_done_event,
                                   DataType* smol_gen_out,
                                   DataType* smol_interm,
-                                  DataType* smol_interm2) const {
+                                  DataType* smol_interm2,
+                                  DataType* bank_h_buf,
+                                  DataType* bank_lr_buf,
+                                  DataType* bank_lrb_buf,
+                                  cudaEvent_t bank_done_event) const {
   int _lid = g_enc_layer_counter.fetch_add(1, std::memory_order_relaxed);
 
   const int d_model = mha_q_size_;
@@ -2335,11 +2415,18 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // Multi-stream FFN: active when parallel FFN is configured, the FFN source
   // pointer is valid, a suitable event/buffer context was provided by the
   // caller, and the SwiGLU fused gate+up weight exists (for SwiGLU nets).
+  // Under the shared gate bank, SwiGLU's gate comes from the bank adapter
+  // and ffn_gate_up_w_ is intentionally null — the bank context (h buffer +
+  // done event) takes its place as the SwiGLU-readiness condition.
+  const bool ffn_swiglu_ready =
+      ffn_gate_up_w_ != nullptr ||
+      (has_gate_bank_ && has_bank_ffn_ && bank_h_buf != nullptr &&
+       bank_done_event != nullptr);
   const bool ms_ffn =
       is_parallel_ffn_ && ffn_src != nullptr &&
       ffn_stream && ffn_cublas && ln1_done_event && ffn_done_event &&
       ffn_buf_wide && ffn_buf_out &&
-      (has_swiglu_ ? ffn_gate_up_w_ != nullptr : ffn_dense1_w != nullptr);
+      (has_swiglu_ ? ffn_swiglu_ready : ffn_dense1_w != nullptr);
 
   DataType* mha_input = in_out_tensor;
 
@@ -2368,6 +2455,77 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // happens further down, after LN1 writes ln1_cache_.
   if (!is_prenorm_ && (ms_ffn || ms_smol)) {
     ReportCUDAErrors(cudaEventRecord(ln1_done_event, stream));
+  }
+
+  // ── Shared gate bank (A-Layout-2) ──
+  // Compute h = silu(W_bank x + b) and the rank-r mixer outputs FIRST on
+  // the main stream, so the FFN stream (which needs h + lrb_ffn for its
+  // gate) can be released as early as possible.  All three consumers
+  // (GLU-V, VGA-E, FFN gate) read the same post-norm residual x that the
+  // sublayers read.  Post-norm only — asserted at construction.
+  const bool use_bank = has_gate_bank_ && !is_prenorm_ &&
+                        bank_h_buf != nullptr && bank_done_event != nullptr;
+  DataType* bank_lrb_v = nullptr;
+  DataType* bank_lrb_vga = nullptr;
+  DataType* bank_lrb_ffn = nullptr;
+  if (use_bank) {
+    const int bank_batch = N * 64;
+    const size_t bank_max_tokens = (size_t)max_batch_size_ * 64;
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, gate_bank_size_,
+                          bank_batch, embedding_op_size_, 1.0f,
+                          (const DataType*)gate_bank_w_, embedding_op_size_,
+                          in_out_tensor, embedding_op_size_, 0.0f,
+                          bank_h_buf, gate_bank_size_);
+    addBiasBatched<DataType>(bank_h_buf, bank_h_buf, gate_bank_b_, 1,
+                             bank_batch, gate_bank_size_, ACTIVATION_SWISH,
+                             stream);
+    const int bank_total_rank = bank_rank_v_ + bank_rank_vga_ + bank_rank_ffn_;
+    if (bank_total_rank > 0 && bank_lr_buf != nullptr &&
+        bank_lrb_buf != nullptr) {
+      // Stage 1: one GEMM over the concatenated [v; vga; ffn] lr_a rows.
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, bank_total_rank,
+                            bank_batch, gate_bank_size_, 1.0f,
+                            (const DataType*)bank_lr_a_w_, gate_bank_size_,
+                            bank_h_buf, gate_bank_size_, 0.0f,
+                            bank_lr_buf, bank_total_rank);
+      // Stage 2: per-site lr_b GEMMs reading their row slice of
+      // bank_lr_buf (ldb = total rank).  Output segments are carved out
+      // of bank_lrb_buf at fixed max-token strides in [v | vga | ffn]
+      // order — must match the AttentionBody allocation exactly.
+      DataType* seg = bank_lrb_buf;
+      int r_off = 0;
+      if (bank_rank_v_ > 0) {
+        bank_lrb_v = seg;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, mha_v_size_,
+                              bank_batch, bank_rank_v_, 1.0f,
+                              (const DataType*)bank_v_lr_b_w_, bank_rank_v_,
+                              bank_lr_buf + r_off, bank_total_rank, 0.0f,
+                              bank_lrb_v, mha_v_size_);
+        seg += bank_max_tokens * mha_v_size_;
+        r_off += bank_rank_v_;
+      }
+      if (bank_rank_vga_ > 0) {
+        bank_lrb_vga = seg;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, mha_q_size_,
+                              bank_batch, bank_rank_vga_, 1.0f,
+                              (const DataType*)bank_vga_lr_b_w_,
+                              bank_rank_vga_, bank_lr_buf + r_off,
+                              bank_total_rank, 0.0f, bank_lrb_vga,
+                              mha_q_size_);
+        seg += bank_max_tokens * mha_q_size_;
+        r_off += bank_rank_vga_;
+      }
+      if (bank_rank_ffn_ > 0) {
+        bank_lrb_ffn = seg;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, ffn_dff_,
+                              bank_batch, bank_rank_ffn_, 1.0f,
+                              (const DataType*)bank_ffn_lr_b_w_,
+                              bank_rank_ffn_, bank_lr_buf + r_off,
+                              bank_total_rank, 0.0f, bank_lrb_ffn, ffn_dff_);
+        r_off += bank_rank_ffn_;
+      }
+    }
+    ReportCUDAErrors(cudaEventRecord(bank_done_event, stream));
   }
 
   if (is_prenorm_) {
@@ -2511,7 +2669,21 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     if (has_swiglu_) {
       const int dff = ffn_dff_;
       DataType* hidden_out = ffn_buf_wide;
-      if (ffn_gate_up_w_ != nullptr) {
+      if (use_bank && has_bank_ffn_) {
+        // Bank-adapter SwiGLU: up-only GEMM (the gate comes from the
+        // shared bank).  The up GEMM only needs ffn_src, so it runs
+        // before waiting on the bank; BankGatedMul then needs h/lrb_ffn,
+        // produced on the main stream behind bank_done_event.
+        DataType* up_out = ffn_buf_wide + (size_t)dff * batch;
+        cublasXgemm(ffn_h, CUBLAS_OP_T, CUBLAS_OP_N, dff, batch, num_inputs,
+                    1.0f, (const DataType*)ffn_up_w_, num_inputs,
+                    ffn_src, num_inputs, 0.0f, up_out, dff);
+        ReportCUDAErrors(cudaStreamWaitEvent(ffn_s, bank_done_event, 0));
+        BankGatedMul<DataType>(batch, dff, gate_bank_size_, hidden_out,
+                               bank_h_buf, bank_lrb_ffn, up_out,
+                               bank_ffn_diag_, bank_ffn_bias_, ffn_up_b_,
+                               ffn_pgb_, swiglu_softcap_, ffn_s);
+      } else if (ffn_gate_up_w_ != nullptr) {
         cublasXgemm(ffn_h, CUBLAS_OP_T, CUBLAS_OP_N, 2 * dff, batch,
                     num_inputs, 1.0f, (const DataType*)ffn_gate_up_w_,
                     num_inputs, ffn_src, num_inputs, 0.0f,
@@ -2960,7 +3132,23 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         // (col-major (batch, 2*v_w_out) with gate rows first, up rows next).
         // Under GQA the fused weight was built at width = mha_v_size_ (= kv_dim).
         // Fallback (two GEMMs) only fires if mha_vg_vu_w_ alloc failed.
-        if (mha_vg_vu_w_ != nullptr) {
+        if (use_bank && has_bank_v_) {
+          // Bank-adapter GLU-V: single up-only GEMM into v_dst, then the
+          // fused kernel gates it IN PLACE from the shared bank (out == up
+          // aliasing is same-index read-then-write, safe).  PGB + v_softcap
+          // intentionally NOT applied here — they follow the standard path
+          // below (non-GQA) or fold into expandKVWeighted (GQA), exactly
+          // as for the non-bank GLU-V.
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, v_w_out,
+                                batch, num_inputs, 1.0f,
+                                (const DataType*)mha_v_up_w_, num_inputs,
+                                mha_input, num_inputs, 0.0f, v_dst, v_w_out);
+          BankGatedMul<DataType>(batch, v_w_out, gate_bank_size_, v_dst,
+                                 bank_h_buf, bank_lrb_v, v_dst,
+                                 bank_v_diag_, bank_v_bias_, mha_v_up_b_,
+                                 /*pgb=*/(const DataType*)nullptr,
+                                 /*softcap=*/0.0f, stream);
+        } else if (mha_vg_vu_w_ != nullptr) {
           // Under GQA, the fused [gate;up] output lives in gu_kv (carved
           // earlier from nla_qk_temp).  In the non-GQA case we reuse
           // nla_qk_temp itself — same layout, just full width.
@@ -3430,7 +3618,14 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // VGA-E: element-wise gate on attention output.
   // buffer2 (attention output) *= sigmoid(Wg * input + bg)
   if (has_vga_elem_) {
-    if (vga_gate_buf_) {
+    if (use_bank && has_bank_vga_) {
+      // Bank-adapter VGA-E: gate pre-activation comes from the shared
+      // bank (diag ⊙ h + b + lrb) — no gate GEMM at all.
+      FusedVGAEBank<DataType>(N * 64 * d_model, buffer2, bank_h_buf,
+                              gate_bank_size_, bank_lrb_vga,
+                              bank_vga_diag_, bank_vga_bias_, d_model,
+                              stream);
+    } else if (vga_gate_buf_) {
       // Pre-norm: vga_gate_buf_ holds raw GEMM logits (bias+sigmoid deferred).
       // FusedVGAE applies bias+sigmoid+multiply in a single kernel, replacing
       // the separate addVectors(sigmoid) + ElementwiseMultiply pair.
@@ -4017,6 +4212,19 @@ EncoderBlock<DataType>::~EncoderBlock() {
   FreeWeight(mha_kv_b_, arena_);
   FreeWeight(attn_ffn_combined_bias_, arena_);  // runtime buffer (direct cudaMalloc)
   FreeWeight(mha_qkv_fused_w_, arena_);          // built from arena slots, see ctor
+  // Shared gate bank (A-Layout-2) weights.
+  FreeWeight(gate_bank_w_, arena_);
+  FreeWeight(gate_bank_b_, arena_);
+  FreeWeight(bank_lr_a_w_, arena_);
+  FreeWeight(bank_v_diag_, arena_);
+  FreeWeight(bank_v_bias_, arena_);
+  FreeWeight(bank_v_lr_b_w_, arena_);
+  FreeWeight(bank_vga_diag_, arena_);
+  FreeWeight(bank_vga_bias_, arena_);
+  FreeWeight(bank_vga_lr_b_w_, arena_);
+  FreeWeight(bank_ffn_diag_, arena_);
+  FreeWeight(bank_ffn_bias_, arena_);
+  FreeWeight(bank_ffn_lr_b_w_, arena_);
   // exo_lambda_ is host-side (exo_lambda_host_), no GPU free needed.
 }
 
@@ -4442,6 +4650,39 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
       ReportCUDAErrors(cudaMalloc(&ffn_buf_wide_, wide));
       ReportCUDAErrors(cudaMalloc(&ffn_buf_out_, out));
 
+      // ── Shared gate bank (A-Layout-2) buffers ──
+      // Dedicated allocations: h is written on the main stream and read by
+      // both streams within a layer, so it cannot live in reusable scratch.
+      // Segment widths/order in bank_lrb_buf_ ([v | vga | ffn], rank>0
+      // sites only, fixed max-token strides) must match the carve in
+      // EncoderBlock::Eval exactly.
+      {
+        const auto* enc0 = encoder_weights_[0];
+        has_gate_bank_ = enc0->has_gate_bank_;
+        if (has_gate_bank_) {
+          const size_t max_tokens = (size_t)max_batch_size * 64;
+          ReportCUDAErrors(cudaMalloc(
+              &bank_h_buf_,
+              max_tokens * enc0->gate_bank_size_ * sizeof(DataType)));
+          const int total_rank = enc0->bank_rank_v_ + enc0->bank_rank_vga_ +
+                                 enc0->bank_rank_ffn_;
+          if (total_rank > 0) {
+            size_t lrb_width = 0;
+            if (enc0->bank_rank_v_ > 0) lrb_width += enc0->mha_v_size_;
+            if (enc0->bank_rank_vga_ > 0) lrb_width += enc0->mha_q_size_;
+            if (enc0->bank_rank_ffn_ > 0) lrb_width += enc0->ffn_dff_;
+            ReportCUDAErrors(cudaMalloc(
+                &bank_lr_buf_, max_tokens * total_rank * sizeof(DataType)));
+            ReportCUDAErrors(cudaMalloc(
+                &bank_lrb_buf_, max_tokens * lrb_width * sizeof(DataType)));
+          }
+          for (int i = 0; i < num_encoder_layers_; i++) {
+            ReportCUDAErrors(cudaEventCreateWithFlags(
+                &bank_done_events_[i], cudaEventDisableTiming));
+          }
+        }
+      }
+
       // Third-stream VGA-E was tested and reverted: median improved +2% but
       // CV doubled (1.7%→3.5%), mean flat. The main/FFN streams are already
       // perfectly balanced; removing VGA-E from the main stream critical path
@@ -4596,9 +4837,13 @@ AttentionBody<DataType>::~AttentionBody() {
   FreeWeight(value_branch_buf_, arena_);         // runtime buffer
   FreeWeight(ffn_buf_wide_, arena_);             // runtime buffer
   FreeWeight(ffn_buf_out_, arena_);              // runtime buffer
+  FreeWeight(bank_h_buf_, arena_);               // runtime buffer
+  FreeWeight(bank_lr_buf_, arena_);              // runtime buffer
+  FreeWeight(bank_lrb_buf_, arena_);             // runtime buffer
   for (int i = 0; i < num_encoder_layers_; i++) {
     if (ln1_done_events_[i]) cudaEventDestroy(ln1_done_events_[i]);
     if (ffn_done_events_[i]) cudaEventDestroy(ffn_done_events_[i]);
+    if (bank_done_events_[i]) cudaEventDestroy(bank_done_events_[i]);
   }
   for (auto exec : ffn_graph_execs_) {
     if (exec) cudaGraphExecDestroy(exec);
@@ -5321,7 +5566,13 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                ms_smol ? smol_done_events_[enc_idx] : nullptr,
                ms_smol ? smol_gen_out_ : nullptr,
                ms_smol ? smol_intermediate_ : nullptr,
-               ms_smol ? smol_intermediate2_ : nullptr);
+               ms_smol ? smol_intermediate2_ : nullptr,
+               // Shared gate bank context: requires the multi-stream FFN
+               // path (the FFN gate adapter runs on ffn_stream_).
+               (has_gate_bank_ && ms) ? bank_h_buf_ : nullptr,
+               (has_gate_bank_ && ms) ? bank_lr_buf_ : nullptr,
+               (has_gate_bank_ && ms) ? bank_lrb_buf_ : nullptr,
+               (has_gate_bank_ && ms) ? bank_done_events_[enc_idx] : nullptr);
 
     if (kLayerTimingEnabled && !in_capture) {
       cudaEventRecord(layer_ends[enc_idx], stream);

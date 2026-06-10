@@ -395,7 +395,19 @@ class EncoderBlock {
             cudaEvent_t smol_done_event = nullptr,
             DataType* smol_gen_out = nullptr,
             DataType* smol_interm = nullptr,
-            DataType* smol_interm2 = nullptr) const;
+            DataType* smol_interm2 = nullptr,
+            // Shared gate bank context (all null = no bank).
+            //   bank_h_buf:   (max_batch*64, bank) — h, written on main.
+            //   bank_lr_buf:  (max_batch*64, Σrank) — lr_a stage output.
+            //   bank_lrb_buf: per-site lr_b segments at fixed max-token
+            //                 strides, [v | vga | ffn] order (rank>0 only).
+            //   bank_done_event: recorded on main once h + lrb are ready;
+            //                 the FFN stream waits on it before its
+            //                 BankGatedMul.
+            DataType* bank_h_buf = nullptr,
+            DataType* bank_lr_buf = nullptr,
+            DataType* bank_lrb_buf = nullptr,
+            cudaEvent_t bank_done_event = nullptr) const;
 
   // Weight arena (or nullptr).  Captured at construction time from
   // tl_weight_arena.  When non-null, all GPU weight buffers below
@@ -564,6 +576,37 @@ class EncoderBlock {
   DataType* vga_elem_gate_w_ = nullptr;
   DataType* vga_elem_gate_b_ = nullptr;
   DataType* vga_gate_buf_ = nullptr;  // precomputed gate for pre-norm path
+
+  // ── Shared gate bank (A-Layout-2) ──
+  // One per-layer nonlinear basis h = silu(W_bank x + b) consumed by the
+  // GLU-V / VGA-E / SwiGLU-FFN gates through diag + rank-r adapters.
+  // Presence-detected from gate_bank_w in the proto; per-site presence
+  // from each bank_*_diag.  The replaced projections (v_gate /
+  // vga_elem_gate / gate_proj) are ABSENT in bank nets — has_glu_attn_ /
+  // has_vga_elem_ are therefore also keyed off the bank fields, and the
+  // weight-concat fast paths (mha_vg_vu_w_, ffn_gate_up_w_,
+  // mha_qkv_fused_w_) stay null under the bank.  Post-norm parallel-FFN
+  // only (matches the training-side constraint).
+  bool has_gate_bank_ = false;
+  bool has_bank_v_ = false;
+  bool has_bank_vga_ = false;
+  bool has_bank_ffn_ = false;
+  int gate_bank_size_ = 0;
+  int bank_rank_v_ = 0;
+  int bank_rank_vga_ = 0;
+  int bank_rank_ffn_ = 0;
+  DataType* gate_bank_w_ = nullptr;
+  DataType* gate_bank_b_ = nullptr;
+  DataType* bank_lr_a_w_ = nullptr;  // concat [v; vga; ffn] rows, (Σr, bank)
+  DataType* bank_v_diag_ = nullptr;
+  DataType* bank_v_bias_ = nullptr;
+  DataType* bank_v_lr_b_w_ = nullptr;
+  DataType* bank_vga_diag_ = nullptr;
+  DataType* bank_vga_bias_ = nullptr;
+  DataType* bank_vga_lr_b_w_ = nullptr;
+  DataType* bank_ffn_diag_ = nullptr;
+  DataType* bank_ffn_bias_ = nullptr;
+  DataType* bank_ffn_lr_b_w_ = nullptr;
 
   // Persistent LN1 output buffer — computes LN1 once per Eval, reused by
   // SmolGen, Q/K/V, and (for parallel FFN) the FFN. Avoids the 2-3 LN1
@@ -842,6 +885,17 @@ class AttentionBody : public BaseLayer<DataType> {
   // Dedicated FFN temp buffers (shared across all encoder layers).
   DataType* ffn_buf_wide_ = nullptr;   // (batch, 2*dff) for fused gate+up GEMM
   DataType* ffn_buf_out_ = nullptr;    // (batch, emb)   for FFN final output
+
+  // Shared gate bank (A-Layout-2) buffers — dedicated allocations because
+  // h outlives both streams' reads within a layer (main: V/VGA adapters;
+  // FFN stream: FFN gate adapter).  Sized from encoder[0]'s bank dims.
+  // bank_done_events_ are per-layer for the same cross-graph reasons as
+  // ln1_done_events_/ffn_done_events_.
+  bool has_gate_bank_ = false;
+  DataType* bank_h_buf_ = nullptr;
+  DataType* bank_lr_buf_ = nullptr;
+  DataType* bank_lrb_buf_ = nullptr;
+  cudaEvent_t bank_done_events_[kMaxEncoderLayers] = {};
 
   // Third-stream VGA-E overlap. Runs VGA-E precompute GEMM concurrently with
   // Q/K/V projections on the main stream. Enabled when multi_stream_ffn_ is

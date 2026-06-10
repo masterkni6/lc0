@@ -373,6 +373,28 @@ template <typename T>
 void FusedVGAE(int total, T* output, const T* gate, const T* bias,
                int bias_size, cudaStream_t stream);
 
+// ── Shared gate bank adapters (A-Layout-2) ──
+// h is the encoder layer's shared nonlinear basis silu(W_bank x + b),
+// stored column-major (bank_dim, tokens).  Site gate pre-activation:
+//   pre = diag[c] * h[token, c] + gate_b[c] (+ lrb[token, c])
+// lrb (optional, (out_dim, tokens)) is the rank-r mixer output; null for
+// rank-0 (diagonal-only) adapters.
+//
+// BankGatedMul (GLU-V / SwiGLU-FFN sites):
+//   output = silu(pre) * (up + up_b) [+ pgb] [tanh-softcap]
+// out == up aliasing is safe (each thread reads then writes one index).
+template <typename T>
+void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
+                  const T* h, const T* lrb, const T* up, const T* diag,
+                  const T* gate_b, const T* up_b, const T* pgb,
+                  float softcap, cudaStream_t stream);
+
+// FusedVGAEBank (VGA-E site): output[i] *= sigmoid(pre).
+template <typename T>
+void FusedVGAEBank(int total, T* output, const T* h, int bank_dim,
+                   const T* lrb, const T* diag, const T* bias, int dim,
+                   cudaStream_t stream);
+
 // Fused Residual Add + LayerNorm: ln_output = LN(residual + delta).
 // Also writes residual_output = residual + delta if non-null.
 // Replaces addVectors + NormLayer in one pass.

@@ -1894,6 +1894,77 @@ void FusedVGAE(int total, T* output, const T* gate, const T* bias,
   ReportCUDAErrors(cudaGetLastError());
 }
 
+// ── Shared gate bank adapters (A-Layout-2) ──────────────────────────────
+// The encoder layer's bank h = silu(W_bank x + b) is column-major
+// (bank_dim, tokens), ld = bank_dim — same layout every projection GEMM in
+// this backend produces.  A site adapter forms its gate pre-activation as
+//   pre[c] = diag[c] * h[token, c] + gate_b[c] (+ lrb[token, c])
+// where lrb is the optional rank-r mixer output (lr_b @ lr_a @ h), already
+// materialized at (out_dim, tokens) by two small GEMMs.
+//
+// bank_gated_mul: V/FFN consumption — out = silu(pre) * (up + up_b)
+// [+ pgb] [softcap].  out == up aliasing is safe (same-index read/write).
+template <typename T>
+__global__ void bank_gated_mul_kernel(int total, int out_dim, int bank_dim,
+                                      T* output, const T* h, const T* lrb,
+                                      const T* up, const T* diag,
+                                      const T* gate_b, const T* up_b,
+                                      const T* pgb, float softcap) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int c = i % out_dim;
+  const size_t row = (size_t)(i / out_dim);
+  float pre = (float)diag[c] * (float)h[row * bank_dim + c] + (float)gate_b[c];
+  if (lrb) pre += (float)lrb[i];
+  const float gate = pre / (1.0f + expf(-pre));  // silu
+  float u = (float)up[i];
+  if (up_b) u += (float)up_b[c];
+  float val = gate * u;
+  if (pgb) val += (float)pgb[c];
+  if (softcap > 0.0f) val = softcap * tanhf(val / softcap);
+  output[i] = (T)val;
+}
+
+template <typename T>
+void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
+                  const T* h, const T* lrb, const T* up, const T* diag,
+                  const T* gate_b, const T* up_b, const T* pgb,
+                  float softcap, cudaStream_t stream) {
+  const int total = batch * out_dim;
+  const int kBlockSize = 256;
+  int blocks = DivUp(total, kBlockSize);
+  bank_gated_mul_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+      total, out_dim, bank_dim, output, h, lrb, up, diag, gate_b, up_b, pgb,
+      softcap);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+// fused_vgae_bank: VGA-E consumption — output *= sigmoid(pre).
+template <typename T>
+__global__ void fused_vgae_bank_kernel(int total, int dim, int bank_dim,
+                                       T* output, const T* h, const T* lrb,
+                                       const T* diag, const T* bias) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int c = i % dim;
+  const size_t row = (size_t)(i / dim);
+  float pre = (float)diag[c] * (float)h[row * bank_dim + c] + (float)bias[c];
+  if (lrb) pre += (float)lrb[i];
+  const float s = 1.0f / (1.0f + expf(-pre));
+  output[i] = (T)((float)output[i] * s);
+}
+
+template <typename T>
+void FusedVGAEBank(int total, T* output, const T* h, int bank_dim,
+                   const T* lrb, const T* diag, const T* bias, int dim,
+                   cudaStream_t stream) {
+  const int kBlockSize = 256;
+  int blocks = DivUp(total, kBlockSize);
+  fused_vgae_bank_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+      total, dim, bank_dim, output, h, lrb, diag, bias);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
 // ── Fused Residual Add + LayerNorm ──────────────────────────────────────
 // Replaces: addVectors(residual) + NormLayer with a single kernel.
 // output[i] = LN(residual[i] + delta[i])
@@ -3466,6 +3537,28 @@ template void FusedVGAE<half>(int total, half* output, const half* gate,
 template void FusedVGAE<float>(int total, float* output, const float* gate,
                                const float* bias, int bias_size,
                                cudaStream_t stream);
+
+template void BankGatedMul<half>(int batch, int out_dim, int bank_dim,
+                                 half* output, const half* h, const half* lrb,
+                                 const half* up, const half* diag,
+                                 const half* gate_b, const half* up_b,
+                                 const half* pgb, float softcap,
+                                 cudaStream_t stream);
+template void BankGatedMul<float>(int batch, int out_dim, int bank_dim,
+                                  float* output, const float* h,
+                                  const float* lrb, const float* up,
+                                  const float* diag, const float* gate_b,
+                                  const float* up_b, const float* pgb,
+                                  float softcap, cudaStream_t stream);
+
+template void FusedVGAEBank<half>(int total, half* output, const half* h,
+                                  int bank_dim, const half* lrb,
+                                  const half* diag, const half* bias, int dim,
+                                  cudaStream_t stream);
+template void FusedVGAEBank<float>(int total, float* output, const float* h,
+                                   int bank_dim, const float* lrb,
+                                   const float* diag, const float* bias,
+                                   int dim, cudaStream_t stream);
 
 template void FusedResidualAddLN<half>(int tokens, int emb, half* ln_output,
                                        half* residual_output,
