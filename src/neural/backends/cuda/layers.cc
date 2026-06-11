@@ -1589,6 +1589,10 @@ EncoderBlock<DataType>::EncoderBlock(
     mha_q_size_ = cpu_weights.mha.q2_b.size();
   }
   mha_k_size_ = cpu_weights.mha.k_b.size();
+  if (mha_k_size_ == 0) {
+    // K-on-bank nets: k_w/k_b absent (K = Wk2(bank)); width from k2_b.
+    mha_k_size_ = cpu_weights.mha.k2_b.size();
+  }
   // V bias width.  Under GLU-V, v_b is absent (the V projection splits
   // into v_gate + v_up, each with its own bias); fall back to v_gate_b
   // (same width as the standard v_b would have been).  Without this
@@ -1785,17 +1789,21 @@ EncoderBlock<DataType>::EncoderBlock(
   // NLA (NonLinear Attention): second-layer Q/K/V projection.
   has_nla_ = cpu_weights.mha.q2_w.size() > 0;
   if (has_nla_) {
-    // NLA-Q-only is signaled by absent k2_w in the proto (the PyTorch
-    // export omits wk2 when nla_q_only=true).  K stays plain linear in
-    // that case, so we skip the k2 alloc and the fused [Q1|K1] buffer
-    // (Q-only uses two separate GEMMs in Eval — see the nla_q_only_
-    // branch there).
-    nla_q_only_ = cpu_weights.mha.k2_w.size() == 0;
+    // Full NLA needs BOTH k_w (inner projection) and k2_w (outer).
+    // NLA-Q-only nets carry neither k2.  K-on-bank nets carry k2_w
+    // (bank → kv_dim) with k_w ABSENT — still the q_only Eval branch
+    // (K has no private inner projection; the bank plays that role).
+    const bool full_nla = cpu_weights.mha.k2_w.size() > 0 &&
+                          cpu_weights.mha.k_w.size() > 0;
+    nla_q_only_ = !full_nla;
     allocAndUpload<DataType>(&mha_q2_w_, cpu_weights.mha.q2_w, scratch);
     allocAndUpload<DataType>(&mha_q2_b_, cpu_weights.mha.q2_b, scratch);
-    if (!nla_q_only_) {
+    // k2 weights are needed by full NLA AND by K-on-bank.
+    if (cpu_weights.mha.k2_w.size() > 0) {
       allocAndUpload<DataType>(&mha_k2_w_, cpu_weights.mha.k2_w, scratch);
       allocAndUpload<DataType>(&mha_k2_b_, cpu_weights.mha.k2_b, scratch);
+    }
+    if (!nla_q_only_) {
 
       // Fused Q1+K1 weight: [W_q1; W_k1] (2*d_model, emb).
       // Allows a single GEMM to compute both Q1 and K1 intermediates, halving
@@ -2020,6 +2028,12 @@ EncoderBlock<DataType>::EncoderBlock(
     // a full matrix and absorbs any remix.
     bank_include_q_ = has_nla_ && nla_q_only_ &&
                       cpu_weights.mha.q_w.size() == 0;
+    // K-on-bank: K = Wk2(h) — k2_w present with k_w absent (full NLA
+    // would carry both).  Cost-neutral vs plain K; K gains the bank's
+    // silu nonlinearity.
+    bank_include_k_ = has_nla_ && nla_q_only_ &&
+                      cpu_weights.mha.k2_w.size() > 0 &&
+                      cpu_weights.mha.k_w.size() == 0;
     if (has_bank_v_) {
       allocAndUpload<DataType>(&bank_v_diag_, cpu_weights.mha.bank_v_diag,
                                scratch);
@@ -2096,6 +2110,13 @@ EncoderBlock<DataType>::EncoderBlock(
     throw Exception(
         "NLA net has q2_w but no q_w and no gate bank — incomplete export "
         "(a Layout-1 net needs gate_bank_w; sync torchprocess.py + "
+        "regenerate net_pb2.py, then re-export).");
+  }
+  if (cpu_weights.mha.k2_w.size() > 0 && cpu_weights.mha.k_w.size() == 0 &&
+      !has_gate_bank_) {
+    throw Exception(
+        "net has k2_w but no k_w and no gate bank — incomplete export "
+        "(a K-on-bank net needs gate_bank_w; sync torchprocess.py + "
         "regenerate net_pb2.py, then re-export).");
   }
 
@@ -3158,19 +3179,30 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           addBiasBatched<DataType>(mha_q, mha_q, mha_q2_b_, 1, batch, d_model,
                                    ACTIVATION_NONE, stream);
         }
-        // K = Wk @ x + bk  (plain linear, no silu, no second projection).
+        // K = Wk @ x + bk  (plain linear, no silu, no second projection),
+        // or K = Wk2 @ h + bk2 under K-on-bank (nonlinear via the bank).
         // Under GQA, K projects to kv_dim into k_kv; otherwise directly to
         // mha_k at d_model.  expandKVWeighted will fan k_kv → mha_k below
         // and absorbs the bias add, so under GQA we skip the addBiasBatched
         // launch (one fewer kernel per encoder layer × 60 layers).
         DataType* k_dst = is_gqa ? k_kv : mha_k;
         const int k_w_out = is_gqa ? kv_dim : d_model;
-        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, k_w_out,
-                              batch, num_inputs, 1.0f,
-                              (const DataType*)mha_k_w, num_inputs,
-                              mha_input, num_inputs, 0.0f, k_dst, k_w_out);
+        if (bank_include_k_) {
+          assert(use_bank && "K-on-bank requires the bank context");
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, k_w_out,
+                                batch, gate_bank_size_, 1.0f,
+                                (const DataType*)mha_k2_w_, gate_bank_size_,
+                                bank_h_buf, gate_bank_size_, 0.0f, k_dst,
+                                k_w_out);
+        } else {
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, k_w_out,
+                                batch, num_inputs, 1.0f,
+                                (const DataType*)mha_k_w, num_inputs,
+                                mha_input, num_inputs, 0.0f, k_dst, k_w_out);
+        }
+        const DataType* k_bias = bank_include_k_ ? mha_k2_b_ : mha_k_b;
         if (!is_gqa) {
-          addBiasBatched<DataType>(k_dst, k_dst, mha_k_b, 1, batch, k_w_out,
+          addBiasBatched<DataType>(k_dst, k_dst, k_bias, 1, batch, k_w_out,
                                    ACTIVATION_NONE, stream);
         }
         // else: bias deferred — passed as `b_k` to expandKVWeighted below.
@@ -3323,7 +3355,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // The kernel absorbs both and applies softcap-then-blend (math
       // identical to softcap-then-blend done as separate kernels).
       if (is_gqa) {
-        const DataType* b_k_fused = mha_k_b;
+        const DataType* b_k_fused =
+            bank_include_k_ ? mha_k2_b_ : mha_k_b;
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;
@@ -3490,7 +3523,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // fuses K/V here.  AddExoAnchors gates Q-only mode via the
       // (exo_fused_kv) check below.
       if (is_gqa) {
-        const DataType* b_k_fused = mha_k_b;
+        const DataType* b_k_fused =
+            bank_include_k_ ? mha_k2_b_ : mha_k_b;
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;

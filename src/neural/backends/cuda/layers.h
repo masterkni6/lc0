@@ -593,6 +593,9 @@ class EncoderBlock {
   // Layout-1: Q = Wq2(h) — the bank replaces NLA-Q's inner projection.
   // Detected from absent q_w with q2_w present (export writes no q_w).
   bool bank_include_q_ = false;
+  // K-on-bank: K = Wk2(h) — k2_w present with k_w absent (full NLA has
+  // both).  Cost-neutral; K gains the bank's silu nonlinearity.
+  bool bank_include_k_ = false;
   int gate_bank_size_ = 0;
   int bank_rank_v_ = 0;
   int bank_rank_vga_ = 0;
