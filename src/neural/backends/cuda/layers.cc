@@ -2270,45 +2270,17 @@ static void cublasXgemm(cublasHandle_t handle, cublasOperation_t transa,
         std::getenv("LC0_CUBLAS_FP32_ACCUM") != nullptr;
     static const bool kDumpHgemm =
         std::getenv("LC0_DUMP_HGEMM") != nullptr;
-    // ── Small-m robustness route (cross-cuBLAS-version safety) ──
-    // cuBLAS 12.9.2 (Linux, r580 driver): the legacy Hgemm dispatch for
-    // small-m fp16 TN GEMMs (the 256/320-wide projections: K2/V-up,
-    // value embedding, smolgen dense1) can select a
-    // cutlass_80_wmma_tensorop_h161616gemm_32x32 kernel that writes OUT
-    // OF BOUNDS (compute-sanitizer-verified invalid __global__ writes
-    // ~16 MB past its workspace), poisoning the CUDA context BEFORE any
-    // error status is returned — so the try-Hgemm-then-fallback pattern
-    // below is NOT safe for this shape class; the bad dispatch must be
-    // avoided up front.  cuBLAS 12.9.0 (Windows) does not exhibit it,
-    // and lc0 must run on whatever library a data-gen rig ships.
-    // Route small-m GEMMs through GemmEx with STRICT fp32 accumulation:
-    // a different, framework-default kernel family (HMMA 32F-accum — the
-    // same class PyTorch uses for fp16 matmul) that is stable across
-    // library versions.  These shapes are bandwidth-bound, so the
-    // accumulator upgrade costs nothing measurable, and numerics
-    // improve slightly.  LC0_CUBLAS_SMALL_M_HGEMM=1 restores the legacy
-    // dispatch (escape hatch / A-B benchmarking).
-    static const bool kSmallMHgemm =
-        std::getenv("LC0_CUBLAS_SMALL_M_HGEMM") != nullptr;
-    constexpr int kSmallMThreshold = 384;
-    if (!kSmallMHgemm && m <= kSmallMThreshold) {
-      static const bool kDumpEx = std::getenv("LC0_DUMP_HGEMM") != nullptr;
-      if (kDumpEx) {
-        fprintf(stderr,
-                "cublasGemmEx32F: transa=%d transb=%d m=%d n=%d k=%d "
-                "lda=%d ldb=%d ldc=%d  A=%p B=%p C=%p\n",
-                (int)transa, (int)transb, m, n, k, lda, ldb, ldc,
-                (const void*)A, (const void*)B, (void*)C);
-        fflush(stderr);
-      }
-      ReportCUBLASErrors(cublasGemmEx(
-          handle, transa, transb, m, n, k, &alpha,
-          (const void*)A, CUDA_R_16F, lda,
-          (const void*)B, CUDA_R_16F, ldb, &beta,
-          (void*)C,       CUDA_R_16F, ldc,
-          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-      return;
-    }
+    // NOTE (2026-06-11 debugging war story): an OOB crash on a Linux rig
+    // was initially pinned on the legacy Hgemm dispatch for small-m
+    // shapes and "fixed" by routing them through GemmEx fp32-accum.
+    // The real culprit was getMaxAttentionBodySize deriving d_model from
+    // the absent q_b of a Layout-1 bank net (undersized scratch → the
+    // encoder carved Q/K/V slabs past the allocation; both Hgemm and
+    // GemmEx kernels faithfully wrote through the bad pointer).  The
+    // small-m detour was reverted; if a GEMM ever reports
+    // EXECUTION_FAILED/INTERNAL_ERROR at valid-looking pointers, suspect
+    // a buffer-sizing mismatch FIRST and use LC0_DUMP_HGEMM=1 plus the
+    // [bufmap] dump in AttentionBody::Eval to check pointer containment.
     auto call_gemm_ex = [&]() {
       return cublasGemmEx(
           handle, transa, transb, m, n, k, &alpha,

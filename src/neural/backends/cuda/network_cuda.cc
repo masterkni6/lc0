@@ -123,6 +123,17 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
 
   if (weights.encoder.size() > 0) {
     encoder_d_model = weights.encoder[0].mha.q_b.size();
+    if (encoder_d_model == 0) {
+      // Layout-1 / bank nets: q_w/q_b are ABSENT (Q = Wq2(h)); the Q width
+      // comes from the second projection's bias instead — the exact same
+      // fallback EncoderBlock's ctor uses for mha_q_size_.  Without this,
+      // encoder_d_model = 0 collapses the qkv reservation below and the
+      // encoder carves its Q/K/V/temp slabs PAST the end of scratch:
+      // out-of-bounds writes that surface (or not) depending on the
+      // machine's allocator layout.  Found the hard way on a Linux rig
+      // (sanitizer-verified OOB at scratch + 3 slabs in a 2-slab buffer).
+      encoder_d_model = weights.encoder[0].mha.q2_b.size();
+    }
 
     // SwiGLU nets use gate_proj instead of dense1 — pick whichever is present.
     // Derive dff from weight matrix size (bias may be absent if bias=False).
@@ -135,11 +146,16 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
                     embedding_op_size;
     }
 
-    assert(weights.encoder[0].mha.k_b.size() > 0);
+    // K-on-bank nets carry k2_b instead of k_b; bank-form Q carries q2_b.
+    assert(weights.encoder[0].mha.k_b.size() > 0 ||
+           weights.encoder[0].mha.k2_b.size() > 0);
+    assert(encoder_d_model > 0);
     // v_b is absent under GLU-V (split into v_gate_b + v_up_b).  Only
-    // require v_b OR v_gate_w to be present, not both.
+    // require v_b OR v_gate_w to be present, not both.  Under the shared
+    // gate bank the gate weight is absent too — v_up_w marks GLU-V then.
     assert(weights.encoder[0].mha.v_b.size() > 0 ||
-           weights.encoder[0].mha.v_gate_w.size() > 0);
+           weights.encoder[0].mha.v_gate_w.size() > 0 ||
+           weights.encoder[0].mha.v_up_w.size() > 0);
   }
 
   const size_t encoder_heads = weights.encoder_head_count;
