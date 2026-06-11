@@ -148,10 +148,16 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
                           const T* b1, const T* w2, const T* b2,
                           cudaStream_t stream);
 
+// uv/uv_ld/uv_rank: optional smolgen-dictionary rank-r residual, fused
+// into the C==64 path — bias += U_b[i,:]·V_b[j,:] per logit, added to the
+// raw map BEFORE smolgen_cap (torch caps alpha·P + UVᵀ as a whole).  uv
+// points at the U block of the dict decoder output (column-major, one
+// column per (batch, head) map, ld = uv_ld; V block at +64*uv_rank).
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2,
              cudaStream_t stream, float softcap = 0.0f,
-             float smolgen_cap = 0.0f);
+             float smolgen_cap = 0.0f, const T* uv = nullptr, int uv_ld = 0,
+             int uv_rank = 0);
 
 template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,

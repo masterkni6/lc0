@@ -916,6 +916,12 @@ constexpr float kTwiceHalfMax = 131008.0f;  // Twice the max finite fp16 value.
 // softmax along C dimension which is assumed to be 64
 // each thread processes two elements. Each warp computes a sum (over 64
 // elements)
+namespace {
+// Max supported smolgen-dict residual rank in the fused softmax path
+// (shared-memory tile sizing).  The wrapper asserts uv_rank <= this.
+constexpr int kMaxDictRank = 16;
+}  // namespace
+
 template <typename T>
 __global__ void softmax_opt_64_kernel(T* output, const T* input,
                                       const T* input2, int N, float softcap,
@@ -997,6 +1003,116 @@ __global__ void softmax_opt_64_kernel(T* output, const T* input,
   }
 }
 
+// softmax_opt_64 variant with the smolgen-dictionary rank-r residual
+// fused in: bias[i,j] += U_b[i,:]·V_b[j,:] added to the RAW map before
+// the smolgen softcap (torch caps alpha·P + UVᵀ as a whole).  Separate
+// kernel so the common path pays zero overhead (no static smem, no
+// sync).  Each 256-thread block covers 512 contiguous logits = 8 rows
+// of exactly ONE (batch, head) map (4096 % 512 == 0 — blocks never
+// straddle maps); the map's V block (64 x r) and 8 needed U rows are
+// staged in shared memory with a +1 row pad (stride r+1) so the
+// per-thread reads are bank-conflict-free (gcd(r+1, 32) spreads lanes).
+// Replaces a beta=1 strided-batched GEMM that re-read + re-wrote the
+// whole dense map buffer (~40 µs/layer of bandwidth).
+template <typename T>
+__global__ void softmax_opt_64_uv_kernel(T* output, const T* input,
+                                         const T* input2, int N,
+                                         float softcap, float smolgen_cap,
+                                         const T* uv, int uv_ld,
+                                         int uv_rank) {
+  const int index = blockDim.x * blockIdx.x + threadIdx.x;
+  const int pad = uv_rank + 1;
+
+  __shared__ T sUV[(64 + 8) * (kMaxDictRank + 1)];
+  {
+    const int e0_blk = (blockDim.x * blockIdx.x) * 2;
+    const int b = e0_blk >> 12;          // map index (one 64x64 per b)
+    const int i0 = (e0_blk & 4095) >> 6;  // first row this block covers
+    const T* col = uv + (size_t)b * uv_ld;
+    for (int t = threadIdx.x; t < 64 * uv_rank; t += blockDim.x) {
+      const int row = t / uv_rank, kk = t % uv_rank;
+      sUV[row * pad + kk] = col[64 * uv_rank + t];        // V block
+    }
+    for (int t = threadIdx.x; t < 8 * uv_rank; t += blockDim.x) {
+      const int row = t / uv_rank, kk = t % uv_rank;
+      sUV[64 * pad + row * pad + kk] = col[(i0 + row) * uv_rank + kk];
+    }
+    __syncthreads();
+  }
+  if (index >= N) return;
+
+  float x[4];
+  float ex[2];
+  const bool fp16 = std::is_same<half, T>::value;
+  if (fp16) {
+    half inp[2];
+    copyAs<int>(&inp[0], &input[index * 2]);
+    x[0] = (float)inp[0];
+    x[1] = (float)inp[1];
+    copyAs<int>(&inp[0], &input2[index * 2]);
+    x[2] = (float)inp[0];
+    x[3] = (float)inp[1];
+  } else {
+    copyAs<uint2>(&x[0], &input[index * 2]);
+    copyAs<uint2>(&x[2], &input2[index * 2]);
+  }
+
+  {
+    const int o = (index * 2) & 4095;
+    const int i = (o >> 6) & 7;          // row within this block's tile
+    const int j = o & 63;                // this thread: (i, j), (i, j+1)
+    const T* sV = sUV;
+    const T* sU = sUV + 64 * pad;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int kk = 0; kk < uv_rank; kk++) {
+      const float u = (float)sU[i * pad + kk];
+      s0 += u * (float)sV[j * pad + kk];
+      s1 += u * (float)sV[(j + 1) * pad + kk];
+    }
+    x[2] += s0;
+    x[3] += s1;
+  }
+
+  if (smolgen_cap > 0.0f) {
+    const float inv_sg = 1.0f / smolgen_cap;
+    x[2] = tanhf(x[2] * inv_sg) * smolgen_cap;
+    x[3] = tanhf(x[3] * inv_sg) * smolgen_cap;
+  }
+  x[0] += x[2];
+  x[1] += x[3];
+  if (fp16) {
+    x[0] = clamp(x[0], -kTwiceHalfMax, kTwiceHalfMax);
+    x[1] = clamp(x[1], -kTwiceHalfMax, kTwiceHalfMax);
+  }
+  if (softcap > 0.0f) {
+    const float inv = 1.0f / softcap;
+    x[0] = tanhf(x[0] * inv) * softcap;
+    x[1] = tanhf(x[1] * inv) * softcap;
+  }
+  float threadMax = max(x[0], x[1]);
+  float maxval = warpMax(threadMax);
+  maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
+
+  ex[0] = exp(x[0] - maxval);
+  ex[1] = exp(x[1] - maxval);
+
+  float threadSum = ex[0] + ex[1];
+  float Sum = warpReduce(threadSum);
+  Sum = __shfl_sync(0xFFFFFFFF, Sum, 0);
+
+  ex[0] = ex[0] / Sum;
+  ex[1] = ex[1] / Sum;
+
+  if (fp16) {
+    half op[2];
+    op[0] = (half)ex[0];
+    op[1] = (half)ex[1];
+    copyAs<int>(&output[index * 2], &op[0]);
+  } else {
+    copyAs<uint2>(&output[index * 2], &ex[0]);
+  }
+}
+
 // N * C Tensors
 // performs softmax along the C dimension
 // Each thread processes one element
@@ -1062,15 +1178,28 @@ __global__ void softmax_kernel(T* output, const T* input, const T* input2,
 
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2,
-             cudaStream_t stream, float softcap, float smolgen_cap) {
+             cudaStream_t stream, float softcap, float smolgen_cap,
+             const T* uv, int uv_ld, int uv_rank) {
   if (C == 64) {
     int size = N * 32;  // Total no of threads needed
     const int kBlockSize = 256;
     int blocks = DivUp(size, kBlockSize);
-    softmax_opt_64_kernel<T>
-        <<<blocks, kBlockSize, 0, stream>>>(output, input, input2, size,
-                                            softcap, smolgen_cap);
+    if (uv != nullptr) {
+      assert(uv_rank > 0 && uv_rank <= kMaxDictRank);
+      assert(input2 != nullptr);
+      softmax_opt_64_uv_kernel<T>
+          <<<blocks, kBlockSize, 0, stream>>>(output, input, input2, size,
+                                              softcap, smolgen_cap, uv,
+                                              uv_ld, uv_rank);
+    } else {
+      softmax_opt_64_kernel<T>
+          <<<blocks, kBlockSize, 0, stream>>>(output, input, input2, size,
+                                              softcap, smolgen_cap);
+    }
   } else {
+    // The smolgen-dict UV residual is only wired for the C==64 attention
+    // path (the only consumer); other softmax users never pass uv.
+    assert(uv == nullptr);
     softmax_kernel<T><<<N, C, 0, stream>>>(output, input, input2, softcap,
                                             smolgen_cap);
   }
@@ -3453,10 +3582,12 @@ template void OutputInputTransform<float, false, ACTIVATION_MISH, true, false>(
 
 template void Softmax<half>(int N, int C, half* output, const half* input,
                             const half* input2, cudaStream_t stream,
-                            float softcap, float smolgen_cap);
+                            float softcap, float smolgen_cap, const half* uv,
+                            int uv_ld, int uv_rank);
 template void Softmax<float>(int N, int C, float* output, const float* input,
                              const float* input2, cudaStream_t stream,
-                             float softcap, float smolgen_cap);
+                             float softcap, float smolgen_cap,
+                             const float* uv, int uv_ld, int uv_rank);
 
 template void LayerNorm<half>(int N, int C, half* output, const half* input,
                               const half* bias, const half* skip,

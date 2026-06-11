@@ -2969,6 +2969,12 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // instead of the main scratch/buffer1, avoiding any aliasing with Q/K/V.
   // Main stream will wait on smol_done_event right before softmax consumes
   // the bias.
+  // Smolgen-dictionary rank-r residual handoff: when the ms_smol dict
+  // branch leaves the UVᵀ term un-applied (fused into softmax instead),
+  // these point at the U block of the decoder output in smol_interm2.
+  const DataType* smol_dict_uv = nullptr;
+  int smol_dict_uv_ld = 0;
+
   if (ms_smol) {
     ReportCUDAErrors(cudaStreamWaitEvent(smolgen_stream, ln1_done_event, 0));
     const cudaStream_t   sg_s = smolgen_stream;
@@ -3044,17 +3050,18 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                               batch, M, 1.0f,
                               (const DataType*)smol_dict_p_, num_outputs,
                               dec_out, LD, 0.0f, smol_gen_out, num_outputs);
-        // U·Vᵀ residual accumulated into the composed maps (beta=1).
-        // U/V blocks are row-major (64, r) within a decoder column =
-        // col-major (r, 64) with ld=r.  D = op_T(V)·U (m=64 over j,
-        // n=64 over i) lands D[j,i] = Σ_k V[j,k]U[i,k] at flat i*64+j —
-        // exactly C[i,j] in the row-major map layout softmax consumes.
+        // U·Vᵀ residual: FUSED into the softmax (consumed straight from
+        // dec_out) instead of accumulated into the dense maps.  The
+        // previous beta=1 strided-batched GEMM re-read + re-wrote the
+        // entire 21MB map buffer (~40µs/layer of bandwidth) and
+        // cancelled the dictionary's gen-GEMM saving — measured: r=8
+        // 3584 nps vs r=0 3902 on the QK arm.  Lifetime: dec_out
+        // (smol_interm2) provably survives until this layer's softmax —
+        // layer i+1's smolgen waits on ln1_done(i+1), which records on
+        // the main stream AFTER softmax(i) completes.
         if (r > 0) {
-          cublasXGemmStridedBatched<DataType>(
-              sg_h, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, r, 1.0f,
-              dec_out + M + 64 * r, r, LD,
-              dec_out + M, r, LD,
-              1.0f, smol_gen_out, 64, num_outputs, batch, use_gemm_ex_);
+          smol_dict_uv = dec_out + M;
+          smol_dict_uv_ld = LD;
         }
       } else {
         cublasXgemm<DataType>(sg_h, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
@@ -3986,7 +3993,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
 #ifdef USE_CUTLASS
   if (use_fused_mha_ && attn_logit_cap_ == 0.0f &&
-      smolgen_softcap_ == 0.0f) {
+      smolgen_softcap_ == 0.0f && smol_dict_uv == nullptr) {
     // CUTLASS fused MHA hardcodes 1/sqrt(d) scaling internally and has no
     // softcap support.  Routed here only when:
     //   - attention softcap is disabled (cap == 0), AND
@@ -4049,7 +4056,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           N * encoder_heads_);
 
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
-              smol_bias, stream, attn_logit_cap_, smolgen_softcap_);
+              smol_bias, stream, attn_logit_cap_, smolgen_softcap_,
+              smol_dict_uv, smol_dict_uv_ld, smol_dict_rank_);
 
       // attn_weights @ V -> buffer2
       cublasXGemmBatched<DataType>(
