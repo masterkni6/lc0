@@ -35,6 +35,8 @@ User's 640×60 net (t6-640x60.yaml: emb=640, heads=20, kv=10, NLA-Q-only + GLU-V
 | K-on-bank | `gate_bank_include_k: true` | `k2_w` present, `k_w` ABSENT | K = Wk2(h) |
 | GLU-Q | `gate_bank_glu_q: true` | `bank_q_diag` (+ `q_w`, no `q2_w`) | Q = silu(adapter(h))⊙(Wq·x+b) |
 | GLU-K | `gate_bank_glu_k: true` | `bank_k_diag` (+ `k_w`, no `k2_w`) | K = silu(adapter(h))⊙(Wk·x+b) |
+| gated-Q | `gate_bank_gated_q: true` (needs include_q) | `bank_q_diag` + `q2_w` | Q = silu(adapter(h))⊙(Wq2·h+b) — 3rd-order addressing |
+| gated-K | `gate_bank_gated_k: true` (needs include_k) | `bank_k_diag` + `k2_w` | K likewise; identity init (diag=0, b=1.27846 → gate≡1): step 0 == ungated arm, usable as fine-tune extension; verified BIT-IDENTICAL vs ungated same-seed pb; cost −5.9% at h10 (4153 vs 4414) |
 
 All Q/K arms require `use_nla: true` + `nla_q_only: true` in yaml. GLU-Q drops q2_w → net is structurally non-NLA in CUDA and routes via the fallback Q/K/V branch (which has a bank GLU-V arm). GLU-K alone routes via the NLA-Q-only branch. glu_q+include_k is forbidden (not routable). Proto: EncoderLayer `gate_bank_w/b=14/15`; MHA `bank_v_*=45-48`, `bank_vga_*=49-52`, `bank_q_*=53-56`, `bank_k_*=57-60`; FFN `bank_gate_*=18-21`. Bias semantics: GLU-form K/Q bias lives INSIDE the gate product — expandKVWeighted gets `b_k=nullptr` under GLU-K.
 
