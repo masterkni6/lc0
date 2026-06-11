@@ -1918,7 +1918,7 @@ __global__ void bank_gated_mul_kernel(int total, int out_dim, int bank_dim,
                                       const T* up, const T* diag,
                                       const T* gate_b, const T* up_b,
                                       const T* pgb, float softcap,
-                                      int up_stride) {
+                                      int up_stride, int out_stride) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int c = i % out_dim;
@@ -1931,21 +1931,23 @@ __global__ void bank_gated_mul_kernel(int total, int out_dim, int bank_dim,
   float val = gate * u;
   if (pgb) val += (float)pgb[c];
   if (softcap > 0.0f) val = softcap * tanhf(val / softcap);
-  output[i] = (T)val;
+  output[row * (size_t)out_stride + c] = (T)val;
 }
 
 template <typename T>
 void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
                   const T* h, const T* lrb, const T* up, const T* diag,
                   const T* gate_b, const T* up_b, const T* pgb,
-                  float softcap, int up_stride, cudaStream_t stream) {
+                  float softcap, int up_stride, cudaStream_t stream,
+                  int out_stride) {
   const int total = batch * out_dim;
   const int kBlockSize = 256;
   int blocks = DivUp(total, kBlockSize);
   if (up_stride <= 0) up_stride = out_dim;
+  if (out_stride <= 0) out_stride = out_dim;
   bank_gated_mul_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
       total, out_dim, bank_dim, output, h, lrb, up, diag, gate_b, up_b, pgb,
-      softcap, up_stride);
+      softcap, up_stride, out_stride);
   ReportCUDAErrors(cudaGetLastError());
 }
 
@@ -3580,14 +3582,15 @@ template void BankGatedMul<half>(int batch, int out_dim, int bank_dim,
                                  const half* up, const half* diag,
                                  const half* gate_b, const half* up_b,
                                  const half* pgb, float softcap,
-                                 int up_stride, cudaStream_t stream);
+                                 int up_stride, cudaStream_t stream,
+                                 int out_stride);
 template void BankGatedMul<float>(int batch, int out_dim, int bank_dim,
                                   float* output, const float* h,
                                   const float* lrb, const float* up,
                                   const float* diag, const float* gate_b,
                                   const float* up_b, const float* pgb,
                                   float softcap, int up_stride,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, int out_stride);
 
 template void FusedVGAEBank<half>(int total, half* output, const half* h,
                                   int bank_dim, const half* lrb,

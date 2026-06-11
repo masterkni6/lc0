@@ -167,6 +167,10 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   // are all active) replaces 3 GEMMs with one, but the wider output
   // (d_model + 3*kv_dim = up to 2.5*d_model) plus v_kv (= 0.5*d_model)
   // = 3*d_model of intermediate beyond Q/K/V — bumps to 6*qkv when has_nla.
+  // GLU-Q/K bank nets (q2_w absent → !has_nla) also build the fused
+  // weight ([Wq|Wk|Wv_up], ≤ 2*d_model) and stage it plus v_kv_fused
+  // (0.5*d_model) in the GQA transient region — 5.5*qkv total, inside
+  // the 7*qkv non-NLA + GQA reservation below.
   bool has_nla = weights.encoder.size() > 0 &&
                  weights.encoder[0].mha.q2_w.size() > 0;
   bool has_glu_v = weights.encoder.size() > 0 &&

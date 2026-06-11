@@ -1910,7 +1910,20 @@ EncoderBlock<DataType>::EncoderBlock(
   const bool bank_fused_v = cpu_weights.gate_bank_w.size() > 0 &&
                             cpu_weights.mha.bank_v_diag.size() > 0 &&
                             mha_v_up_w_ != nullptr;
-  if (has_nla_ && nla_q_only_ && is_gqa &&
+  // GLU-Q/K via bank: q2_w is absent (so has_nla_ is false) but Q and K
+  // still read x through q_w/k_w (now the content/up projections) — the
+  // same [Wq | Wk | Wv_up] fused GEMM applies; the bank gates each slot
+  // afterwards.  This is the structural advantage of the GLU forms over
+  // Layout-1/K-on-bank, whose h-based reads cannot join this GEMM.
+  const bool bank_glu_qk_fused =
+      bank_fused_v && !has_nla_ &&
+      cpu_weights.mha.bank_q_diag.size() > 0 &&
+      cpu_weights.mha.bank_k_diag.size() > 0;
+  // Debug escape: LC0_NO_FUSED_QKV=1 forces the separate-GEMM Q/K/V path
+  // so fused-vs-separate output parity can be checked on the same net.
+  const bool disable_fused_qkv = getenv("LC0_NO_FUSED_QKV") != nullptr;
+  if (!disable_fused_qkv &&
+      ((has_nla_ && nla_q_only_) || bank_glu_qk_fused) && is_gqa &&
       ((has_glu_attn_ && mha_vg_vu_w_ != nullptr) || bank_fused_v) &&
       mha_q_w != nullptr && mha_k_w != nullptr && fused_qkv_scratch_fits) {
     const size_t emb = (size_t)embedding_op_size_;
@@ -2034,6 +2047,10 @@ EncoderBlock<DataType>::EncoderBlock(
     bank_include_k_ = has_nla_ && nla_q_only_ &&
                       cpu_weights.mha.k2_w.size() > 0 &&
                       cpu_weights.mha.k_w.size() == 0;
+    // GLU-Q/K via bank: the bank gates a private linear view of x
+    // (q_w/k_w are the content/up projections; q2_w/k2_w absent).
+    bank_glu_q_ = cpu_weights.mha.bank_q_diag.size() > 0;
+    bank_glu_k_ = cpu_weights.mha.bank_k_diag.size() > 0;
     if (has_bank_v_) {
       allocAndUpload<DataType>(&bank_v_diag_, cpu_weights.mha.bank_v_diag,
                                scratch);
@@ -2064,18 +2081,48 @@ EncoderBlock<DataType>::EncoderBlock(
       bank_rank_ffn_ =
           (int)(cpu_weights.ffn.bank_gate_lr_a.size() / gate_bank_size_);
     }
-    // Concatenate the sites' lr_a rows ([v; vga; ffn] order) into one
-    // (Σrank, bank) weight so the mixers' first stage is a single GEMM.
+    if (bank_glu_q_) {
+      bank_q_width_ = (int)cpu_weights.mha.bank_q_diag.size();
+      allocAndUpload<DataType>(&bank_q_diag_, cpu_weights.mha.bank_q_diag,
+                               scratch);
+      allocAndUpload<DataType>(&bank_q_bias_, cpu_weights.mha.bank_q_b,
+                               scratch);
+      allocAndUpload<DataType>(&bank_q_lr_b_w_, cpu_weights.mha.bank_q_lr_b,
+                               scratch);
+      bank_rank_q_ =
+          (int)(cpu_weights.mha.bank_q_lr_a.size() / gate_bank_size_);
+    }
+    if (bank_glu_k_) {
+      bank_k_width_ = (int)cpu_weights.mha.bank_k_diag.size();
+      allocAndUpload<DataType>(&bank_k_diag_, cpu_weights.mha.bank_k_diag,
+                               scratch);
+      allocAndUpload<DataType>(&bank_k_bias_, cpu_weights.mha.bank_k_b,
+                               scratch);
+      allocAndUpload<DataType>(&bank_k_lr_b_w_, cpu_weights.mha.bank_k_lr_b,
+                               scratch);
+      bank_rank_k_ =
+          (int)(cpu_weights.mha.bank_k_lr_a.size() / gate_bank_size_);
+    }
+    // Concatenate the sites' lr_a rows ([v; vga; ffn; q; k] order) into
+    // one (Σrank, bank) weight so the mixers' first stage is a single
+    // GEMM.  q/k append AFTER the original three so existing offsets and
+    // the AttentionBody lrb-carve order stay stable.
     std::vector<float> lr_a_cat;
     lr_a_cat.reserve(cpu_weights.mha.bank_v_lr_a.size() +
                      cpu_weights.mha.bank_vga_lr_a.size() +
-                     cpu_weights.ffn.bank_gate_lr_a.size());
+                     cpu_weights.ffn.bank_gate_lr_a.size() +
+                     cpu_weights.mha.bank_q_lr_a.size() +
+                     cpu_weights.mha.bank_k_lr_a.size());
     lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_v_lr_a.begin(),
                     cpu_weights.mha.bank_v_lr_a.end());
     lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_vga_lr_a.begin(),
                     cpu_weights.mha.bank_vga_lr_a.end());
     lr_a_cat.insert(lr_a_cat.end(), cpu_weights.ffn.bank_gate_lr_a.begin(),
                     cpu_weights.ffn.bank_gate_lr_a.end());
+    lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_q_lr_a.begin(),
+                    cpu_weights.mha.bank_q_lr_a.end());
+    lr_a_cat.insert(lr_a_cat.end(), cpu_weights.mha.bank_k_lr_a.begin(),
+                    cpu_weights.mha.bank_k_lr_a.end());
     allocAndUpload<DataType>(&bank_lr_a_w_, lr_a_cat, scratch);
   }
 
@@ -2118,6 +2165,51 @@ EncoderBlock<DataType>::EncoderBlock(
         "net has k2_w but no k_w and no gate bank — incomplete export "
         "(a K-on-bank net needs gate_bank_w; sync torchprocess.py + "
         "regenerate net_pb2.py, then re-export).");
+  }
+  if ((cpu_weights.mha.bank_q_diag.size() > 0 ||
+       cpu_weights.mha.bank_k_diag.size() > 0) &&
+      !has_gate_bank_) {
+    throw Exception(
+        "net has bank_q_*/bank_k_* adapters but no gate_bank_w — "
+        "incomplete export (sync torchprocess.py + regenerate net_pb2.py, "
+        "then re-export).");
+  }
+  if (bank_glu_q_) {
+    if (cpu_weights.mha.q2_w.size() > 0) {
+      throw Exception(
+          "net has both bank_q_diag (GLU-Q) and q2_w (NLA/Layout-1) — "
+          "ambiguous Q form; the export should never produce this.");
+    }
+    if (cpu_weights.mha.q_w.size() == 0) {
+      throw Exception(
+          "GLU-Q net has bank_q_diag but no q_w (the content/up "
+          "projection) — incomplete export.");
+    }
+    if (bank_q_width_ != mha_q_size_) {
+      throw Exception("bank_q_diag size " + std::to_string(bank_q_width_) +
+                      " != d_model " + std::to_string(mha_q_size_));
+    }
+  }
+  if (bank_glu_k_) {
+    if (cpu_weights.mha.k2_w.size() > 0) {
+      throw Exception(
+          "net has both bank_k_diag (GLU-K) and k2_w (full NLA / "
+          "K-on-bank) — ambiguous K form; the export should never "
+          "produce this.");
+    }
+    if (cpu_weights.mha.k_w.size() == 0) {
+      throw Exception(
+          "GLU-K net has bank_k_diag but no k_w (the content/up "
+          "projection) — incomplete export.");
+    }
+    const int expect_kv =
+        (kv_heads_ < encoder_heads_)
+            ? kv_heads_ * (mha_q_size_ / encoder_heads_)
+            : mha_q_size_;
+    if (bank_k_width_ != expect_kv) {
+      throw Exception("bank_k_diag size " + std::to_string(bank_k_width_) +
+                      " != kv_dim " + std::to_string(expect_kv));
+    }
   }
 
   // Persistent LN1 cache for Pre-Norm paths. Computes LN1 once per Eval.
@@ -2550,10 +2642,13 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // sublayers read.  Post-norm only — asserted at construction.
   const bool use_bank = has_gate_bank_ && !is_prenorm_ &&
                         bank_h_buf != nullptr && bank_done_event != nullptr;
-  const int bank_total_rank = bank_rank_v_ + bank_rank_vga_ + bank_rank_ffn_;
+  const int bank_total_rank = bank_rank_v_ + bank_rank_vga_ + bank_rank_ffn_ +
+                              bank_rank_q_ + bank_rank_k_;
   DataType* bank_lrb_v = nullptr;
   DataType* bank_lrb_vga = nullptr;
   DataType* bank_lrb_ffn = nullptr;
+  DataType* bank_lrb_q = nullptr;
+  DataType* bank_lrb_k = nullptr;
   if (use_bank) {
     const int bank_batch = N * 64;
     cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, gate_bank_size_,
@@ -2565,11 +2660,11 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                              bank_batch, gate_bank_size_, ACTIVATION_SWISH,
                              stream);
     // Rank-r mixers: stage 1 is one GEMM over the concatenated
-    // [v; vga; ffn] lr_a rows; stage 2 is per-site lr_b GEMMs whose
+    // [v; vga; ffn; q; k] lr_a rows; stage 2 is per-site lr_b GEMMs whose
     // outputs are carved out of bank_lr_buf AFTER the lr_a region, at
-    // fixed max-token strides in [v | vga | ffn] order (must match the
-    // AttentionBody allocation).  Folding stage 2 into the consuming
-    // kernels was measured slower (see note in common_kernels.cu).
+    // fixed max-token strides in [v | vga | ffn | q | k] order (must
+    // match the AttentionBody allocation).  Folding stage 2 into the
+    // consuming kernels was measured slower (see common_kernels.cu).
     if (bank_total_rank > 0 && bank_lr_buf != nullptr) {
       const size_t bank_max_tokens = (size_t)max_batch_size_ * 64;
       cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, bank_total_rank,
@@ -2607,7 +2702,27 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                               (const DataType*)bank_ffn_lr_b_w_,
                               bank_rank_ffn_, bank_lr_buf + r_off,
                               bank_total_rank, 0.0f, bank_lrb_ffn, ffn_dff_);
+        seg += bank_max_tokens * ffn_dff_;
         r_off += bank_rank_ffn_;
+      }
+      if (bank_rank_q_ > 0) {
+        bank_lrb_q = seg;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, bank_q_width_,
+                              bank_batch, bank_rank_q_, 1.0f,
+                              (const DataType*)bank_q_lr_b_w_, bank_rank_q_,
+                              bank_lr_buf + r_off, bank_total_rank, 0.0f,
+                              bank_lrb_q, bank_q_width_);
+        seg += bank_max_tokens * bank_q_width_;
+        r_off += bank_rank_q_;
+      }
+      if (bank_rank_k_ > 0) {
+        bank_lrb_k = seg;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, bank_k_width_,
+                              bank_batch, bank_rank_k_, 1.0f,
+                              (const DataType*)bank_k_lr_b_w_, bank_rank_k_,
+                              bank_lr_buf + r_off, bank_total_rank, 0.0f,
+                              bank_lrb_k, bank_k_width_);
+        r_off += bank_rank_k_;
       }
     }
     ReportCUDAErrors(cudaEventRecord(bank_done_event, stream));
@@ -3099,10 +3214,26 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
               /*column_stride=*/M_fused);
         }
 
+        // 5b) GLU-K via bank: gate the K slot IN PLACE at its strided
+        //     location (out_stride == up_stride == M_fused, same-index
+        //     read-then-write).  The K bias moves INSIDE the gate product
+        //     — K = silu(adapter(h)) ⊙ (Wk·x + b_k) — so expandKVWeighted
+        //     below must NOT add it again (b_k_fused = nullptr).
+        if (bank_glu_k_) {
+          assert(use_bank && "GLU-K requires the bank context");
+          BankGatedMul<DataType>(
+              batch, kv_dim_f, gate_bank_size_, qkv_fused_out + d_model,
+              bank_h_buf, bank_lrb_k, qkv_fused_out + d_model, bank_k_diag_,
+              bank_k_bias_, mha_k_b, /*pgb=*/(const DataType*)nullptr,
+              /*softcap=*/0.0f, /*up_stride=*/M_fused, stream,
+              /*out_stride=*/M_fused);
+        }
+
         // 6) expandKVWeighted reads K from qkv_fused_out at offset d_model
         //    with stride M_fused; V from v_kv_fused at stride kv_dim_f.
-        //    K bias and V PGB/softcap still folded in via b_k/b_v/v_softcap.
-        const DataType* b_k_fused = mha_k_b;
+        //    K bias and V PGB/softcap still folded in via b_k/b_v/v_softcap
+        //    (K bias already consumed by the GLU-K gate when active).
+        const DataType* b_k_fused = bank_glu_k_ ? nullptr : mha_k_b;
         const DataType* b_v_fused = pgb_v_;  // GLU-V branch: PGB only
         const float     v_softcap_fused = v_softcap_;
         const DataType* exo_k_f = exo_fused_kv ? exo_k_anc : nullptr;
@@ -3199,13 +3330,27 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                 batch, num_inputs, 1.0f,
                                 (const DataType*)mha_k_w, num_inputs,
                                 mha_input, num_inputs, 0.0f, k_dst, k_w_out);
+          // GLU-K via bank: gate the plain projection in place; the K
+          // bias moves INSIDE the gate product, so it must not be added
+          // again below / in expandKVWeighted.
+          if (bank_glu_k_) {
+            assert(use_bank && "GLU-K requires the bank context");
+            BankGatedMul<DataType>(batch, k_w_out, gate_bank_size_, k_dst,
+                                   bank_h_buf, bank_lrb_k, k_dst,
+                                   bank_k_diag_, bank_k_bias_, mha_k_b,
+                                   /*pgb=*/(const DataType*)nullptr,
+                                   /*softcap=*/0.0f, /*up_stride=*/0, stream);
+          }
         }
-        const DataType* k_bias = bank_include_k_ ? mha_k2_b_ : mha_k_b;
-        if (!is_gqa) {
+        const DataType* k_bias =
+            bank_glu_k_ ? nullptr
+                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
+        if (!is_gqa && k_bias != nullptr) {
           addBiasBatched<DataType>(k_dst, k_dst, k_bias, 1, batch, k_w_out,
                                    ACTIVATION_NONE, stream);
         }
-        // else: bias deferred — passed as `b_k` to expandKVWeighted below.
+        // else: bias deferred — passed as `b_k` to expandKVWeighted below
+        // (already consumed inside the gate when GLU-K is active).
       } else {
         // ── Full NLA: nonlinear on BOTH Q and K (existing fused path) ──
         // Single GEMM: [W_q1; W_k1]^T @ x → [Q1 | K1] in one launch.
@@ -3356,7 +3501,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // identical to softcap-then-blend done as separate kernels).
       if (is_gqa) {
         const DataType* b_k_fused =
-            bank_include_k_ ? mha_k2_b_ : mha_k_b;
+            bank_glu_k_ ? nullptr
+                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;
@@ -3438,6 +3584,78 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       DataType* gu_kv2 = is_gqa ? (kv_scratch + kv_dim * max_batch) : nullptr;
       DataType* v_kv2 = is_gqa ? (kv_scratch + 3 * kv_dim * max_batch) : nullptr;
 
+      // ── Fused [Wq | Wk | Wv_up] GEMM for GLU-Q/K bank nets ──
+      // Q/K/V all read x (the bank only GATES), so the NLA path's single
+      // input GEMM applies unchanged here; each slot is then gated from
+      // the bank.  This is the structural payoff of the GLU forms over
+      // Layout-1/K-on-bank, whose h-based reads cannot join this GEMM.
+      // Scratch: qkv_fused_out (M_fused ≤ 2*d_model) + v_kv_fused
+      // (kv_dim) reuse the GQA transient region — 2.5*d_model ≤ the
+      // 4*d_model this region holds under the 7*qkv reservation.
+      if (mha_qkv_fused_w_ != nullptr && bank_glu_q_ && bank_glu_k_) {
+        assert(use_bank && "GLU-Q/K requires the bank context");
+        assert(is_gqa && "fused [Wq|Wk|Wv_up] is built under GQA only");
+        const int M_fused = mha_qkv_fused_M_;  // d_model + 2*kv_dim
+        DataType* qkv_fused_out = kv_scratch;
+        DataType* v_kv_fused = qkv_fused_out + (size_t)M_fused * max_batch;
+
+        // 1) Single fused GEMM: [Wq | Wk | Wv_up]^T @ mha_input.
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, M_fused,
+                              batch, num_inputs, 1.0f,
+                              (const DataType*)mha_qkv_fused_w_, num_inputs,
+                              mha_input, num_inputs, 0.0f,
+                              qkv_fused_out, M_fused);
+
+        // 2) Q = silu(adapter_q(h)) ⊙ (up_q + b_q) → mha_q (contiguous).
+        //    up_q lives at offset 0 of the fused output, row stride
+        //    M_fused; the Q bias moves inside the gate product.
+        BankGatedMul<DataType>(batch, d_model, gate_bank_size_, mha_q,
+                               bank_h_buf, bank_lrb_q, qkv_fused_out,
+                               bank_q_diag_, bank_q_bias_, mha_q_b,
+                               /*pgb=*/(const DataType*)nullptr,
+                               /*softcap=*/0.0f, /*up_stride=*/M_fused,
+                               stream);
+        if (exo_fused_kv) {
+          // Anchor adds AFTER the gate (matches torch: q += exo_q after
+          // the projection completes).  Bias already inside the gate.
+          addVectors<DataType>(mha_q, mha_q,
+                               const_cast<DataType*>(exo_q_anc),
+                               batch * d_model, batch * d_model,
+                               batch * d_model, ACTIVATION_NONE, stream);
+        }
+
+        // 3) K gated IN PLACE at its strided slot (offset d_model); the
+        //    K bias is consumed here, so expandKVWeighted gets b_k=null.
+        BankGatedMul<DataType>(batch, kv_dim, gate_bank_size_,
+                               qkv_fused_out + d_model, bank_h_buf,
+                               bank_lrb_k, qkv_fused_out + d_model,
+                               bank_k_diag_, bank_k_bias_, mha_k_b,
+                               /*pgb=*/(const DataType*)nullptr,
+                               /*softcap=*/0.0f, /*up_stride=*/M_fused,
+                               stream, /*out_stride=*/M_fused);
+
+        // 4) V: gate the up slot (offset d_model+kv_dim) from the bank
+        //    → v_kv_fused (contiguous).  PGB + v_softcap deferred into
+        //    expandKVWeighted, exactly as the non-fused GLU-V path.
+        BankGatedMul<DataType>(batch, kv_dim, gate_bank_size_, v_kv_fused,
+                               bank_h_buf, bank_lrb_v,
+                               qkv_fused_out + (d_model + kv_dim),
+                               bank_v_diag_, bank_v_bias_, mha_v_up_b_,
+                               /*pgb=*/(const DataType*)nullptr,
+                               /*softcap=*/0.0f, /*up_stride=*/M_fused,
+                               stream);
+
+        // 5) Expand: K strided from the fused buffer, V contiguous.
+        expandKVWeighted<DataType>(
+            mha_k, mha_v, qkv_fused_out + d_model, v_kv_fused,
+            gqa_w_k_, gqa_w_v_, N, encoder_heads_, kv_heads_, depth,
+            d_model, kv_dim, stream,
+            /*b_k=*/nullptr, /*b_v=*/pgb_v_, v_softcap_,
+            exo_fused_kv ? exo_k_anc : nullptr,
+            exo_fused_kv ? exo_v_anc : nullptr,
+            /*k_in_stride=*/M_fused, /*v_in_stride=*/0);
+      } else {
+
       // Q projection (always d_model — Q has the full head count).
       // When exo_fused_kv, fold Q exo into Q's bias add (one kernel
       // instead of bias + Q part of AddExoAnchors).
@@ -3445,7 +3663,22 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                             num_inputs, 1.0f, (const DataType*)mha_q_w,
                             num_inputs, mha_input, num_inputs, 0.0f,
                             mha_q, d_model);
-      if (exo_fused_kv) {
+      if (bank_glu_q_) {
+        // GLU-Q via bank: gate the plain projection in place; the Q bias
+        // moves INSIDE the gate product (silu(adapter(h)) ⊙ (Wq·x + b)).
+        assert(use_bank && "GLU-Q requires the bank context");
+        BankGatedMul<DataType>(batch, d_model, gate_bank_size_, mha_q,
+                               bank_h_buf, bank_lrb_q, mha_q, bank_q_diag_,
+                               bank_q_bias_, mha_q_b,
+                               /*pgb=*/(const DataType*)nullptr,
+                               /*softcap=*/0.0f, /*up_stride=*/0, stream);
+        if (exo_fused_kv) {
+          addVectors<DataType>(mha_q, mha_q,
+                               const_cast<DataType*>(exo_q_anc),
+                               batch * d_model, batch * d_model,
+                               batch * d_model, ACTIVATION_NONE, stream);
+        }
+      } else if (exo_fused_kv) {
         addBiasAndAdd<DataType>(mha_q, mha_q, mha_q_b, exo_q_anc,
                                 batch * d_model, d_model, stream);
       } else {
@@ -3454,7 +3687,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       }
 
       // K projection: kv_dim under GQA into k_kv2, else d_model into mha_k.
-      // Under GQA the bias is deferred into expandKVWeighted as `b_k`.
+      // Under GQA the bias is deferred into expandKVWeighted as `b_k`
+      // (unless GLU-K consumed it inside the gate product).
       {
         DataType* k_dst = is_gqa ? k_kv2 : mha_k;
         const int k_w_out = is_gqa ? kv_dim : d_model;
@@ -3462,7 +3696,15 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                               num_inputs, 1.0f, (const DataType*)mha_k_w,
                               num_inputs, mha_input, num_inputs, 0.0f,
                               k_dst, k_w_out);
-        if (!is_gqa) {
+        if (bank_glu_k_) {
+          // GLU-K via bank: gate in place; K bias consumed here.
+          assert(use_bank && "GLU-K requires the bank context");
+          BankGatedMul<DataType>(batch, k_w_out, gate_bank_size_, k_dst,
+                                 bank_h_buf, bank_lrb_k, k_dst,
+                                 bank_k_diag_, bank_k_bias_, mha_k_b,
+                                 /*pgb=*/(const DataType*)nullptr,
+                                 /*softcap=*/0.0f, /*up_stride=*/0, stream);
+        } else if (!is_gqa) {
           addBiasBatched<DataType>(k_dst, k_dst, mha_k_b, 1, batch, k_w_out,
                                    ACTIVATION_NONE, stream);
         }
@@ -3473,6 +3715,21 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       DataType* v_dst = is_gqa ? v_kv2 : mha_v;
       const int v_w_out = is_gqa ? kv_dim : d_model;
       if (has_glu_attn_) {
+        if (use_bank && has_bank_v_) {
+          // Bank-adapter GLU-V (non-NLA route, e.g. GLU-Q nets): single
+          // up-only GEMM, then gate in place from the shared bank.  PGB
+          // + v_softcap follow the standard handling below, exactly as
+          // the non-bank GLU-V.
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, v_w_out,
+                                batch, num_inputs, 1.0f,
+                                (const DataType*)mha_v_up_w_, num_inputs,
+                                mha_input, num_inputs, 0.0f, v_dst, v_w_out);
+          BankGatedMul<DataType>(batch, v_w_out, gate_bank_size_, v_dst,
+                                 bank_h_buf, bank_lrb_v, v_dst,
+                                 bank_v_diag_, bank_v_bias_, mha_v_up_b_,
+                                 /*pgb=*/(const DataType*)nullptr,
+                                 /*softcap=*/0.0f, /*up_stride=*/0, stream);
+        } else {
         DataType* glu_temp = is_gqa ? gu_kv2 : (mha_v + d_model * max_batch);
         cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, v_w_out, batch,
                               num_inputs, 1.0f, (const DataType*)mha_v_gate_w_,
@@ -3486,6 +3743,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         SwiGLUElementwiseWithBias<DataType>(N * 64 * v_w_out, v_w_out, v_dst,
                                              glu_temp, v_dst, mha_v_gate_b_,
                                              mha_v_up_b_, stream);
+        }
         // PGB + v_softcap fusion (see comment in NLA branch above).
         // Under GQA: deferred into expandKVWeighted.
         if (!is_gqa) {
@@ -3524,7 +3782,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // (exo_fused_kv) check below.
       if (is_gqa) {
         const DataType* b_k_fused =
-            bank_include_k_ ? mha_k2_b_ : mha_k_b;
+            bank_glu_k_ ? nullptr
+                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;
@@ -3536,6 +3795,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                    v_softcap_fused,
                                    exo_k_fused, exo_v_fused);
       }
+      }  // end of !fused-GLU-QK branch
     }
   }
 
@@ -4347,6 +4607,12 @@ EncoderBlock<DataType>::~EncoderBlock() {
   FreeWeight(bank_ffn_diag_, arena_);
   FreeWeight(bank_ffn_bias_, arena_);
   FreeWeight(bank_ffn_lr_b_w_, arena_);
+  FreeWeight(bank_q_diag_, arena_);
+  FreeWeight(bank_q_bias_, arena_);
+  FreeWeight(bank_q_lr_b_w_, arena_);
+  FreeWeight(bank_k_diag_, arena_);
+  FreeWeight(bank_k_bias_, arena_);
+  FreeWeight(bank_k_lr_b_w_, arena_);
   // exo_lambda_ is host-side (exo_lambda_host_), no GPU free needed.
 }
 
@@ -4787,15 +5053,18 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
               &bank_h_buf_,
               max_tokens * enc0->gate_bank_size_ * sizeof(DataType)));
           const int total_rank = enc0->bank_rank_v_ + enc0->bank_rank_vga_ +
-                                 enc0->bank_rank_ffn_;
+                                 enc0->bank_rank_ffn_ + enc0->bank_rank_q_ +
+                                 enc0->bank_rank_k_;
           if (total_rank > 0) {
             // Layout: [lr_a output (total_rank) | lrb_v | lrb_vga |
-            // lrb_ffn], each at max-token stride — must match the carve
-            // in EncoderBlock::Eval.
+            // lrb_ffn | lrb_q | lrb_k], each at max-token stride — must
+            // match the carve in EncoderBlock::Eval.
             size_t width = total_rank;
             if (enc0->bank_rank_v_ > 0) width += enc0->mha_v_size_;
             if (enc0->bank_rank_vga_ > 0) width += enc0->mha_q_size_;
             if (enc0->bank_rank_ffn_ > 0) width += enc0->ffn_dff_;
+            if (enc0->bank_rank_q_ > 0) width += enc0->bank_q_width_;
+            if (enc0->bank_rank_k_ > 0) width += enc0->bank_k_width_;
             ReportCUDAErrors(cudaMalloc(
                 &bank_lr_buf_, max_tokens * width * sizeof(DataType)));
           }

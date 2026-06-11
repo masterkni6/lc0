@@ -179,6 +179,22 @@ message Weights {
     optional Layer bank_vga_b = 50;
     optional Layer bank_vga_lr_a = 51;
     optional Layer bank_vga_lr_b = 52;
+
+    // GLU-Q/K via bank: the bank GATES a private linear view of x —
+    //   Q = silu(adapter_q(h)) ⊙ (q_w·x + q_b)   (d_model wide)
+    //   K = silu(adapter_k(h)) ⊙ (k_w·x + k_b)   (kv_dim wide)
+    // q_w/k_w are reused as the content (up) projections; q2_w/k2_w are
+    // absent (GLU form replaces the NLA second layer).  Same per-site
+    // cost as Layout-1 / K-on-bank (one output GEMM; adapter ~free) but
+    // multiplicative, and Q/K keep their private input subspaces.
+    optional Layer bank_q_diag = 53;
+    optional Layer bank_q_b = 54;
+    optional Layer bank_q_lr_a = 55;
+    optional Layer bank_q_lr_b = 56;
+    optional Layer bank_k_diag = 57;
+    optional Layer bank_k_b = 58;
+    optional Layer bank_k_lr_a = 59;
+    optional Layer bank_k_lr_b = 60;
   }
 
   message FFN {

@@ -381,16 +381,19 @@ void FusedVGAE(int total, T* output, const T* gate, const T* bias,
 // materialized by small cuBLAS GEMMs (folding it into these kernels was
 // measured slower — see note in common_kernels.cu).  Null => rank-0.
 //
-// BankGatedMul (GLU-V / SwiGLU-FFN sites):
+// BankGatedMul (GLU-V / GLU-Q / GLU-K / SwiGLU-FFN sites):
 //   output = silu(pre) * (up + up_b) [+ pgb] [tanh-softcap]
 // up is read at row stride `up_stride` (0 => out_dim, contiguous) so it
-// can live inside a wider fused-GEMM output.  out == up aliasing is safe
-// when up_stride == out_dim (same-index read-then-write).
+// can live inside a wider fused-GEMM output; output is written at row
+// stride `out_stride` (0 => out_dim) so a strided fused-GEMM slot can be
+// gated IN PLACE (out == up with out_stride == up_stride is same-index
+// read-then-write, safe — likewise the contiguous out == up case).
 template <typename T>
 void BankGatedMul(int batch, int out_dim, int bank_dim, T* output,
                   const T* h, const T* lrb, const T* up, const T* diag,
                   const T* gate_b, const T* up_b, const T* pgb,
-                  float softcap, int up_stride, cudaStream_t stream);
+                  float softcap, int up_stride, cudaStream_t stream,
+                  int out_stride = 0);
 
 // FusedVGAEBank (VGA-E site): output[i] *= sigmoid(pre).
 template <typename T>

@@ -126,6 +126,17 @@ struct BaseWeights {
     Vec bank_vga_b;
     Vec bank_vga_lr_a;
     Vec bank_vga_lr_b;
+    // GLU-Q/K via bank: gate adapters on Q (d_model) and K (kv_dim);
+    // q_w/k_w are then the content (up) projections and q2_w/k2_w are
+    // absent.
+    Vec bank_q_diag;
+    Vec bank_q_b;
+    Vec bank_q_lr_a;
+    Vec bank_q_lr_b;
+    Vec bank_k_diag;
+    Vec bank_k_b;
+    Vec bank_k_lr_a;
+    Vec bank_k_lr_b;
   };
 
   struct FFN {

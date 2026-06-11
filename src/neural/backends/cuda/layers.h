@@ -583,9 +583,11 @@ class EncoderBlock {
   // from each bank_*_diag.  The replaced projections (v_gate /
   // vga_elem_gate / gate_proj) are ABSENT in bank nets — has_glu_attn_ /
   // has_vga_elem_ are therefore also keyed off the bank fields, and the
-  // weight-concat fast paths (mha_vg_vu_w_, ffn_gate_up_w_,
-  // mha_qkv_fused_w_) stay null under the bank.  Post-norm parallel-FFN
-  // only (matches the training-side constraint).
+  // gate-concat fast paths (mha_vg_vu_w_, ffn_gate_up_w_) stay null
+  // under the bank.  mha_qkv_fused_w_ IS built for bank nets whose Q/K
+  // both read x ([Wq|Wk|Wv_up] — plain NLA-Q-only and GLU-Q/K forms);
+  // it stays null under Layout-1 / K-on-bank (q_w / k_w absent).
+  // Post-norm parallel-FFN only (matches the training-side constraint).
   bool has_gate_bank_ = false;
   bool has_bank_v_ = false;
   bool has_bank_vga_ = false;
@@ -596,13 +598,28 @@ class EncoderBlock {
   // K-on-bank: K = Wk2(h) — k2_w present with k_w absent (full NLA has
   // both).  Cost-neutral; K gains the bank's silu nonlinearity.
   bool bank_include_k_ = false;
+  // GLU-Q/K via bank: the bank GATES a private linear view of x —
+  //   Q = silu(adapter_q(h)) ⊙ (q_w·x + q_b)   (d_model wide)
+  //   K = silu(adapter_k(h)) ⊙ (k_w·x + k_b)   (kv_dim wide)
+  // Detected from bank_q_diag / bank_k_diag; q_w/k_w are the content
+  // (up) projections and q2_w/k2_w are absent — so a GLU-Q net is
+  // structurally non-NLA (has_nla_ false) and routes through the
+  // non-NLA Q/K/V branch.  GLU-K alone (with NLA-Q intact) routes
+  // through the NLA-Q-only branch.
+  bool bank_glu_q_ = false;
+  bool bank_glu_k_ = false;
   int gate_bank_size_ = 0;
   int bank_rank_v_ = 0;
   int bank_rank_vga_ = 0;
   int bank_rank_ffn_ = 0;
+  int bank_rank_q_ = 0;
+  int bank_rank_k_ = 0;
+  int bank_q_width_ = 0;  // = bank_q_diag.size() = d_model
+  int bank_k_width_ = 0;  // = bank_k_diag.size() = kv_dim
   DataType* gate_bank_w_ = nullptr;
   DataType* gate_bank_b_ = nullptr;
-  DataType* bank_lr_a_w_ = nullptr;  // concat [v; vga; ffn] rows, (Σr, bank)
+  // concat [v; vga; ffn; q; k] rows, (Σr, bank)
+  DataType* bank_lr_a_w_ = nullptr;
   DataType* bank_v_diag_ = nullptr;
   DataType* bank_v_bias_ = nullptr;
   DataType* bank_v_lr_b_w_ = nullptr;
@@ -612,6 +629,12 @@ class EncoderBlock {
   DataType* bank_ffn_diag_ = nullptr;
   DataType* bank_ffn_bias_ = nullptr;
   DataType* bank_ffn_lr_b_w_ = nullptr;
+  DataType* bank_q_diag_ = nullptr;
+  DataType* bank_q_bias_ = nullptr;
+  DataType* bank_q_lr_b_w_ = nullptr;
+  DataType* bank_k_diag_ = nullptr;
+  DataType* bank_k_bias_ = nullptr;
+  DataType* bank_k_lr_b_w_ = nullptr;
 
   // Persistent LN1 output buffer — computes LN1 once per Eval, reused by
   // SmolGen, Q/K/V, and (for parallel FFN) the FFN. Avoids the 2-3 LN1

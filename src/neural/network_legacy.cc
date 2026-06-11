@@ -183,7 +183,15 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       bank_vga_diag(LayerAdapter(mha.bank_vga_diag()).as_vector()),
       bank_vga_b(LayerAdapter(mha.bank_vga_b()).as_vector()),
       bank_vga_lr_a(LayerAdapter(mha.bank_vga_lr_a()).as_vector()),
-      bank_vga_lr_b(LayerAdapter(mha.bank_vga_lr_b()).as_vector()) {
+      bank_vga_lr_b(LayerAdapter(mha.bank_vga_lr_b()).as_vector()),
+      bank_q_diag(LayerAdapter(mha.bank_q_diag()).as_vector()),
+      bank_q_b(LayerAdapter(mha.bank_q_b()).as_vector()),
+      bank_q_lr_a(LayerAdapter(mha.bank_q_lr_a()).as_vector()),
+      bank_q_lr_b(LayerAdapter(mha.bank_q_lr_b()).as_vector()),
+      bank_k_diag(LayerAdapter(mha.bank_k_diag()).as_vector()),
+      bank_k_b(LayerAdapter(mha.bank_k_b()).as_vector()),
+      bank_k_lr_a(LayerAdapter(mha.bank_k_lr_a()).as_vector()),
+      bank_k_lr_b(LayerAdapter(mha.bank_k_lr_b()).as_vector()) {
   if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
     throw Exception("RPE weights file not supported.");
   }
