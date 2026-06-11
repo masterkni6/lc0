@@ -3023,58 +3023,80 @@ __global__ void expandKVWeighted_kernel(
     const T* b_k, const T* b_v,
     const T* w_k, const T* w_v,
     const T* exo_k_anc, const T* exo_v_anc,
-    int N, int heads, int kv_heads,
-    int depth, int d_model, int kv_dim,
+    int total_pairs, int heads, int kv_heads,
+    int depth, int d_model,
     int k_in_stride, int v_in_stride,
     float v_softcap) {
-  // grid: (N * heads, 64), thread: depth.
-  const int d = threadIdx.x;
-  const int s = blockIdx.y;     // 0..63
-  const int nh = blockIdx.x;
-  const int n = nh / heads;
-  const int h = nh % heads;
-
-  // Cache this block's blend row in shared memory.  Threads d in
-  // [0, kv_heads) cooperate — kv_heads ≤ depth always (training enforces
-  // kv_heads | heads, depth = d_model/heads, kv_dim = kv_heads*depth).
-  __shared__ float w_k_row[128];
-  __shared__ float w_v_row[128];
-  if (d < kv_heads) {
-    w_k_row[d] = (float)w_k[h * kv_heads + d];
-    w_v_row[d] = (float)w_v[h * kv_heads + d];
-  }
-  __syncthreads();
-
-  if (d >= depth) return;
-  const int out_off = h * depth + s * d_model + 64 * d_model * n + d;
-  float ak = 0.f, av = 0.f;
+  // Flat grid-stride over PAIRS of consecutive output elements.  The old
+  // layout — grid (N*heads, 64), block (depth=32 threads) — produced 128
+  // bytes per 1-warp block across 163k blocks/launch at the 640x60 shape
+  // and measured 16% of ALL GPU time (140us/launch, ~7x below bandwidth).
+  // This version: 256-thread blocks, 2 elements per thread (a warp covers
+  // 128 contiguous bytes per tensor per access — full cache lines), blend
+  // row via __ldg (400 B total, L1-resident).  Accumulation order is
+  // identical to the old kernel (float acc, kh ascending), so outputs are
+  // bit-identical.  Requires even depth (pairs must not straddle a head);
+  // the dispatcher falls back to per-element indexing via the same code
+  // with pair=element when depth is odd (not used by any current net).
   const float inv_cap = (v_softcap > 0.f) ? (1.0f / v_softcap) : 0.f;
-  #pragma unroll 4
-  for (int kh = 0; kh < kv_heads; kh++) {
-    const int k_in_off = kh * depth + s * k_in_stride
-                       + 64 * k_in_stride * n + d;
-    const int v_in_off = kh * depth + s * v_in_stride
-                       + 64 * v_in_stride * n + d;
-    const int b_off    = kh * depth + d;
-
-    // K: optional pre-blend bias add.
-    float k_val = (float)k_in[k_in_off];
-    if (b_k) k_val += (float)b_k[b_off];
-    ak += w_k_row[kh] * k_val;
-
-    // V: optional pre-blend PGB add, then optional softcap.
-    float v_val = (float)v_in[v_in_off];
-    if (b_v) v_val += (float)b_v[b_off];
-    if (v_softcap > 0.f) v_val = v_softcap * tanhf(v_val * inv_cap);
-    av += w_v_row[kh] * v_val;
+  for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < total_pairs;
+       p += gridDim.x * blockDim.x) {
+    const int i = p * 2;                 // first element of the pair
+    const int dm = i % d_model;          // position within d_model
+    const int sn = i / d_model;          // n*64 + s (token index)
+    const int h = dm / depth;
+    const int d = dm % depth;
+    // Input offset: kh*depth + (n*64+s)*stride + d.
+    const size_t k_base = (size_t)sn * k_in_stride + d;
+    const size_t v_base = (size_t)sn * v_in_stride + d;
+    const T* wkr = w_k + h * kv_heads;
+    const T* wvr = w_v + h * kv_heads;
+    float ak0 = 0.f, ak1 = 0.f, av0 = 0.f, av1 = 0.f;
+#pragma unroll 4
+    for (int kh = 0; kh < kv_heads; kh++) {
+      const float wk = (float)__ldg(wkr + kh);
+      const float wv = (float)__ldg(wvr + kh);
+      const size_t kin = k_base + kh * depth;
+      const size_t vin = v_base + kh * depth;
+      float k0 = (float)k_in[kin];
+      float k1 = (float)k_in[kin + 1];
+      float v0 = (float)v_in[vin];
+      float v1 = (float)v_in[vin + 1];
+      if (b_k) {
+        const int bo = kh * depth + d;
+        k0 += (float)b_k[bo];
+        k1 += (float)b_k[bo + 1];
+      }
+      if (b_v) {
+        const int bo = kh * depth + d;
+        v0 += (float)b_v[bo];
+        v1 += (float)b_v[bo + 1];
+      }
+      if (v_softcap > 0.f) {
+        v0 = v_softcap * tanhf(v0 * inv_cap);
+        v1 = v_softcap * tanhf(v1 * inv_cap);
+      }
+      ak0 += wk * k0;
+      ak1 += wk * k1;
+      av0 += wv * v0;
+      av1 += wv * v1;
+    }
+    // Optional ExoFormer anchor add — per-element on the d_model-wide
+    // output.  When non-null this replaces the K/V portion of
+    // AddExoAnchors (Q anchor still added separately).
+    if (exo_k_anc) {
+      ak0 += (float)exo_k_anc[i];
+      ak1 += (float)exo_k_anc[i + 1];
+    }
+    if (exo_v_anc) {
+      av0 += (float)exo_v_anc[i];
+      av1 += (float)exo_v_anc[i + 1];
+    }
+    k_out[i] = (T)ak0;
+    k_out[i + 1] = (T)ak1;
+    v_out[i] = (T)av0;
+    v_out[i + 1] = (T)av1;
   }
-  // Optional ExoFormer anchor add — per-element on the d_model-wide
-  // output.  When non-null this replaces the K/V portion of
-  // AddExoAnchors (Q anchor still added separately).
-  if (exo_k_anc) ak += (float)exo_k_anc[out_off];
-  if (exo_v_anc) av += (float)exo_v_anc[out_off];
-  k_out[out_off] = (T)ak;
-  v_out[out_off] = (T)av;
 }
 
 template <typename T>
@@ -3085,15 +3107,20 @@ void expandKVWeighted(T* k_out, T* v_out, const T* k_in, const T* v_in,
                      const T* b_k, const T* b_v, float v_softcap,
                      const T* exo_k_anc, const T* exo_v_anc,
                      int k_in_stride, int v_in_stride) {
-  dim3 grid(N * heads, 64);
-  dim3 block(depth);
   // Defaults: per-position column stride = kv_dim (standalone packing).
   const int ks = (k_in_stride > 0) ? k_in_stride : kv_dim;
   const int vs = (v_in_stride > 0) ? v_in_stride : kv_dim;
-  expandKVWeighted_kernel<T><<<grid, block, 0, stream>>>(
+  // depth is even for every real net (depth = d_model/heads, both powers
+  // of two in practice); the pair-based kernel requires it so pairs stay
+  // within one head and one token.
+  assert(depth % 2 == 0 && "expandKVWeighted requires even depth");
+  const int total_pairs = N * 64 * d_model / 2;
+  const int kBlockSize = 256;
+  const int blocks = DivUp(total_pairs, kBlockSize);
+  expandKVWeighted_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
       k_out, v_out, k_in, v_in, b_k, b_v, w_k, w_v,
       exo_k_anc, exo_v_anc,
-      N, heads, kv_heads, depth, d_model, kv_dim, ks, vs, v_softcap);
+      total_pairs, heads, kv_heads, depth, d_model, ks, vs, v_softcap);
 }
 
 // addBiasAndAdd: out[i] = in[i] + broadcast_bias[i % width] + add[i].
