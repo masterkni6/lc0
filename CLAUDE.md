@@ -65,6 +65,18 @@ All Q/K arms require `use_nla: true` + `nla_q_only: true` in yaml. GLU-Q drops q
 
 Notes: heads-10 win = softmax+smolgen-bias bandwidth halves + d_k 64 attention tiles much more efficient than d_k 32; its capacity cost is halved smolgen per-head bias maps. Smolgen ≈ 10-12% of wall and 117M params (41% of net). Weighted GQA's 10.7% is mostly a KERNEL deficiency (dense Σ with 10× read amplification) — fix in backend before reconsidering the feature. Backend queue from this profile: (1) expandKVWeighted rewrite (shared-mem staging / per-token mini-GEMM, est +6-8% nps, no capacity change); (2) graph_capture=true in selfplay (+3-7% measured, conf flag); (3) [Q2|K2] fused h-GEMM ~+2%; (4) int8 W8A8 QAT remains the big lever (25-40%).
 
+**Smolgen dictionary probe (2026-06-11, `C:\Users\maste\Downloads\smolgen_rank_probe.py` — weight-space Stage 1).** Every emittable smolgen map lives in col(G) (G = shared smolgen_w, 4096×256). Probe measures: G spectrum, atom matrix-rank, per-site (layer×head, via dense2 blocks) atom concentration, shared-top-64-atom energy share. Results (share of total site energy in the shared top-64 atoms / per-site atoms for 90% energy):
+
+| net | steps | top-64 share | site r90 |
+|---|---|---|---|
+| random baseline | — | 33.6% | 216 |
+| t6-640x60-bank | 7.8k | 84.7% | 112 |
+| t9-512x60 (smolgenbias) | 12.5k | 83.4% | 122 |
+| t9-512x60-exostack | 272.5k | 89.1% | 73 |
+| BT4 (official) | 6.1M | **94.2%** | 68 |
+
+**Verdict: dictionary hypothesis licensed — concentration strengthens monotonically with maturity.** Converged smolgen ≈ shared ~64-atom dictionary + per-site mixtures. Atoms are NOT low matrix-rank (rank-8 holds only ~51-62% energy) → store dictionary atoms DENSE (M=64 → 512KB fp16, L2-resident), don't factor them. Mature-net per-site min share 53% → keep a small per-site dynamic residual (UVᵀ rank ~8) for outlier sites. Replacement design: `B_h = softcap(Σ_m α_h,m(g)·P_m + U_h(g)V_h(g)ᵀ)` — est +7-9% nps, −90M params vs current smolgen (10-12% wall, 117M params = 41% of 640×60 net). Init P from measured atoms (`smolgen_dict_t6bank.npz`, `smolgen_dict_t9_272k.npz` in Downloads). Stage 2 (realized-map stats: α-only variance share, residual rank sizing) needs activations — checkpoint hooks or an lc0 latent-dump patch; refines M and r but does not gate the arm.
+
 - All arms are training-gated next: user trains r0 / L1 / QK / gluQK and picks on Elo-vs-nps. Sync torchprocess.py to the trainer + regenerate net_pb2.py there (`python -m grpc_tools.protoc --proto_path=<worktree>/proto --python_out=Downloads/proto net.proto`) BEFORE enabling new flags — stale net_pb2 silently drops fields (load-time validation in layers.cc now catches this).
 
 ## fp8 inference: tried, abandoned (May 2026)
