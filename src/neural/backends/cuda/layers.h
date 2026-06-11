@@ -623,6 +623,13 @@ class EncoderBlock {
   // through the NLA-Q-only branch.
   bool bank_glu_q_ = false;
   bool bank_glu_k_ = false;
+  // Gated-QK addressing: multiplicative gate ON TOP of the Layout-1 /
+  // K-on-bank linear reads — Q = silu(adapter_q(h)) ⊙ (Wq2·h), K
+  // likewise.  Detected from bank_q_diag/bank_k_diag WITH q2_w/k2_w
+  // present (the GLU forms have the adapter with q_w/k_w instead).
+  // Shares the bank_q_*/bank_k_* weight fields with the GLU forms.
+  bool bank_gated_q_ = false;
+  bool bank_gated_k_ = false;
   int gate_bank_size_ = 0;
   int bank_rank_v_ = 0;
   int bank_rank_vga_ = 0;

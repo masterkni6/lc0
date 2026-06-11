@@ -2054,10 +2054,19 @@ EncoderBlock<DataType>::EncoderBlock(
     bank_include_k_ = has_nla_ && nla_q_only_ &&
                       cpu_weights.mha.k2_w.size() > 0 &&
                       cpu_weights.mha.k_w.size() == 0;
-    // GLU-Q/K via bank: the bank gates a private linear view of x
-    // (q_w/k_w are the content/up projections; q2_w/k2_w absent).
-    bank_glu_q_ = cpu_weights.mha.bank_q_diag.size() > 0;
-    bank_glu_k_ = cpu_weights.mha.bank_k_diag.size() > 0;
+    // bank_q_diag / bank_k_diag carry a per-site adapter shared by TWO
+    // mutually exclusive forms, disambiguated by which projection exists:
+    //  - GLU form:   adapter + q_w  (no q2_w) — gate ⊙ (Wq·x), private view
+    //  - gated read: adapter + q2_w (no q_w)  — gate ⊙ (Wq2·h), Layout-1
+    //    upgraded to 3rd-order addressing (identity-init gate in torch).
+    bank_glu_q_ = cpu_weights.mha.bank_q_diag.size() > 0 &&
+                  cpu_weights.mha.q2_w.size() == 0;
+    bank_glu_k_ = cpu_weights.mha.bank_k_diag.size() > 0 &&
+                  cpu_weights.mha.k2_w.size() == 0;
+    bank_gated_q_ = cpu_weights.mha.bank_q_diag.size() > 0 &&
+                    cpu_weights.mha.q2_w.size() > 0;
+    bank_gated_k_ = cpu_weights.mha.bank_k_diag.size() > 0 &&
+                    cpu_weights.mha.k2_w.size() > 0;
     if (has_bank_v_) {
       allocAndUpload<DataType>(&bank_v_diag_, cpu_weights.mha.bank_v_diag,
                                scratch);
@@ -2088,7 +2097,7 @@ EncoderBlock<DataType>::EncoderBlock(
       bank_rank_ffn_ =
           (int)(cpu_weights.ffn.bank_gate_lr_a.size() / gate_bank_size_);
     }
-    if (bank_glu_q_) {
+    if (bank_glu_q_ || bank_gated_q_) {
       bank_q_width_ = (int)cpu_weights.mha.bank_q_diag.size();
       allocAndUpload<DataType>(&bank_q_diag_, cpu_weights.mha.bank_q_diag,
                                scratch);
@@ -2099,7 +2108,7 @@ EncoderBlock<DataType>::EncoderBlock(
       bank_rank_q_ =
           (int)(cpu_weights.mha.bank_q_lr_a.size() / gate_bank_size_);
     }
-    if (bank_glu_k_) {
+    if (bank_glu_k_ || bank_gated_k_) {
       bank_k_width_ = (int)cpu_weights.mha.bank_k_diag.size();
       allocAndUpload<DataType>(&bank_k_diag_, cpu_weights.mha.bank_k_diag,
                                scratch);
@@ -2181,33 +2190,34 @@ EncoderBlock<DataType>::EncoderBlock(
         "incomplete export (sync torchprocess.py + regenerate net_pb2.py, "
         "then re-export).");
   }
-  if (bank_glu_q_) {
-    if (cpu_weights.mha.q2_w.size() > 0) {
-      throw Exception(
-          "net has both bank_q_diag (GLU-Q) and q2_w (NLA/Layout-1) — "
-          "ambiguous Q form; the export should never produce this.");
-    }
-    if (cpu_weights.mha.q_w.size() == 0) {
+  if (bank_glu_q_ || bank_gated_q_) {
+    if (bank_glu_q_ && cpu_weights.mha.q_w.size() == 0) {
       throw Exception(
           "GLU-Q net has bank_q_diag but no q_w (the content/up "
           "projection) — incomplete export.");
+    }
+    if (bank_gated_q_ && cpu_weights.mha.q_w.size() > 0) {
+      throw Exception(
+          "net has bank_q_diag with BOTH q_w and q2_w — gated-Q gates the "
+          "Layout-1 read (q2_w only); the export should never produce "
+          "this combination.");
     }
     if (bank_q_width_ != mha_q_size_) {
       throw Exception("bank_q_diag size " + std::to_string(bank_q_width_) +
                       " != d_model " + std::to_string(mha_q_size_));
     }
   }
-  if (bank_glu_k_) {
-    if (cpu_weights.mha.k2_w.size() > 0) {
-      throw Exception(
-          "net has both bank_k_diag (GLU-K) and k2_w (full NLA / "
-          "K-on-bank) — ambiguous K form; the export should never "
-          "produce this.");
-    }
-    if (cpu_weights.mha.k_w.size() == 0) {
+  if (bank_glu_k_ || bank_gated_k_) {
+    if (bank_glu_k_ && cpu_weights.mha.k_w.size() == 0) {
       throw Exception(
           "GLU-K net has bank_k_diag but no k_w (the content/up "
           "projection) — incomplete export.");
+    }
+    if (bank_gated_k_ && cpu_weights.mha.k_w.size() > 0) {
+      throw Exception(
+          "net has bank_k_diag with BOTH k_w and k2_w — gated-K gates the "
+          "K-on-bank read (k2_w only); the export should never produce "
+          "this combination.");
     }
     const int expect_kv =
         (kv_heads_ < encoder_heads_)
@@ -3368,6 +3378,17 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                 (const DataType*)mha_q2_w_, gate_bank_size_,
                                 bank_h_buf, gate_bank_size_, 0.0f,
                                 mha_q, d_model);
+          // Gated-QK addressing: gate the bank read in place — the Q2
+          // bias moves INSIDE the gate product, Q = silu(adapter(h)) ⊙
+          // (Wq2·h + b), so the bias-add below must be skipped.
+          if (bank_gated_q_) {
+            BankGatedMul<DataType>(batch, d_model, gate_bank_size_, mha_q,
+                                   bank_h_buf, bank_lrb_q, mha_q,
+                                   bank_q_diag_, bank_q_bias_, mha_q2_b_,
+                                   /*pgb=*/(const DataType*)nullptr,
+                                   /*softcap=*/0.0f, /*up_stride=*/0,
+                                   stream);
+          }
         } else {
           DataType* q1 = nla_qk_temp;  // reuse scratch (d_model wide used)
           // Q1 = Wq @ x ; silu(Q1 + bq)
@@ -3383,7 +3404,16 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                 (const DataType*)mha_q2_w_, d_model,
                                 q1, d_model, 0.0f, mha_q, d_model);
         }
-        if (exo_fused_kv) {
+        if (bank_gated_q_) {
+          // Q2 bias already consumed inside the gate product; only the
+          // exo anchor (added AFTER the gate, matching torch) remains.
+          if (exo_fused_kv) {
+            addVectors<DataType>(mha_q, mha_q,
+                                 const_cast<DataType*>(exo_q_anc),
+                                 batch * d_model, batch * d_model,
+                                 batch * d_model, ACTIVATION_NONE, stream);
+          }
+        } else if (exo_fused_kv) {
           // Fold the Q exo anchor add into the Q2 bias add — one kernel
           // instead of two (addBiasBatched + the Q part of AddExoAnchors).
           // K/V exo go into expandKVWeighted below; AddExoAnchors is then
@@ -3409,6 +3439,16 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                 (const DataType*)mha_k2_w_, gate_bank_size_,
                                 bank_h_buf, gate_bank_size_, 0.0f, k_dst,
                                 k_w_out);
+          // Gated-QK addressing: gate the bank read in place; the K2
+          // bias moves INSIDE the gate product (skip it downstream).
+          if (bank_gated_k_) {
+            BankGatedMul<DataType>(batch, k_w_out, gate_bank_size_, k_dst,
+                                   bank_h_buf, bank_lrb_k, k_dst,
+                                   bank_k_diag_, bank_k_bias_, mha_k2_b_,
+                                   /*pgb=*/(const DataType*)nullptr,
+                                   /*softcap=*/0.0f, /*up_stride=*/0,
+                                   stream);
+          }
         } else {
           cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, k_w_out,
                                 batch, num_inputs, 1.0f,
@@ -3427,8 +3467,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           }
         }
         const DataType* k_bias =
-            bank_glu_k_ ? nullptr
-                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
+            (bank_glu_k_ || bank_gated_k_)
+                ? nullptr
+                : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
         if (!is_gqa && k_bias != nullptr) {
           addBiasBatched<DataType>(k_dst, k_dst, k_bias, 1, batch, k_w_out,
                                    ACTIVATION_NONE, stream);
@@ -3585,8 +3626,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // identical to softcap-then-blend done as separate kernels).
       if (is_gqa) {
         const DataType* b_k_fused =
-            bank_glu_k_ ? nullptr
-                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
+            (bank_glu_k_ || bank_gated_k_)
+                ? nullptr
+                : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;
@@ -3866,8 +3908,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // (exo_fused_kv) check below.
       if (is_gqa) {
         const DataType* b_k_fused =
-            bank_glu_k_ ? nullptr
-                        : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
+            (bank_glu_k_ || bank_gated_k_)
+                ? nullptr
+                : (bank_include_k_ ? mha_k2_b_ : mha_k_b);
         const DataType* b_v_fused = has_glu_attn_ ? pgb_v_ : mha_v_b;
         const float v_softcap_fused = has_glu_attn_ ? v_softcap_ : 0.0f;
         const DataType* exo_k_fused = exo_fused_kv ? exo_k_anc : nullptr;
