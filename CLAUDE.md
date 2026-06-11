@@ -54,6 +54,17 @@ All Q/K arms require `use_nla: true` + `nla_q_only: true` in yaml. GLU-Q drops q
 - Fused [Wq|Wk|Wv_up] input GEMM extended to gluQK nets: tied with separate GEMMs at 60L (launch savings absorbed into FFN stall slack — same as 512×60). `LC0_NO_FUSED_QKV=1` forces the separate path (debug/parity).
 - r64 (trained t6-640x60-bank-swa-7826) measured −6.4% vs nobank earlier; rank-0 is the production direction. lr_b folding into consuming kernels measured 1.4-4.5× slower than GEMM form — do not retry (note in common_kernels.cu).
 - Verification pattern for new arms: 2L torch fwd/bwd + export-structure check → 2L fused-vs-separate CUDA output parity on same pb → 60L load + finite eval + legal bestmove → bench. Trained-checkpoint parity happens when an arm trains.
+**Profile of the QK arm (2026-06-11, nsys capture-off — no node-trace inflation, batch 128).** Component map, % of GPU kernel time: 640-col GEMMs ×5/layer (bank, Q2, dense, FFN up, FFN down — dff=640) 28.6%; attention matmuls 17.1% + softmax 4.8%; **expandKVWeighted 10.7%** (weighted-GQA dense 10-way blend, ~4.8 ms/forward ON THE MAIN STREAM — the kernel re-reads every kv slice per output head); norms 9.5% (1 DeepNorm RMS/layer @ 43.8 µs = 6.1%; the 2 LN/layer are smolgen-internal = 3.4%); K2+V-up 320-col GEMMs 8.2% (poor tile efficiency at M=320); bank gate kernels 6.8% + VGA 3.3%; smolgen gen GEMM 4.9% + dense1 1.1%. Heads/embedding < 1%. GPU-busy sum ≈ 44.8 ms vs ~36 ms wall → main/FFN stream overlap working.
+
+**Ablation prices (same build/session, capture-on means, QK base 3702):**
+| change | nps | params |
+|---|---|---|
+| encoder_heads 20→10 (d_k 64, kv_heads 5; kv_dim stays 320) | **4339 (+17.2%)** | 241M (−41M) |
+| smolgen off | 4054 (+9.5%) | 165.8M |
+| smolgen_hidden_sz/gen_sz 256→128 (all heads kept) | 3780 (+2.1%) | **205.1M (−77M)** |
+
+Notes: heads-10 win = softmax+smolgen-bias bandwidth halves + d_k 64 attention tiles much more efficient than d_k 32; its capacity cost is halved smolgen per-head bias maps. Smolgen ≈ 10-12% of wall and 117M params (41% of net). Weighted GQA's 10.7% is mostly a KERNEL deficiency (dense Σ with 10× read amplification) — fix in backend before reconsidering the feature. Backend queue from this profile: (1) expandKVWeighted rewrite (shared-mem staging / per-token mini-GEMM, est +6-8% nps, no capacity change); (2) graph_capture=true in selfplay (+3-7% measured, conf flag); (3) [Q2|K2] fused h-GEMM ~+2%; (4) int8 W8A8 QAT remains the big lever (25-40%).
+
 - All arms are training-gated next: user trains r0 / L1 / QK / gluQK and picks on Elo-vs-nps. Sync torchprocess.py to the trainer + regenerate net_pb2.py there (`python -m grpc_tools.protoc --proto_path=<worktree>/proto --python_out=Downloads/proto net.proto`) BEFORE enabling new flags — stale net_pb2 silently drops fields (load-time validation in layers.cc now catches this).
 
 ## fp8 inference: tried, abandoned (May 2026)
