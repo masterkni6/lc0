@@ -3230,6 +3230,64 @@ __global__ void expandKVWeighted_kernel(
   }
 }
 
+// expandKVWeighted v2: one block per token, shared-memory staged tiles.
+// The flat-gather kernel above re-reads every kv slice once per OUTPUT
+// head (kv_heads-fold read amplification) and re-applies bias/softcap
+// per output — measured 7.1% of GPU time on the h10 production net
+// (48 µs/layer, main stream).  Here each block stages the token's K and
+// V tiles ONCE (bias added, V softcap applied, stored as float — the
+// exact intermediate the gather kernel computes per element), then all
+// heads×depth outputs read shared memory.  Accumulation stays float,
+// kh-ascending — bit-identical to v1.  Traffic per token drops from
+// 2·d_model·kv_heads reads to 2·kv_dim, fully coalesced both ways.
+template <typename T>
+__global__ void expandKVWeighted_staged_kernel(
+    T* k_out, T* v_out, const T* k_in, const T* v_in,
+    const T* b_k, const T* b_v,
+    const T* w_k, const T* w_v,
+    const T* exo_k_anc, const T* exo_v_anc,
+    int heads, int kv_heads, int depth, int d_model, int kv_dim,
+    int k_in_stride, int v_in_stride, float v_softcap) {
+  extern __shared__ float s_tiles[];        // [K tile (kv_dim) | V tile]
+  float* sK = s_tiles;
+  float* sV = s_tiles + kv_dim;
+  const int sn = blockIdx.x;                // token index n*64 + s
+  const float inv_cap = (v_softcap > 0.f) ? (1.0f / v_softcap) : 0.f;
+
+  // Stage: biased (and V-softcapped) tiles in float.  Column layout is
+  // (kh*depth + d) — contiguous within the token column — so these loads
+  // are coalesced; bias indexing matches the gather kernel exactly.
+  for (int t = threadIdx.x; t < kv_dim; t += blockDim.x) {
+    float kv = (float)k_in[(size_t)sn * k_in_stride + t];
+    if (b_k) kv += (float)b_k[t];
+    sK[t] = kv;
+    float vv = (float)v_in[(size_t)sn * v_in_stride + t];
+    if (b_v) vv += (float)b_v[t];
+    if (v_softcap > 0.f) vv = v_softcap * tanhf(vv * inv_cap);
+    sV[t] = vv;
+  }
+  __syncthreads();
+
+  for (int o = threadIdx.x; o < d_model; o += blockDim.x) {
+    const int h = o / depth;
+    const int d = o % depth;
+    const T* wkr = w_k + h * kv_heads;
+    const T* wvr = w_v + h * kv_heads;
+    float ak = 0.f, av = 0.f;
+#pragma unroll 4
+    for (int kh = 0; kh < kv_heads; kh++) {
+      const int td = kh * depth + d;
+      ak += (float)__ldg(wkr + kh) * sK[td];
+      av += (float)__ldg(wvr + kh) * sV[td];
+    }
+    const size_t oi = (size_t)sn * d_model + o;
+    if (exo_k_anc) ak += (float)exo_k_anc[oi];
+    if (exo_v_anc) av += (float)exo_v_anc[oi];
+    k_out[oi] = (T)ak;
+    v_out[oi] = (T)av;
+  }
+}
+
 template <typename T>
 void expandKVWeighted(T* k_out, T* v_out, const T* k_in, const T* v_in,
                      const T* w_k, const T* w_v, int N, int heads,
@@ -3245,13 +3303,27 @@ void expandKVWeighted(T* k_out, T* v_out, const T* k_in, const T* v_in,
   // of two in practice); the pair-based kernel requires it so pairs stay
   // within one head and one token.
   assert(depth % 2 == 0 && "expandKVWeighted requires even depth");
-  const int total_pairs = N * 64 * d_model / 2;
-  const int kBlockSize = 256;
-  const int blocks = DivUp(total_pairs, kBlockSize);
-  expandKVWeighted_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
-      k_out, v_out, k_in, v_in, b_k, b_v, w_k, w_v,
-      exo_k_anc, exo_v_anc,
-      total_pairs, heads, kv_heads, depth, d_model, ks, vs, v_softcap);
+  // Staged (v2) path: one block per token, dynamic smem for the two
+  // float tiles.  Falls back to the flat-gather kernel for exotic
+  // kv_dim (smem bound) or under LC0_EXPANDKV_V1=1 (parity testing).
+  static const bool kForceV1 = std::getenv("LC0_EXPANDKV_V1") != nullptr;
+  const size_t smem = 2 * (size_t)kv_dim * sizeof(float);
+  if (!kForceV1 && smem <= 48 * 1024) {
+    const int kBlockSize = 256;
+    expandKVWeighted_staged_kernel<T>
+        <<<N * 64, kBlockSize, smem, stream>>>(
+            k_out, v_out, k_in, v_in, b_k, b_v, w_k, w_v,
+            exo_k_anc, exo_v_anc, heads, kv_heads, depth, d_model, kv_dim,
+            ks, vs, v_softcap);
+  } else {
+    const int total_pairs = N * 64 * d_model / 2;
+    const int kBlockSize = 256;
+    const int blocks = DivUp(total_pairs, kBlockSize);
+    expandKVWeighted_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+        k_out, v_out, k_in, v_in, b_k, b_v, w_k, w_v,
+        exo_k_anc, exo_v_anc,
+        total_pairs, heads, kv_heads, depth, d_model, ks, vs, v_softcap);
+  }
 }
 
 // addBiasAndAdd: out[i] = in[i] + broadcast_bias[i % width] + add[i].
