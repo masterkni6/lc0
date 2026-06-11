@@ -590,6 +590,9 @@ class EncoderBlock {
   bool has_bank_v_ = false;
   bool has_bank_vga_ = false;
   bool has_bank_ffn_ = false;
+  // Layout-1: Q = Wq2(h) — the bank replaces NLA-Q's inner projection.
+  // Detected from absent q_w with q2_w present (export writes no q_w).
+  bool bank_include_q_ = false;
   int gate_bank_size_ = 0;
   int bank_rank_v_ = 0;
   int bank_rank_vga_ = 0;

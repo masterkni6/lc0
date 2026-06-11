@@ -1583,6 +1583,11 @@ EncoderBlock<DataType>::EncoderBlock(
   arena_ = tl_weight_arena;
 
   mha_q_size_ = cpu_weights.mha.q_b.size();
+  if (mha_q_size_ == 0) {
+    // Layout-1 bank nets: q_w/q_b are absent (Q = Wq2(bank)); the Q width
+    // comes from the second projection's bias instead.
+    mha_q_size_ = cpu_weights.mha.q2_b.size();
+  }
   mha_k_size_ = cpu_weights.mha.k_b.size();
   // V bias width.  Under GLU-V, v_b is absent (the V projection splits
   // into v_gate + v_up, each with its own bias); fall back to v_gate_b
@@ -2010,6 +2015,11 @@ EncoderBlock<DataType>::EncoderBlock(
     has_bank_v_ = cpu_weights.mha.bank_v_diag.size() > 0;
     has_bank_vga_ = cpu_weights.mha.bank_vga_diag.size() > 0;
     has_bank_ffn_ = cpu_weights.ffn.bank_gate_diag.size() > 0;
+    // Layout-1: Q consumes the bank directly (Q = Wq2(h)) — detected from
+    // an absent q_w with q2_w present.  No adapter fields needed; Wq2 is
+    // a full matrix and absorbs any remix.
+    bank_include_q_ = has_nla_ && nla_q_only_ &&
+                      cpu_weights.mha.q_w.size() == 0;
     if (has_bank_v_) {
       allocAndUpload<DataType>(&bank_v_diag_, cpu_weights.mha.bank_v_diag,
                                scratch);
@@ -2081,6 +2091,12 @@ EncoderBlock<DataType>::EncoderBlock(
         "VGA-E has neither vga_elem_gate_w nor bank_vga_* in the proto — "
         "incomplete export (sync torchprocess.py + regenerate net_pb2.py, "
         "then re-export).");
+  }
+  if (has_nla_ && cpu_weights.mha.q_w.size() == 0 && !has_gate_bank_) {
+    throw Exception(
+        "NLA net has q2_w but no q_w and no gate bank — incomplete export "
+        "(a Layout-1 net needs gate_bank_w; sync torchprocess.py + "
+        "regenerate net_pb2.py, then re-export).");
   }
 
   // Persistent LN1 cache for Pre-Norm paths. Computes LN1 once per Eval.
@@ -3106,19 +3122,31 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         // NOTE: under GQA the q1 scratch is also nla_qk_temp, but we only
         // need it long enough to materialize Q (above the K/V GQA writes),
         // and Q is the first thing computed, so there's no clash.
-        DataType* q1 = nla_qk_temp;  // reuse scratch (d_model wide used)
-        // Q1 = Wq @ x ; silu(Q1 + bq)
-        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model,
-                              batch, num_inputs, 1.0f,
-                              (const DataType*)mha_q_w, num_inputs,
-                              mha_input, num_inputs, 0.0f, q1, d_model);
-        addBiasBatched<DataType>(q1, q1, mha_q_b, 1, batch, d_model,
-                                 ACTIVATION_SWISH, stream);
-        // Q  = Wq2 @ Q1 + bq2 (+ exo_q_anc fused when exo_fused_kv)
-        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model,
-                              batch, d_model, 1.0f,
-                              (const DataType*)mha_q2_w_, d_model,
-                              q1, d_model, 0.0f, mha_q, d_model);
+        if (bank_include_q_) {
+          // Layout-1: the shared bank IS Q's inner layer — Q = Wq2(h).
+          // h (bank_h_buf) was computed at the top of Eval, so the wq
+          // GEMM and its silu launch vanish entirely.
+          assert(use_bank && "Layout-1 requires the bank context");
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model,
+                                batch, gate_bank_size_, 1.0f,
+                                (const DataType*)mha_q2_w_, gate_bank_size_,
+                                bank_h_buf, gate_bank_size_, 0.0f,
+                                mha_q, d_model);
+        } else {
+          DataType* q1 = nla_qk_temp;  // reuse scratch (d_model wide used)
+          // Q1 = Wq @ x ; silu(Q1 + bq)
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model,
+                                batch, num_inputs, 1.0f,
+                                (const DataType*)mha_q_w, num_inputs,
+                                mha_input, num_inputs, 0.0f, q1, d_model);
+          addBiasBatched<DataType>(q1, q1, mha_q_b, 1, batch, d_model,
+                                   ACTIVATION_SWISH, stream);
+          // Q  = Wq2 @ Q1 + bq2 (+ exo_q_anc fused when exo_fused_kv)
+          cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model,
+                                batch, d_model, 1.0f,
+                                (const DataType*)mha_q2_w_, d_model,
+                                q1, d_model, 0.0f, mha_q, d_model);
+        }
         if (exo_fused_kv) {
           // Fold the Q exo anchor add into the Q2 bias add — one kernel
           // instead of two (addBiasBatched + the Q part of AddExoAnchors).
