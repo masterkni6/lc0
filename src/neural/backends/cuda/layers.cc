@@ -1555,13 +1555,20 @@ EncoderBlock<DataType>::EncoderBlock(
     float smolgen_softcap,
     float v_softcap,
     float swiglu_softcap,
-    int kv_heads)
+    int kv_heads,
+    DataType* smol_dict_p, DataType* smol_dict_dec,
+    int smol_dict_m, int smol_dict_rank)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       kv_heads_(kv_heads > 0 ? kv_heads : heads),
       alpha_(alpha),
       default_eps_(default_eps),
       has_smolgen_(cpu_weights.mha.has_smolgen),
+      has_smol_dict_(smol_dict_p != nullptr),
+      smol_dict_m_(smol_dict_m),
+      smol_dict_rank_(smol_dict_rank),
+      smol_dict_p_(smol_dict_p),
+      smol_dict_dec_(smol_dict_dec),
       smolgen_activation_(smolgen_act),
       ffn_activation_(ffn_act),
       max_batch_size_(max_batch_size),
@@ -3006,11 +3013,45 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = smol_dense_2_size_ / H; /* gen_sz */
       const int num_outputs = smol_global_size_; /* 64 * 64 */
       const int batch = N * H;
-      cublasXgemm<DataType>(sg_h, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
-                            batch, num_inputs, 1.0f,
-                            (const DataType*)smol_global, num_inputs,
-                            smol_interm, num_inputs, 0.0f, smol_gen_out,
-                            num_outputs);
+      if (has_smol_dict_) {
+        // Smolgen dictionary: one shared decoder emits [alpha | U | V]
+        // per head; bias = mixture over the shared atom bank P plus a
+        // rank-r dynamic residual U·Vᵀ.  smol_interm2 is free here
+        // (step 3's LN wrote smol_interm) and holds the decoder output.
+        const int M = smol_dict_m_;
+        const int r = smol_dict_rank_;
+        const int LD = M + 2 * 64 * r;
+        DataType* dec_out = smol_interm2;
+        cublasXgemm<DataType>(sg_h, CUBLAS_OP_T, CUBLAS_OP_N, LD, batch,
+                              num_inputs, 1.0f,
+                              (const DataType*)smol_dict_dec_, num_inputs,
+                              smol_interm, num_inputs, 0.0f, dec_out, LD);
+        // Compose: out[o, b] = Σ_m P[m, o]·alpha[m, b].  P row-major
+        // (M, 4096) = col-major (4096, M) → OP_N, lda=4096; alpha is
+        // rows [0, M) of each decoder column (k=M, ldb=LD skips U/V).
+        cublasXgemm<DataType>(sg_h, CUBLAS_OP_N, CUBLAS_OP_N, num_outputs,
+                              batch, M, 1.0f,
+                              (const DataType*)smol_dict_p_, num_outputs,
+                              dec_out, LD, 0.0f, smol_gen_out, num_outputs);
+        // U·Vᵀ residual accumulated into the composed maps (beta=1).
+        // U/V blocks are row-major (64, r) within a decoder column =
+        // col-major (r, 64) with ld=r.  D = op_T(V)·U (m=64 over j,
+        // n=64 over i) lands D[j,i] = Σ_k V[j,k]U[i,k] at flat i*64+j —
+        // exactly C[i,j] in the row-major map layout softmax consumes.
+        if (r > 0) {
+          cublasXGemmStridedBatched<DataType>(
+              sg_h, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, r, 1.0f,
+              dec_out + M + 64 * r, r, LD,
+              dec_out + M, r, LD,
+              1.0f, smol_gen_out, 64, num_outputs, batch, use_gemm_ex_);
+        }
+      } else {
+        cublasXgemm<DataType>(sg_h, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                              batch, num_inputs, 1.0f,
+                              (const DataType*)smol_global, num_inputs,
+                              smol_interm, num_inputs, 0.0f, smol_gen_out,
+                              num_outputs);
+      }
     }
     // Signal main stream that smolgen bias in smol_gen_out is ready.
     ReportCUDAErrors(cudaEventRecord(smol_done_event, sg_s));
@@ -3074,10 +3115,35 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           smol_dense_2_size_ / H; /* gen_sz */
       const int num_outputs = smol_global_size_; /* 64 * 64 */
       const int batch = N * H;
-      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
-                            batch, num_inputs, 1.0f,
-                            (const DataType*)smol_global, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer2, num_outputs);
+      if (has_smol_dict_) {
+        // Smolgen dictionary — see the ms_smol copy above for the math.
+        // buffer1 is free here (dense2's GEMM output was consumed by the
+        // LN that wrote `scratch`) and holds the decoder output.
+        const int M = smol_dict_m_;
+        const int r = smol_dict_rank_;
+        const int LD = M + 2 * 64 * r;
+        DataType* dec_out = buffer1;
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, LD, batch,
+                              num_inputs, 1.0f,
+                              (const DataType*)smol_dict_dec_, num_inputs,
+                              scratch, num_inputs, 0.0f, dec_out, LD);
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_N, CUBLAS_OP_N, num_outputs,
+                              batch, M, 1.0f,
+                              (const DataType*)smol_dict_p_, num_outputs,
+                              dec_out, LD, 0.0f, buffer2, num_outputs);
+        if (r > 0) {
+          cublasXGemmStridedBatched<DataType>(
+              cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, r, 1.0f,
+              dec_out + M + 64 * r, r, LD,
+              dec_out + M, r, LD,
+              1.0f, buffer2, 64, num_outputs, batch, use_gemm_ex_);
+        }
+      } else {
+        cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                              batch, num_inputs, 1.0f,
+                              (const DataType*)smol_global, num_inputs, scratch,
+                              num_inputs, 0.0f, buffer2, num_outputs);
+      }
     }
   }
 
@@ -4811,6 +4877,46 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
   if (has_smolgen_) {
     allocAndUpload<DataType>(&smolgen_global_, weights.smolgen_w, scratch);
     smolgen_global_size_ = 64 * 64;
+    // Smolgen dictionary (motif bank): shared atom bank + fused decoder.
+    if (weights.smolgen_dict_p.size() > 0) {
+      if (weights.smolgen_w.size() > 0) {
+        throw Exception(
+            "net has both smolgen_w and smolgen_dict_p — ambiguous "
+            "smolgen decoder; the export should never produce this.");
+      }
+      if (weights.smolgen_dict_dec_w.size() == 0) {
+        throw Exception(
+            "smolgen_dict_p present but smolgen_dict_dec_w missing — "
+            "incomplete export (sync torchprocess.py + regenerate "
+            "net_pb2.py, then re-export).");
+      }
+      if (weights.smolgen_dict_p.size() % (64 * 64) != 0) {
+        throw Exception("smolgen_dict_p size not a multiple of 4096");
+      }
+      smol_dict_m_ = (int)(weights.smolgen_dict_p.size() / (64 * 64));
+      // Decoder rows = M + 2*64*r; columns = gen_sz (from layer 0's
+      // dense2 width / head count).
+      const auto& sg0 = weights.encoder[0].mha.smolgen;
+      const int gen_sz = (int)(sg0.dense2_b.size() / encoder_head_count_);
+      if (gen_sz <= 0 ||
+          weights.smolgen_dict_dec_w.size() % gen_sz != 0) {
+        throw Exception("smolgen_dict_dec_w size not divisible by gen_sz");
+      }
+      const int dec_rows = (int)(weights.smolgen_dict_dec_w.size() / gen_sz);
+      // dec_rows == M is valid: rank-0 (mixture-only, no UVᵀ residual).
+      if ((dec_rows - smol_dict_m_) % (2 * 64) != 0 ||
+          dec_rows < smol_dict_m_) {
+        throw Exception(
+            "smolgen_dict_dec_w rows (" + std::to_string(dec_rows) +
+            ") don't decompose as M + 2*64*r with M=" +
+            std::to_string(smol_dict_m_));
+      }
+      smol_dict_rank_ = (dec_rows - smol_dict_m_) / (2 * 64);
+      allocAndUpload<DataType>(&smol_dict_p_, weights.smolgen_dict_p,
+                               scratch);
+      allocAndUpload<DataType>(&smol_dict_dec_, weights.smolgen_dict_dec_w,
+                               scratch);
+    }
   }
 
   // Encoder final norm (Pre-Norm only)
@@ -4843,7 +4949,8 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         is_prenorm_, use_rms_norm_, has_swiglu_,
         is_parallel_ffn_, attn_logit_cap_,
         body_has_exoformer, smolgen_softcap_, v_softcap_, swiglu_softcap_,
-        weights.kv_headcount);
+        weights.kv_headcount,
+        smol_dict_p_, smol_dict_dec_, smol_dict_m_, smol_dict_rank_);
     encoder_weights_.emplace_back(pW);
   }
 
@@ -5195,6 +5302,8 @@ AttentionBody<DataType>::~AttentionBody() {
   }
   if (has_smolgen_) {
     FreeWeight(smolgen_global_, arena_);
+    FreeWeight(smol_dict_p_, arena_);
+    FreeWeight(smol_dict_dec_, arena_);
   }
   FreeWeight(enc_final_norm_g_, arena_);
   FreeWeight(enc_final_norm_b_, arena_);

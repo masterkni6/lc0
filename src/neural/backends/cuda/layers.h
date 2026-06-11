@@ -358,7 +358,14 @@ class EncoderBlock {
                // kv_heads < heads, K/V projections are sized to
                // kv_dim = kv_heads*depth and reused across Q heads via
                // genOffsetPointers_GQA (no physical expand).
-               int kv_heads = 0);
+               int kv_heads = 0,
+               // Smolgen dictionary (motif bank): shared atom bank P
+               // (smol_dict_m × 4096) + fused [alpha | U | V] decoder
+               // ((M + 2*64*r) × gen_sz).  Owned by AttentionBody (like
+               // smolgen_global_scratch); null → classic weight_gen.
+               DataType* smol_dict_p = nullptr,
+               DataType* smol_dict_dec = nullptr,
+               int smol_dict_m = 0, int smol_dict_rank = 0);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -436,6 +443,14 @@ class EncoderBlock {
   DataType *smol_ln1_gammas, *smol_ln1_betas;
   DataType *smol_ln2_gammas, *smol_ln2_betas;
   DataType *smol_global;
+  // Smolgen dictionary (motif bank) — pointers owned by AttentionBody,
+  // shared across all layers (like smol_global).  has_smol_dict_ routes
+  // the final weight-gen step through decoder→compose→UVᵀ GEMMs.
+  bool has_smol_dict_ = false;
+  int smol_dict_m_ = 0;
+  int smol_dict_rank_ = 0;
+  DataType* smol_dict_p_ = nullptr;
+  DataType* smol_dict_dec_ = nullptr;
 
   int mha_q_size_;
   int mha_k_size_;
@@ -798,6 +813,12 @@ class AttentionBody : public BaseLayer<DataType> {
   DataType *ip_emb_ffn_gate_up_w_ = nullptr, *ip_emb_ffn_gate_up_b_ = nullptr;
   bool has_emb_ffn_swiglu_ = false;
   DataType *smolgen_global_;  // global smolgen weights for all encoder layers
+  // Smolgen dictionary (motif bank): shared atom bank + fused decoder,
+  // uploaded here and passed by pointer to every EncoderBlock.
+  DataType* smol_dict_p_ = nullptr;
+  DataType* smol_dict_dec_ = nullptr;
+  int smol_dict_m_ = 0;
+  int smol_dict_rank_ = 0;
   DataType *pos_encoding_ = nullptr;
   int embedding_dense_size_;
   int embedding_op_size_;

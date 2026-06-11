@@ -53,7 +53,10 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip2_mov_w(LayerAdapter(weights.ip2_mov_w()).as_vector()),
       ip2_mov_b(LayerAdapter(weights.ip2_mov_b()).as_vector()),
       smolgen_w(LayerAdapter(weights.smolgen_w()).as_vector()),
-      has_smolgen(weights.has_smolgen_w()),
+      has_smolgen(weights.has_smolgen_w() || weights.has_smolgen_dict_p()),
+      smolgen_dict_p(LayerAdapter(weights.smolgen_dict_p()).as_vector()),
+      smolgen_dict_dec_w(
+          LayerAdapter(weights.smolgen_dict_dec_w()).as_vector()),
       encoder_final_norm_gammas(
           LayerAdapter(weights.encoder_final_norm_gammas()).as_vector()),
       encoder_final_norm_betas(

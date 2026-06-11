@@ -77,6 +77,17 @@ Notes: heads-10 win = softmax+smolgen-bias bandwidth halves + d_k 64 attention t
 
 **Verdict: dictionary hypothesis licensed — concentration strengthens monotonically with maturity.** Converged smolgen ≈ shared ~64-atom dictionary + per-site mixtures. Atoms are NOT low matrix-rank (rank-8 holds only ~51-62% energy) → store dictionary atoms DENSE (M=64 → 512KB fp16, L2-resident), don't factor them. Mature-net per-site min share 53% → keep a small per-site dynamic residual (UVᵀ rank ~8) for outlier sites. Replacement design: `B_h = softcap(Σ_m α_h,m(g)·P_m + U_h(g)V_h(g)ᵀ)` — est +7-9% nps, −90M params vs current smolgen (10-12% wall, 117M params = 41% of 640×60 net). Init P from measured atoms (`smolgen_dict_t6bank.npz`, `smolgen_dict_t9_272k.npz` in Downloads). Stage 2 (realized-map stats: α-only variance share, residual rank sizing) needs activations — checkpoint hooks or an lc0 latent-dump patch; refines M and r but does not gate the arm.
 
+**Smolgen dictionary — IMPLEMENTED end-to-end (2026-06-11).** `use_smolgen_dict: true` + `smolgen_dict_atoms` (M) + `smolgen_dict_rank` (r) + `smolgen_gen_sz: 64` (slim code — where the savings come from) + optional `smolgen_dict_init: <probe npz>`. Torch: SmolGen dict branch (`B = Σ_m α_m(z)·P_m + U(z)V(z)ᵀ`), shared `smol_dict_P` (M×4096, init from probe atoms) + fused bias-less decoder (gen_sz → M+2·64·r, rows [α|U|V], V zero-init). Proto: top-level `smolgen_dict_p=66`, `smolgen_dict_dec_w=67`; smolgen_w absent under dict. CUDA: AttentionBody uploads + passes to EncoderBlock (like smol_global); both smolgen step-5 sites (ms_smol + main) replaced by decoder GEMM → compose GEMM (4096×NH×M, P consumed OP_N lda=4096) → strided-batched UVᵀ (OP_T/OP_N trick lands C[i,j] at i·64+j) with beta=1; softmax/softcap unchanged. Verified: ms_smol-vs-main path outputs identical (LC0_DISABLE_MS_SMOLGEN=1); finite eval, legal bestmove.
+
+**Measured (vs QK base same-session rerun 3649 capture-on / 3421 capture-off mean):**
+| variant | capture-on | capture-off | params |
+|---|---|---|---|
+| M=64 r=8 | 3584 (−1.8%) | 3552 | 219.6M |
+| **M=64 r=0** | **3902 (+6.9%)** | **3771** | 219.4M |
+| M=128 r=0 | 3853 (+5.6%) | 3559 (noisy; median 3714) | 219.7M |
+
+**LESSON: the r>0 UVᵀ strided-batched GEMM with beta=1 into the 21MB map buffer re-reads + re-writes the whole buffer (~40µs/layer) and cancels the entire gen-GEMM saving.** Rank-0 (mixture-only) delivers the predicted win. To rescue r>0: fuse the UVᵀ add into softmax_opt_64 (read U/V from dec_out, +r fma/logit, add BEFORE the smolgen softcap; dec_out in smol_interm2 provably survives until the same layer's softmax — layer i+1's smolgen waits on ln1_done(i+1)) — NOT implemented yet. Params: smolgen 117M → ~36M (dict arms ≈219.6M total net, −63M vs QK arm). Training arm recipe: `use_smolgen_dict: true, smolgen_dict_atoms: 64, smolgen_dict_rank: 0, smolgen_gen_sz: 64, smolgen_dict_init: smolgen_dict_t9_272k.npz` (npz in Downloads; 64 atoms saved — M>64 needs a re-run of the probe with `--atoms M`).
+
 - All arms are training-gated next: user trains r0 / L1 / QK / gluQK and picks on Elo-vs-nps. Sync torchprocess.py to the trainer + regenerate net_pb2.py there (`python -m grpc_tools.protoc --proto_path=<worktree>/proto --python_out=Downloads/proto net.proto`) BEFORE enabling new flags — stale net_pb2 silently drops fields (load-time validation in layers.cc now catches this).
 
 ## fp8 inference: tried, abandoned (May 2026)

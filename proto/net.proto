@@ -433,6 +433,16 @@ message Weights {
   // projection as-is with no runtime scaling.
   optional Layer exo_smol_anchor_w = 65;
 
+  // Smolgen dictionary (motif bank).  Replaces the shared smolgen_w
+  // decoder:  B_h = sum_m alpha_h,m(z) * P_m + U_h(z) V_h(z)^T  where
+  // z is the per-head gen_from code.  smolgen_dict_p holds M dense
+  // 64x64 atoms ((M, 4096) row-major); smolgen_dict_dec_w is ONE shared
+  // bias-less decoder ((M + 2*64*r, gen_sz) row-major) whose output
+  // rows are [alpha (M) | U (64*r, row-major 64xr) | V (64*r)].
+  // When present, smolgen_w is absent.
+  optional Layer smolgen_dict_p = 66;
+  optional Layer smolgen_dict_dec_w = 67;
+
   // Light embedding: per-square MLP + global summary (replaces ip_emb_preproc).
   // Per-square: Linear(12, 64) → SiLU → Linear(64, emb_dense_sz)
   optional Layer light_emb_sq_w1 = 52;

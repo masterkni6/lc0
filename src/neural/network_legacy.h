@@ -277,6 +277,13 @@ struct BaseWeights {
   // Smolgen global weights
   Vec smolgen_w;
   bool has_smolgen;
+
+  // Smolgen dictionary (motif bank): shared atom bank P (M, 4096) +
+  // fused [alpha | U | V] decoder (M + 2*64*r, gen_sz).  When non-empty,
+  // smolgen_w is absent and the bias is composed as
+  // B = sum_m alpha_m P_m + U V^T.
+  Vec smolgen_dict_p;
+  Vec smolgen_dict_dec_w;
 };
 
 struct LegacyWeights : public BaseWeights {
