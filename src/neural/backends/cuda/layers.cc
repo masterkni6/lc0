@@ -2292,6 +2292,15 @@ static void cublasXgemm(cublasHandle_t handle, cublasOperation_t transa,
         std::getenv("LC0_CUBLAS_SMALL_M_HGEMM") != nullptr;
     constexpr int kSmallMThreshold = 384;
     if (!kSmallMHgemm && m <= kSmallMThreshold) {
+      static const bool kDumpEx = std::getenv("LC0_DUMP_HGEMM") != nullptr;
+      if (kDumpEx) {
+        fprintf(stderr,
+                "cublasGemmEx32F: transa=%d transb=%d m=%d n=%d k=%d "
+                "lda=%d ldb=%d ldc=%d  A=%p B=%p C=%p\n",
+                (int)transa, (int)transb, m, n, k, lda, ldb, ldc,
+                (const void*)A, (const void*)B, (void*)C);
+        fflush(stderr);
+      }
       ReportCUBLASErrors(cublasGemmEx(
           handle, transa, transb, m, n, k, &alpha,
           (const void*)A, CUDA_R_16F, lda,
@@ -5404,6 +5413,31 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                                    size_t scratch_size, cudnnHandle_t /*cudnn*/,
                                    cublasHandle_t cublas, cudaStream_t stream,
                                    DataType*** offset_pointers) {
+  // Debug buffer map (LC0_DUMP_HGEMM=1): one-time print of every base
+  // pointer the encoder derives GEMM outputs from, plus their sizes.
+  // Cross-reference against the per-GEMM A/B/C dumps to attribute an
+  // out-of-range pointer to the buffer (and the max_batch arithmetic)
+  // it was carved from.
+  {
+    static const bool kDumpBufMap =
+        std::getenv("LC0_DUMP_HGEMM") != nullptr;
+    static std::atomic<bool> dumped{false};
+    if (kDumpBufMap && !dumped.exchange(true)) {
+      fprintf(stderr,
+              "[bufmap] N=%d scratch=%p scratch_size=%zu output=%p "
+              "input=%p max_batch=%d emb=%d\n",
+              N, scratch, scratch_size, (void*)output, (const void*)input,
+              max_batch_size_, embedding_op_size_);
+      fprintf(stderr,
+              "[bufmap] bank_h=%p bank_lr=%p smol_gen_out0=%p "
+              "smol_interm=%p smol_interm2=%p ffn_wide=%p ffn_out=%p\n",
+              (void*)bank_h_buf_, (void*)bank_lr_buf_,
+              (void*)(num_encoder_layers_ > 0 ? smol_gen_out_ : nullptr),
+              (void*)smol_intermediate_, (void*)smol_intermediate2_,
+              (void*)ffn_buf_wide_, (void*)ffn_buf_out_);
+      fflush(stderr);
+    }
+  }
   // Reset per-forward encoder layer counter so _lid == 0 always means
   // "layer 0 of this forward pass" (not a cumulative counter).
   g_enc_layer_counter.store(0, std::memory_order_relaxed);
