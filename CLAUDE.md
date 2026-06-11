@@ -23,6 +23,39 @@ User's current production net moved from 256×20 (38.9M) to **512×60 (269.8M pa
 - `5d1a003` `build.sh` passes `-Db_lto_threads=0` to parallelize GCC LTRANS (was serial, 50 jobs)
 - `cb1c035` CLAUDE.md feature-status fixes (attack_maps moved to Supported)
 
+## Shared gate bank (June 2026) — program state
+
+User's 640×60 net (t6-640x60.yaml: emb=640, heads=20, kv=10, NLA-Q-only + GLU-V + VGA-E + PGB + SwiGLU parallel-FFN post-norm). One per-layer nonlinear basis `h = silu(W_bank·x + b)` feeds gate sites through `BankAdapter` (`pre = diag⊙h[:w] + b (+ lr_b(lr_a(h)))`; rank 0 = diagonal-only). Presence-detected in CUDA — **no format flags**:
+
+| arm | yaml | detection | form |
+|---|---|---|---|
+| base bank | `use_shared_gate_bank: true` | `gate_bank_w` + per-site `bank_*_diag` | GLU-V/VGA-E/FFN gates read h |
+| rank-0 | `gate_bank_rank: 0` | absent `*_lr_a` | diagonal-only adapters (speed arm) |
+| Layout-1 | `gate_bank_include_q: true` | `q2_w` present, `q_w` ABSENT | Q = Wq2(h) |
+| K-on-bank | `gate_bank_include_k: true` | `k2_w` present, `k_w` ABSENT | K = Wk2(h) |
+| GLU-Q | `gate_bank_glu_q: true` | `bank_q_diag` (+ `q_w`, no `q2_w`) | Q = silu(adapter(h))⊙(Wq·x+b) |
+| GLU-K | `gate_bank_glu_k: true` | `bank_k_diag` (+ `k_w`, no `k2_w`) | K = silu(adapter(h))⊙(Wk·x+b) |
+
+All Q/K arms require `use_nla: true` + `nla_q_only: true` in yaml. GLU-Q drops q2_w → net is structurally non-NLA in CUDA and routes via the fallback Q/K/V branch (which has a bank GLU-V arm). GLU-K alone routes via the NLA-Q-only branch. glu_q+include_k is forbidden (not routable). Proto: EncoderLayer `gate_bank_w/b=14/15`; MHA `bank_v_*=45-48`, `bank_vga_*=49-52`, `bank_q_*=53-56`, `bank_k_*=57-60`; FFN `bank_gate_*=18-21`. Bias semantics: GLU-form K/Q bias lives INSIDE the gate product — expandKVWeighted gets `b_k=nullptr` under GLU-K.
+
+**Bench (4090, 640×60 seed-42 random, batch 128, 25 batches, SAME build/session, mean nps):**
+
+| arm | capture-on | capture-off |
+|---|---|---|
+| nobank60 | 3198 | 3043 |
+| bank60_r0 | 3357 | 3233 |
+| bank60_r0_L1 (Q) | 3658 | 3484 |
+| bank60_r0_QK (Q+K) | **3657** | **3552** |
+| bank60_r0_GLUQK | 3539 | 3374 |
+
+- **Cross-session bench numbers are NOT comparable** (QK measured 3206 capture-on last session, 3657 this session, same pb). Always re-baseline all arms in-session before concluding anything.
+- The earlier "K-on-bank −6% under graph capture" finding did NOT reproduce on this build — QK ties L1 capture-on now.
+- gluQK pays ~3-5% vs QK/L1: its Q/K gate kernels re-read h (~47 MB/layer) and that HBM traffic competes with the bottleneck FFN stream. In exchange Q/K keep private x-subspaces (the A-screen/`bank_q_overlap.py` diagnostic showed trained wq AVOIDS the bank basis — lift ~1.0 vs gates 1.8-2.2), and the form is 3rd-order. It's the capacity-hedge arm; QK is the max-speed arm.
+- Fused [Wq|Wk|Wv_up] input GEMM extended to gluQK nets: tied with separate GEMMs at 60L (launch savings absorbed into FFN stall slack — same as 512×60). `LC0_NO_FUSED_QKV=1` forces the separate path (debug/parity).
+- r64 (trained t6-640x60-bank-swa-7826) measured −6.4% vs nobank earlier; rank-0 is the production direction. lr_b folding into consuming kernels measured 1.4-4.5× slower than GEMM form — do not retry (note in common_kernels.cu).
+- Verification pattern for new arms: 2L torch fwd/bwd + export-structure check → 2L fused-vs-separate CUDA output parity on same pb → 60L load + finite eval + legal bestmove → bench. Trained-checkpoint parity happens when an arm trains.
+- All arms are training-gated next: user trains r0 / L1 / QK / gluQK and picks on Elo-vs-nps. Sync torchprocess.py to the trainer + regenerate net_pb2.py there (`python -m grpc_tools.protoc --proto_path=<worktree>/proto --python_out=Downloads/proto net.proto`) BEFORE enabling new flags — stale net_pb2 silently drops fields (load-time validation in layers.cc now catches this).
+
 ## fp8 inference: tried, abandoned (May 2026)
 
 **Verdict: fp8 inference on Ada (4090) is not viable for lc0 quality at acceptable throughput. Do not re-attempt without one of the prerequisites below.**
